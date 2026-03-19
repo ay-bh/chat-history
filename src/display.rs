@@ -179,10 +179,6 @@ pub fn print_search_results(results: &[SearchResult], query: &str) {
             let files: String = r.message.files_referenced.iter().take(3).cloned().collect::<Vec<_>>().join(", ");
             println!("       {}files: {}{}", c!("dim"), files, c!("reset"));
         }
-        if !r.message.error_patterns.is_empty() {
-            let err: String = r.message.error_patterns[0].chars().take(80).collect();
-            println!("       {}errors: {}{}", c!("red"), err, c!("reset"));
-        }
         println!();
     }
 }

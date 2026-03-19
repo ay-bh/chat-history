@@ -244,9 +244,16 @@ fn main() {
                 std::process::exit(1);
             }
             println!("Resuming: {}", if session.summary.is_empty() { &session.id } else { &session.summary });
-            let claude_bin = "/prod/tools/genai/bin/claude";
+            if !session.project.is_empty() {
+                let project = std::path::Path::new(&session.project);
+                if project.is_dir() {
+                    if let Err(e) = std::env::set_current_dir(project) {
+                        eprintln!("Warning: could not cd to {}: {e}", session.project);
+                    }
+                }
+            }
             use std::os::unix::process::CommandExt;
-            let err = std::process::Command::new(claude_bin)
+            let err = std::process::Command::new("claude")
                 .args(["--resume", &session.id])
                 .exec();
             eprintln!("Failed to exec claude: {err}");
