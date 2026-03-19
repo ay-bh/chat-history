@@ -6,6 +6,8 @@ Scoring logic ported from [claude-historian-mcp](https://github.com/Vvkmnn/claud
 
 ## Install
 
+Requires [Rust](https://rustup.rs/). Then:
+
 ```bash
 cargo install chat-history
 ```
