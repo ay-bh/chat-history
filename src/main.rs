@@ -84,6 +84,50 @@ enum Commands {
     Find {
         session_id: String,
     },
+    /// Install the agent skill for Claude Code and Cursor
+    #[command(name = "install-skill")]
+    InstallSkill,
+}
+
+const SKILL_CONTENT: &str = include_str!("../SKILL.md");
+
+fn skill_targets() -> Vec<(std::path::PathBuf, &'static str)> {
+    let Ok(home) = std::env::var("HOME") else { return vec![] };
+    let home = std::path::Path::new(&home);
+    vec![
+        (home.join(".cursor/skills/chat-history"), "Cursor"),
+        (home.join(".claude/skills/chat-history"), "Claude Code"),
+    ]
+}
+
+fn write_skill(dir: &std::path::Path) -> bool {
+    if std::fs::create_dir_all(dir).is_err() { return false; }
+    std::fs::write(dir.join("SKILL.md"), SKILL_CONTENT).is_ok()
+}
+
+fn install_skill() {
+    let targets = skill_targets();
+    if targets.is_empty() {
+        eprintln!("Could not determine home directory");
+        std::process::exit(1);
+    }
+
+    let mut any_installed = false;
+    for (dir, name) in &targets {
+        if write_skill(dir) {
+            println!("  installed → {}", dir.join("SKILL.md").display());
+            any_installed = true;
+        } else {
+            eprintln!("  skip {name}: could not write to {}", dir.display());
+        }
+    }
+
+    if any_installed {
+        println!("\nDone. The skill is active immediately — no restart needed.");
+    } else {
+        eprintln!("\nNo skills were installed.");
+        std::process::exit(1);
+    }
 }
 
 fn parse_date_arg(val: &Option<String>) -> Option<chrono::NaiveDate> {
@@ -97,6 +141,12 @@ fn parse_date_arg(val: &Option<String>) -> Option<chrono::NaiveDate> {
 
 fn main() {
     let cli = Cli::parse();
+
+    if matches!(cli.command, Some(Commands::InstallSkill)) {
+        install_skill();
+        return;
+    }
+
     let sessions = load_all_sessions();
     let from_d = parse_date_arg(&cli.from_date);
     let to_d = parse_date_arg(&cli.to_date);
@@ -209,6 +259,7 @@ fn main() {
             };
             println!("{}", session.file);
         }
+        Some(Commands::InstallSkill) => unreachable!(),
         None => {
             let mut project_filter = cli.project.as_deref().map(String::from);
             if cli.local && project_filter.is_none() {
