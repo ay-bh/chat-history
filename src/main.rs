@@ -1,22 +1,24 @@
-mod dates;
-mod display;
-mod inspect;
-mod parser;
-mod scoring;
-mod search;
-mod session;
-
+use chat_history::dates::parse_human_date;
+use chat_history::session::{
+    self, filter_sessions, find_session, load_all_sessions, parse_session,
+};
+use chat_history::{display, inspect, scoring, search};
 use clap::{Parser, Subcommand};
-use dates::parse_human_date;
-use session::{filter_sessions, find_session, load_all_sessions, parse_session};
 
 #[derive(Parser)]
-#[command(name = "chat-history", about = "Search Claude Code + Cursor conversation history")]
+#[command(
+    name = "chat-history",
+    about = "Search Claude Code + Cursor conversation history"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
 
-    #[arg(long = "from", global = true, help = "Start date (YYYY-MM-DD, today, yesterday, '3 days ago')")]
+    #[arg(
+        long = "from",
+        global = true,
+        help = "Start date (YYYY-MM-DD, today, yesterday, '3 days ago')"
+    )]
     from_date: Option<String>,
 
     #[arg(long = "to", global = true, help = "End date")]
@@ -40,7 +42,11 @@ struct Cli {
     #[arg(short = 'v', long, help = "Show session IDs and file paths")]
     verbose: bool,
 
-    #[arg(short = 'L', long = "local", help = "Only show sessions from current workspace")]
+    #[arg(
+        short = 'L',
+        long = "local",
+        help = "Only show sessions from current workspace"
+    )]
     local: bool,
 }
 
@@ -92,7 +98,9 @@ enum Commands {
 const SKILL_CONTENT: &str = include_str!("../SKILL.md");
 
 fn skill_targets() -> Vec<(std::path::PathBuf, &'static str)> {
-    let Ok(home) = std::env::var("HOME") else { return vec![] };
+    let Ok(home) = std::env::var("HOME") else {
+        return vec![];
+    };
     let home = std::path::Path::new(&home);
     vec![
         (home.join(".cursor/skills/chat-history"), "Cursor"),
@@ -101,7 +109,9 @@ fn skill_targets() -> Vec<(std::path::PathBuf, &'static str)> {
 }
 
 fn write_skill(dir: &std::path::Path) -> bool {
-    if std::fs::create_dir_all(dir).is_err() { return false; }
+    if std::fs::create_dir_all(dir).is_err() {
+        return false;
+    }
     std::fs::write(dir.join("SKILL.md"), SKILL_CONTENT).is_ok()
 }
 
@@ -133,7 +143,10 @@ fn install_skill() {
 fn parse_date_arg(val: &Option<String>) -> Option<chrono::NaiveDate> {
     val.as_ref().and_then(|v| {
         parse_human_date(v).or_else(|| {
-            eprintln!("Invalid date: '{}'. Try: YYYY-MM-DD, today, yesterday, '3 days ago', 'last week'", v);
+            eprintln!(
+                "Invalid date: '{}'. Try: YYYY-MM-DD, today, yesterday, '3 days ago', 'last week'",
+                v
+            );
             std::process::exit(1);
         })
     })
@@ -152,10 +165,22 @@ fn main() {
     let to_d = parse_date_arg(&cli.to_date);
 
     match cli.command {
-        Some(Commands::Search { query, scope, deep, limit, timeframe, json_output }) => {
+        Some(Commands::Search {
+            query,
+            scope,
+            deep,
+            limit,
+            timeframe,
+            json_output,
+        }) => {
             let pre = filter_sessions(
-                &sessions, from_d, to_d, cli.keyword.as_deref(),
-                cli.source.as_deref(), cli.project.as_deref(), cli.branch.as_deref(),
+                &sessions,
+                from_d,
+                to_d,
+                cli.keyword.as_deref(),
+                cli.source.as_deref(),
+                cli.project.as_deref(),
+                cli.branch.as_deref(),
             );
 
             if !deep && scope == "all" && !scoring::is_uuid(&query) {
@@ -170,7 +195,10 @@ fn main() {
                 }
                 if !json_output {
                     if !idx_results.is_empty() {
-                        eprintln!("Index matches too weak (best: ★ {:.1}) — searching transcripts...", idx_results[0].score);
+                        eprintln!(
+                            "Index matches too weak (best: ★ {:.1}) — searching transcripts...",
+                            idx_results[0].score
+                        );
                     } else {
                         eprintln!("No index matches — searching transcripts...");
                     }
@@ -187,7 +215,11 @@ fn main() {
         Some(Commands::Inspect { session_id, last }) => {
             let session = if last {
                 sessions.iter().max_by_key(|s| {
-                    if s.modified.is_empty() { &s.created } else { &s.modified }
+                    if s.modified.is_empty() {
+                        &s.created
+                    } else {
+                        &s.modified
+                    }
                 })
             } else if let Some(sid) = &session_id {
                 find_session(&sessions, sid)
@@ -204,10 +236,19 @@ fn main() {
                 None => eprintln!("Could not inspect session (transcript may be expired)."),
             }
         }
-        Some(Commands::View { session_id, last, tools, plain }) => {
+        Some(Commands::View {
+            session_id,
+            last,
+            tools,
+            plain,
+        }) => {
             let session = if last {
                 sessions.iter().max_by_key(|s| {
-                    if s.modified.is_empty() { &s.created } else { &s.modified }
+                    if s.modified.is_empty() {
+                        &s.created
+                    } else {
+                        &s.modified
+                    }
                 })
             } else if let Some(sid) = &session_id {
                 find_session(&sessions, sid)
@@ -243,7 +284,14 @@ fn main() {
                 eprintln!("Resume is only supported for Claude Code sessions.");
                 std::process::exit(1);
             }
-            println!("Resuming: {}", if session.summary.is_empty() { &session.id } else { &session.summary });
+            println!(
+                "Resuming: {}",
+                if session.summary.is_empty() {
+                    &session.id
+                } else {
+                    &session.summary
+                }
+            );
             if !session.project.is_empty() {
                 let project = std::path::Path::new(&session.project);
                 if project.is_dir() {
@@ -264,7 +312,9 @@ fn main() {
                             }
                         }
                         Err(e) => {
-                            eprintln!("Warning: could not determine current directory; skipping session copy: {e}");
+                            eprintln!(
+                                "Warning: could not determine current directory; skipping session copy: {e}"
+                            );
                         }
                     }
                 }
@@ -286,14 +336,20 @@ fn main() {
         Some(Commands::InstallSkill) => unreachable!(),
         None => {
             let mut project_filter = cli.project.as_deref().map(String::from);
-            if cli.local && project_filter.is_none() {
-                if let Ok(cwd) = std::env::current_dir() {
-                    project_filter = cwd.file_name().map(|n| n.to_string_lossy().to_string());
-                }
+            if cli.local
+                && project_filter.is_none()
+                && let Ok(cwd) = std::env::current_dir()
+            {
+                project_filter = cwd.file_name().map(|n| n.to_string_lossy().to_string());
             }
             let filtered = filter_sessions(
-                &sessions, from_d, to_d, cli.keyword.as_deref(),
-                cli.source.as_deref(), project_filter.as_deref(), cli.branch.as_deref(),
+                &sessions,
+                from_d,
+                to_d,
+                cli.keyword.as_deref(),
+                cli.source.as_deref(),
+                project_filter.as_deref(),
+                cli.branch.as_deref(),
             );
             if cli.summarize {
                 display::print_summarized(&filtered);
