@@ -3,14 +3,15 @@ use crate::parser::{clean_prompt, snippet_around_match};
 use crate::search::{IndexResult, SearchResult};
 use crate::session::{Message, Session};
 use std::collections::BTreeMap;
+use std::sync::LazyLock;
 
-fn is_color() -> bool {
+static USE_COLOR: LazyLock<bool> = LazyLock::new(|| {
     std::io::IsTerminal::is_terminal(&std::io::stdout()) && std::env::var("NO_COLOR").is_err()
-}
+});
 
 macro_rules! c {
     ($name:expr) => {
-        if is_color() {
+        if *USE_COLOR {
             match $name {
                 "reset" => "\x1b[0m",
                 "bold" => "\x1b[1m",
