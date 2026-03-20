@@ -275,6 +275,9 @@ pub fn scored_search(
                     "error_resolution" if cl.contains("error") || cl.contains("exception") => score *= bval,
                     "solutions" if cl.contains("fix") || cl.contains("resolve") => score *= bval,
                     "implementation" if cl.contains("implement") || cl.contains("create") => score *= bval,
+                    "optimization" if cl.contains("optimiz") || cl.contains("performance") || cl.contains("improve") => score *= bval,
+                    "file_operations" if cl.contains("file") || cl.contains("read") || cl.contains("write") => score *= bval,
+                    "tool_usage" if cl.contains("tool") || !msg.tool_uses.is_empty() => score *= bval,
                     _ => {}
                 }
             }

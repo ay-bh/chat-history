@@ -73,6 +73,7 @@ pub fn inspect_session(session: &Session) -> Option<InspectInfo> {
     let mut accomplishments = Vec::new();
     let mut decisions = Vec::new();
     let mut errors_seen = Vec::new();
+    let mut err_set: HashSet<String> = HashSet::new();
     let mut user_count = 0usize;
     let mut assistant_count = 0usize;
     let mut acc_set: HashSet<String> = HashSet::new();
@@ -101,7 +102,9 @@ pub fn inspect_session(session: &Session) -> Option<InspectInfo> {
             files_modified.insert(f.clone());
         }
         for e in msg.error_patterns.iter().take(3) {
-            errors_seen.push(e.clone());
+            if err_set.insert(e.clone()) {
+                errors_seen.push(e.clone());
+            }
         }
 
         if msg.role == "assistant" && msg.content.len() > 80 {

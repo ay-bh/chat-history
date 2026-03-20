@@ -94,7 +94,7 @@ fn dirs_next() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
 }
 
-fn claude_projects_dir() -> PathBuf {
+pub fn claude_projects_dir() -> PathBuf {
     if let Ok(config_dir) = std::env::var("CLAUDE_CONFIG_DIR") {
         return PathBuf::from(config_dir).join("projects");
     }
@@ -103,6 +103,70 @@ fn claude_projects_dir() -> PathBuf {
 
 fn cursor_projects_dir() -> PathBuf {
     home_dir().join(".cursor").join("projects")
+}
+
+fn read_cwd_from_jsonl(path: &Path) -> Option<String> {
+    let file = fs::File::open(path).ok()?;
+    let reader = BufReader::new(file);
+    for line in reader.lines().take(10) {
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => continue,
+        };
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let entry: Value = match serde_json::from_str(trimmed) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if let Some(cwd) = entry.get("cwd").and_then(Value::as_str) {
+            if !cwd.is_empty() {
+                return Some(cwd.to_string());
+            }
+        }
+    }
+    None
+}
+
+pub fn encode_path_for_claude(path: &Path) -> String {
+    path.to_string_lossy().replace('/', "-")
+}
+
+pub fn copy_session_to_dir(session: &Session, target_dir: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(target_dir)?;
+
+    let src = Path::new(&session.file);
+    let filename = src.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("session file path '{}' has no filename", session.file),
+        )
+    })?;
+    fs::copy(src, target_dir.join(filename))?;
+
+    if let Some(parent) = src.parent() {
+        let companion = parent.join(&session.id);
+        if companion.is_dir() {
+            copy_dir_recursive(&companion, &target_dir.join(&session.id))?;
+        }
+    }
+    Ok(())
+}
+
+fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let dest_path = dst.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir_recursive(&entry.path(), &dest_path)?;
+        } else {
+            fs::copy(entry.path(), &dest_path)?;
+        }
+    }
+    Ok(())
 }
 
 fn mtime_iso(path: &Path) -> Option<String> {
@@ -258,11 +322,13 @@ pub fn load_claude_sessions() -> Vec<Session> {
                     }
                     let iso = mtime_iso(&path).unwrap_or_default();
                     let date = mtime_date(&path).unwrap_or_default();
-                    let project = dir
-                        .file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                        .replace('-', "/");
+                    let project = read_cwd_from_jsonl(&path)
+                        .unwrap_or_else(|| {
+                            dir.file_name()
+                                .unwrap_or_default()
+                                .to_string_lossy()
+                                .replace('-', "/")
+                        });
                     let first = claude_first_prompt(&path);
                     sessions.push(Session {
                         source: "claude".into(),
@@ -298,7 +364,8 @@ pub fn load_cursor_sessions() -> Vec<Session> {
             if !transcripts.is_dir() {
                 continue;
             }
-            let mut seen_ids = HashSet::new();
+            let mut txt_ids: HashSet<String> = HashSet::new();
+            let mut dir_entries: Vec<(String, PathBuf)> = Vec::new();
             if let Ok(entries) = fs::read_dir(&transcripts) {
                 for entry in entries.flatten() {
                     let path = entry.path();
@@ -308,7 +375,7 @@ pub fn load_cursor_sessions() -> Vec<Session> {
                             .unwrap_or_default()
                             .to_string_lossy()
                             .to_string();
-                        seen_ids.insert(sid.clone());
+                        txt_ids.insert(sid.clone());
                         let jsonl_alt = transcripts.join(&sid).join(format!("{sid}.jsonl"));
                         let iso = mtime_iso(&path).unwrap_or_default();
                         let date = mtime_date(&path).unwrap_or_default();
@@ -338,32 +405,35 @@ pub fn load_cursor_sessions() -> Vec<Session> {
                             .unwrap_or_default()
                             .to_string_lossy()
                             .to_string();
-                        if seen_ids.contains(&dirname) {
-                            continue;
-                        }
-                        let jf = path.join(format!("{dirname}.jsonl"));
-                        if !jf.exists() {
-                            continue;
-                        }
-                        let iso = mtime_iso(&jf).unwrap_or_default();
-                        let date = mtime_date(&jf).unwrap_or_default();
-                        let first = cursor_first_prompt_jsonl(&jf);
-                        sessions.push(Session {
-                            source: "cursor".into(),
-                            id: dirname,
-                            summary: String::new(),
-                            first_prompt: first,
-                            created: iso.clone(),
-                            modified: iso,
-                            date,
-                            messages: 0,
-                            branch: String::new(),
-                            project: pd.file_name().to_string_lossy().to_string(),
-                            file: jf.to_string_lossy().to_string(),
-                            is_sidechain: false,
-                        });
+                        dir_entries.push((dirname, path));
                     }
                 }
+            }
+            for (dirname, path) in dir_entries {
+                if txt_ids.contains(&dirname) {
+                    continue;
+                }
+                let jf = path.join(format!("{dirname}.jsonl"));
+                if !jf.exists() {
+                    continue;
+                }
+                let iso = mtime_iso(&jf).unwrap_or_default();
+                let date = mtime_date(&jf).unwrap_or_default();
+                let first = cursor_first_prompt_jsonl(&jf);
+                sessions.push(Session {
+                    source: "cursor".into(),
+                    id: dirname,
+                    summary: String::new(),
+                    first_prompt: first,
+                    created: iso.clone(),
+                    modified: iso,
+                    date,
+                    messages: 0,
+                    branch: String::new(),
+                    project: pd.file_name().to_string_lossy().to_string(),
+                    file: jf.to_string_lossy().to_string(),
+                    is_sidechain: false,
+                });
             }
         }
     }

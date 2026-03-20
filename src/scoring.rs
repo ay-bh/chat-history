@@ -342,6 +342,7 @@ pub fn query_similarity(q1: &str, q2: &str) -> f64 {
     for word1 in &w1 {
         let mut best_match: f64 = 0.0;
         let mut best_idx: Option<usize> = None;
+        let mut best_is_sig_pair = false;
         let is_sig1 = sig1.contains(&word1.as_str());
 
         for (j, word2) in w2.iter().enumerate() {
@@ -353,17 +354,11 @@ pub fn query_similarity(q1: &str, q2: &str) -> f64 {
 
             if word1 == word2 {
                 match_score = 1.0;
-                if is_sig1 && is_sig2 {
-                    sig_matches += 1;
-                }
             } else if word1.contains(word2.as_str()) || word2.contains(word1.as_str()) {
                 let shorter = word1.len().min(word2.len());
                 let longer = word1.len().max(word2.len());
                 if shorter >= 5 && (shorter as f64 / longer as f64) >= 0.6 {
                     match_score = 0.8 * (shorter as f64 / longer as f64);
-                    if is_sig1 && is_sig2 {
-                        sig_matches += 1;
-                    }
                 }
             } else {
                 for (key, syns) in TECHNICAL_SYNONYMS.iter() {
@@ -372,9 +367,6 @@ pub fn query_similarity(q1: &str, q2: &str) -> f64 {
                         || (syns.contains(&word1.as_str()) && syns.contains(&word2.as_str()))
                     {
                         match_score = 0.7;
-                        if is_sig1 && is_sig2 {
-                            sig_matches += 1;
-                        }
                         break;
                     }
                 }
@@ -383,12 +375,16 @@ pub fn query_similarity(q1: &str, q2: &str) -> f64 {
             if match_score > best_match {
                 best_match = match_score;
                 best_idx = Some(j);
+                best_is_sig_pair = is_sig1 && is_sig2 && match_score > 0.0;
             }
         }
 
         if let Some(idx) = best_idx {
             matched2.insert(idx);
             total_score += best_match;
+            if best_is_sig_pair {
+                sig_matches += 1;
+            }
         }
     }
 

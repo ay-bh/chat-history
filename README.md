@@ -176,7 +176,7 @@ The following are automatically filtered out:
 
 Search and scoring logic ported from:
 - [claude-historian-mcp](https://github.com/Vvkmnn/claude-historian-mcp) — multi-signal relevance scoring, query similarity, importance heuristics
-- [claude-history](https://github.com/raine/claude-history) — prefix matching, separator normalization, recency multiplier
+- [claude-history](https://github.com/raine/claude-history) — prefix matching, separator normalization, recency multiplier, cwd-based project path resolution, copy-on-resume for deleted project directories
 - [search-sessions](https://github.com/sinzin91/search-sessions) — two-tier index/deep search, field-weighted scoring, natural language dates, per-session cap
 - [cursor-history](https://github.com/S2thend/cursor-history) — multi-format Cursor transcript parsing
 
