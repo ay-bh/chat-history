@@ -166,7 +166,7 @@ pub fn clean_prompt(text: &str) -> String {
 }
 
 pub fn is_noise(text: &str) -> bool {
-    if text.len() < 40 {
+    if text.len() < 10 {
         return true;
     }
     let lower = text.to_lowercase();
@@ -265,6 +265,7 @@ pub fn snippet_around_match(text: &str, query: &str, context_chars: usize) -> St
         end
     };
 
+    let end = end.max(start);
     let snippet = &cleaned[start..end.min(cleaned.len())];
     let prefix = if start > 0 { "..." } else { "" };
     let suffix = if end < cleaned.len() { "..." } else { "" };
