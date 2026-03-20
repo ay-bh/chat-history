@@ -163,10 +163,17 @@ pub fn print_search_results(results: &[SearchResult], query: &str) {
         } else {
             format!("{}Assistant{}", c!("blue"), c!("reset"))
         };
+        let display_title = if !r.session.summary.is_empty() {
+            r.session.summary.chars().take(80).collect::<String>()
+        } else if !r.session.first_prompt.is_empty() {
+            clean_prompt(&r.session.first_prompt).chars().take(80).collect::<String>()
+        } else {
+            "(no summary)".into()
+        };
         println!(
             "  {}{:3}.{} {} {}{}{} {}  {}{}{}  {}[{}]{}",
             c!("dim"), i + 1, c!("reset"), tag, c!("cyan"), r.session.date, c!("reset"),
-            score, c!("bold"), r.session.summary, c!("reset"),
+            score, c!("bold"), display_title, c!("reset"),
             c!("dim"), sid_short, c!("reset")
         );
         let snippet = snippet_around_match(&r.message.content, query, 200);
