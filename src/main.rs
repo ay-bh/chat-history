@@ -8,7 +8,8 @@ use clap::{Parser, Subcommand};
 #[derive(Parser)]
 #[command(
     name = "chat-history",
-    about = "Search Claude Code + Cursor conversation history"
+    about = "Search Claude Code + Cursor conversation history",
+    version
 )]
 struct Cli {
     #[command(subcommand)]
