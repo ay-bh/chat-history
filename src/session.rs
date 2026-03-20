@@ -94,7 +94,7 @@ fn dirs_next() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
 }
 
-fn claude_projects_dir() -> PathBuf {
+pub fn claude_projects_dir() -> PathBuf {
     if let Ok(config_dir) = std::env::var("CLAUDE_CONFIG_DIR") {
         return PathBuf::from(config_dir).join("projects");
     }
@@ -103,6 +103,66 @@ fn claude_projects_dir() -> PathBuf {
 
 fn cursor_projects_dir() -> PathBuf {
     home_dir().join(".cursor").join("projects")
+}
+
+fn read_cwd_from_jsonl(path: &Path) -> Option<String> {
+    let file = fs::File::open(path).ok()?;
+    let reader = BufReader::new(file);
+    for line in reader.lines().take(10) {
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => continue,
+        };
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let entry: Value = match serde_json::from_str(trimmed) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if let Some(cwd) = entry.get("cwd").and_then(Value::as_str) {
+            if !cwd.is_empty() {
+                return Some(cwd.to_string());
+            }
+        }
+    }
+    None
+}
+
+pub fn encode_path_for_claude(path: &Path) -> String {
+    path.to_string_lossy().replace('/', "-")
+}
+
+pub fn copy_session_to_dir(session: &Session, target_dir: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(target_dir)?;
+
+    let src = Path::new(&session.file);
+    if let Some(filename) = src.file_name() {
+        fs::copy(src, target_dir.join(filename))?;
+    }
+
+    if let Some(parent) = src.parent() {
+        let companion = parent.join(&session.id);
+        if companion.is_dir() {
+            copy_dir_recursive(&companion, &target_dir.join(&session.id))?;
+        }
+    }
+    Ok(())
+}
+
+fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let dest_path = dst.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir_recursive(&entry.path(), &dest_path)?;
+        } else {
+            fs::copy(entry.path(), &dest_path)?;
+        }
+    }
+    Ok(())
 }
 
 fn mtime_iso(path: &Path) -> Option<String> {
@@ -258,11 +318,13 @@ pub fn load_claude_sessions() -> Vec<Session> {
                     }
                     let iso = mtime_iso(&path).unwrap_or_default();
                     let date = mtime_date(&path).unwrap_or_default();
-                    let project = dir
-                        .file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                        .replace('-', "/");
+                    let project = read_cwd_from_jsonl(&path)
+                        .unwrap_or_else(|| {
+                            dir.file_name()
+                                .unwrap_or_default()
+                                .to_string_lossy()
+                                .replace('-', "/")
+                        });
                     let first = claude_first_prompt(&path);
                     sessions.push(Session {
                         source: "claude".into(),
