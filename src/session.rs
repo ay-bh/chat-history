@@ -298,7 +298,8 @@ pub fn load_cursor_sessions() -> Vec<Session> {
             if !transcripts.is_dir() {
                 continue;
             }
-            let mut seen_ids = HashSet::new();
+            let mut txt_ids: HashSet<String> = HashSet::new();
+            let mut dir_entries: Vec<(String, PathBuf)> = Vec::new();
             if let Ok(entries) = fs::read_dir(&transcripts) {
                 for entry in entries.flatten() {
                     let path = entry.path();
@@ -308,7 +309,7 @@ pub fn load_cursor_sessions() -> Vec<Session> {
                             .unwrap_or_default()
                             .to_string_lossy()
                             .to_string();
-                        seen_ids.insert(sid.clone());
+                        txt_ids.insert(sid.clone());
                         let jsonl_alt = transcripts.join(&sid).join(format!("{sid}.jsonl"));
                         let iso = mtime_iso(&path).unwrap_or_default();
                         let date = mtime_date(&path).unwrap_or_default();
@@ -338,32 +339,35 @@ pub fn load_cursor_sessions() -> Vec<Session> {
                             .unwrap_or_default()
                             .to_string_lossy()
                             .to_string();
-                        if seen_ids.contains(&dirname) {
-                            continue;
-                        }
-                        let jf = path.join(format!("{dirname}.jsonl"));
-                        if !jf.exists() {
-                            continue;
-                        }
-                        let iso = mtime_iso(&jf).unwrap_or_default();
-                        let date = mtime_date(&jf).unwrap_or_default();
-                        let first = cursor_first_prompt_jsonl(&jf);
-                        sessions.push(Session {
-                            source: "cursor".into(),
-                            id: dirname,
-                            summary: String::new(),
-                            first_prompt: first,
-                            created: iso.clone(),
-                            modified: iso,
-                            date,
-                            messages: 0,
-                            branch: String::new(),
-                            project: pd.file_name().to_string_lossy().to_string(),
-                            file: jf.to_string_lossy().to_string(),
-                            is_sidechain: false,
-                        });
+                        dir_entries.push((dirname, path));
                     }
                 }
+            }
+            for (dirname, path) in dir_entries {
+                if txt_ids.contains(&dirname) {
+                    continue;
+                }
+                let jf = path.join(format!("{dirname}.jsonl"));
+                if !jf.exists() {
+                    continue;
+                }
+                let iso = mtime_iso(&jf).unwrap_or_default();
+                let date = mtime_date(&jf).unwrap_or_default();
+                let first = cursor_first_prompt_jsonl(&jf);
+                sessions.push(Session {
+                    source: "cursor".into(),
+                    id: dirname,
+                    summary: String::new(),
+                    first_prompt: first,
+                    created: iso.clone(),
+                    modified: iso,
+                    date,
+                    messages: 0,
+                    branch: String::new(),
+                    project: pd.file_name().to_string_lossy().to_string(),
+                    file: jf.to_string_lossy().to_string(),
+                    is_sidechain: false,
+                });
             }
         }
     }
