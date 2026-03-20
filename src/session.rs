@@ -138,9 +138,13 @@ pub fn copy_session_to_dir(session: &Session, target_dir: &Path) -> std::io::Res
     fs::create_dir_all(target_dir)?;
 
     let src = Path::new(&session.file);
-    if let Some(filename) = src.file_name() {
-        fs::copy(src, target_dir.join(filename))?;
-    }
+    let filename = src.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("session file path '{}' has no filename", session.file),
+        )
+    })?;
+    fs::copy(src, target_dir.join(filename))?;
 
     if let Some(parent) = src.parent() {
         let companion = parent.join(&session.id);

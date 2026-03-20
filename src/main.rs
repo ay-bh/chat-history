@@ -255,11 +255,17 @@ fn main() {
                         "Project dir {} no longer exists, copying session to current directory...",
                         session.project
                     );
-                    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-                    let encoded = session::encode_path_for_claude(&cwd);
-                    let target = session::claude_projects_dir().join(&encoded);
-                    if let Err(e) = session::copy_session_to_dir(session, &target) {
-                        eprintln!("Warning: failed to copy session files: {e}");
+                    match std::env::current_dir() {
+                        Ok(cwd) => {
+                            let encoded = session::encode_path_for_claude(&cwd);
+                            let target = session::claude_projects_dir().join(&encoded);
+                            if let Err(e) = session::copy_session_to_dir(session, &target) {
+                                eprintln!("Warning: failed to copy session files: {e}");
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Warning: could not determine current directory; skipping session copy: {e}");
+                        }
                     }
                 }
             }
