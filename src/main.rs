@@ -250,6 +250,17 @@ fn main() {
                     if let Err(e) = std::env::set_current_dir(project) {
                         eprintln!("Warning: could not cd to {}: {e}", session.project);
                     }
+                } else {
+                    eprintln!(
+                        "Project dir {} no longer exists, copying session to current directory...",
+                        session.project
+                    );
+                    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+                    let encoded = session::encode_path_for_claude(&cwd);
+                    let target = session::claude_projects_dir().join(&encoded);
+                    if let Err(e) = session::copy_session_to_dir(session, &target) {
+                        eprintln!("Warning: failed to copy session files: {e}");
+                    }
                 }
             }
             use std::os::unix::process::CommandExt;
