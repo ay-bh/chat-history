@@ -36,13 +36,11 @@ chat-history -L                            # current workspace only
 chat-history --branch feature-xyz          # filter by branch
 chat-history -k "auth" -v                  # keyword filter, show IDs
 
-# Search (fast index search by default, sub-second)
-chat-history search "auth error"           # searches summary/prompt/branch
-chat-history search "auth error" --deep    # full transcript search (rayon-parallelized)
-chat-history search "fix" --scope errors   # error patterns only
-chat-history search "trade" --scope similar  # similar past queries
-chat-history search <full-uuid>            # direct UUID lookup
-chat-history search "cache fix" --json     # structured JSON output for agents
+# Search (always use --deep --json for best results from agents)
+chat-history search "auth error" --deep --json   # full transcript search, structured output
+chat-history search "fix" --scope errors --deep  # error patterns only
+chat-history search "trade" --scope similar      # similar past queries
+chat-history search <full-uuid>                  # direct UUID lookup
 
 # Inspect (session summary)
 chat-history inspect --last                # accomplishments, tools, model, tokens
@@ -60,12 +58,10 @@ The short alias `ch` works identically: `ch search "auth"`, `ch inspect --last`,
 
 ## Search behavior
 
-- **Index search** (default): Searches session metadata (summary, first prompt, branch) — sub-second.
-  - Weak index results (★ < 5.0) automatically fall through to deep transcript search.
-- **Deep search** (`--deep`): Searches full transcript content across all messages.
-  - Parses sessions in parallel using rayon.
+- Always use `--deep --json` when calling from an agent for thorough results and structured output.
+- **Deep search** (`--deep`): Searches full transcript content across all messages in parallel.
   - Snippets show context **around the match**, not the first N characters of the message.
-- **JSON output** (`--json`): Returns structured JSON with `session_id`, `score`, `snippet`, `tools`, `files` — ideal for programmatic/agent consumption.
+- **JSON output** (`--json`): Returns structured JSON with `session_id`, `score`, `snippet`, `tools`, `files`.
 
 ## Interpreting output
 
