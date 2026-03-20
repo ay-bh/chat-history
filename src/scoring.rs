@@ -25,34 +25,176 @@ static CORE_TECH_RE: LazyLock<Regex> = LazyLock::new(|| {
 
 static GENERIC_TERMS: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
     [
-        "config", "configuration", "setup", "install", "build", "deploy", "test", "run",
-        "start", "create", "update", "fix", "add", "remove", "change", "optimize", "use",
-        "using", "with", "for", "the", "and", "make", "write", "read", "delete", "check",
-        "testing", "tests", "mocks", "mocking", "stubs", "coverage", "specs",
-        "design", "designs", "designing", "responsive", "architecture", "pattern", "patterns",
-        "caching", "cache", "rendering", "render", "bundle", "bundling", "performance",
-        "strategy", "strategies", "approach", "implementation", "solution", "solutions",
-        "feature", "features", "system", "systems", "process", "processing",
-        "handler", "handling", "manager", "management",
-        "files", "file", "folder", "directory", "path", "code", "data", "error", "errors",
-        "function", "functions", "class", "classes", "method", "methods",
-        "variable", "variables", "component", "components", "module", "modules",
-        "package", "packages", "library", "libraries",
-        "format", "formatting", "style", "styles", "layout", "display", "show", "hide",
-        "rules", "rule", "options", "option", "settings", "setting", "params", "parameters",
-        "server", "client", "request", "response",
-        "async", "await", "promise", "callback",
-        "import", "export", "require", "include", "define", "declare",
-        "return", "output", "input",
-        "database", "schema", "schemas", "models", "model", "table", "tables",
-        "query", "queries", "migration", "migrations", "index", "indexes",
-        "field", "fields", "column", "columns",
-        "deployment", "container", "containers", "service", "services",
-        "cluster", "clusters", "instance", "instances",
-        "environment", "environments", "manifest", "resource", "resources",
-        "interface", "interfaces", "types", "typing", "object", "objects",
-        "array", "arrays", "string", "strings", "number", "numbers", "boolean",
-        "value", "values", "property", "properties",
+        "config",
+        "configuration",
+        "setup",
+        "install",
+        "build",
+        "deploy",
+        "test",
+        "run",
+        "start",
+        "create",
+        "update",
+        "fix",
+        "add",
+        "remove",
+        "change",
+        "optimize",
+        "use",
+        "using",
+        "with",
+        "for",
+        "the",
+        "and",
+        "make",
+        "write",
+        "read",
+        "delete",
+        "check",
+        "testing",
+        "tests",
+        "mocks",
+        "mocking",
+        "stubs",
+        "coverage",
+        "specs",
+        "design",
+        "designs",
+        "designing",
+        "responsive",
+        "architecture",
+        "pattern",
+        "patterns",
+        "caching",
+        "cache",
+        "rendering",
+        "render",
+        "bundle",
+        "bundling",
+        "performance",
+        "strategy",
+        "strategies",
+        "approach",
+        "implementation",
+        "solution",
+        "solutions",
+        "feature",
+        "features",
+        "system",
+        "systems",
+        "process",
+        "processing",
+        "handler",
+        "handling",
+        "manager",
+        "management",
+        "files",
+        "file",
+        "folder",
+        "directory",
+        "path",
+        "code",
+        "data",
+        "error",
+        "errors",
+        "function",
+        "functions",
+        "class",
+        "classes",
+        "method",
+        "methods",
+        "variable",
+        "variables",
+        "component",
+        "components",
+        "module",
+        "modules",
+        "package",
+        "packages",
+        "library",
+        "libraries",
+        "format",
+        "formatting",
+        "style",
+        "styles",
+        "layout",
+        "display",
+        "show",
+        "hide",
+        "rules",
+        "rule",
+        "options",
+        "option",
+        "settings",
+        "setting",
+        "params",
+        "parameters",
+        "server",
+        "client",
+        "request",
+        "response",
+        "async",
+        "await",
+        "promise",
+        "callback",
+        "import",
+        "export",
+        "require",
+        "include",
+        "define",
+        "declare",
+        "return",
+        "output",
+        "input",
+        "database",
+        "schema",
+        "schemas",
+        "models",
+        "model",
+        "table",
+        "tables",
+        "query",
+        "queries",
+        "migration",
+        "migrations",
+        "index",
+        "indexes",
+        "field",
+        "fields",
+        "column",
+        "columns",
+        "deployment",
+        "container",
+        "containers",
+        "service",
+        "services",
+        "cluster",
+        "clusters",
+        "instance",
+        "instances",
+        "environment",
+        "environments",
+        "manifest",
+        "resource",
+        "resources",
+        "interface",
+        "interfaces",
+        "types",
+        "typing",
+        "object",
+        "objects",
+        "array",
+        "arrays",
+        "string",
+        "strings",
+        "number",
+        "numbers",
+        "boolean",
+        "value",
+        "values",
+        "property",
+        "properties",
     ]
     .into_iter()
     .collect()
@@ -60,8 +202,7 @@ static GENERIC_TERMS: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
 
 static WORD_SPLIT_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"[\s.,;:!?\(\)\[\]\{\}'"<>]+"#).unwrap());
-static NON_WORD_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r#"[^\w\-]"#).unwrap());
+static NON_WORD_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"[^\w\-]"#).unwrap());
 static DIGIT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"\d+"#).unwrap());
 static QUOTE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"['"]"#).unwrap());
 static WHITESPACE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"\s+"#).unwrap());
@@ -169,9 +310,15 @@ pub fn score_relevance(text: &str, query: &str) -> f64 {
     }
     let lower_content = text.to_lowercase();
     let lower_query = query.to_lowercase();
-    let mut query_words: Vec<&str> = lower_query.split_whitespace().filter(|w| w.len() > 2).collect();
+    let mut query_words: Vec<&str> = lower_query
+        .split_whitespace()
+        .filter(|w| w.len() > 2)
+        .collect();
     if query_words.is_empty() {
-        query_words = lower_query.split_whitespace().filter(|w| w.len() >= 2).collect();
+        query_words = lower_query
+            .split_whitespace()
+            .filter(|w| w.len() >= 2)
+            .collect();
     }
     if query_words.is_empty() {
         return 0.0;
@@ -185,8 +332,15 @@ pub fn score_relevance(text: &str, query: &str) -> f64 {
 
     let mut score = 0.0;
 
-    let strict_core: Vec<&str> = query_words.iter().filter(|w| CORE_TECH_RE.is_match(w)).copied().collect();
-    let core_matches = strict_core.iter().filter(|t| content_word_set.contains(&t.to_string())).count();
+    let strict_core: Vec<&str> = query_words
+        .iter()
+        .filter(|w| CORE_TECH_RE.is_match(w))
+        .copied()
+        .collect();
+    let core_matches = strict_core
+        .iter()
+        .filter(|t| content_word_set.contains(**t))
+        .count();
     score += core_matches as f64 * EXACT_MATCH_SCORE;
     if !strict_core.is_empty() && core_matches == 0 {
         score -= 8.0;
@@ -197,7 +351,7 @@ pub fn score_relevance(text: &str, query: &str) -> f64 {
         if strict_core.contains(word) {
             continue;
         }
-        if content_word_set.contains(&word.to_string()) {
+        if content_word_set.contains(*word) {
             word_match_count += 1;
             score += WORD_MATCH_SCORE;
         } else if lower_content.contains(*word) {
@@ -207,10 +361,12 @@ pub fn score_relevance(text: &str, query: &str) -> f64 {
     }
 
     for word in &query_words {
-        if word.len() >= 5 && !CORE_TECH_RE.is_match(word) && !GENERIC_TERMS.contains(word) {
-            if content_word_set.contains(&word.to_string()) {
-                score += SUPPORTING_TERM_SCORE;
-            }
+        if word.len() >= 5
+            && !CORE_TECH_RE.is_match(word)
+            && !GENERIC_TERMS.contains(word)
+            && content_word_set.contains(*word)
+        {
+            score += SUPPORTING_TERM_SCORE;
         }
     }
 
@@ -233,10 +389,11 @@ pub fn score_relevance(text: &str, query: &str) -> f64 {
         }
     }
 
-    if lower_content.contains("\": true") && lower_content.contains("\": false") {
-        if lower_content.contains("plugin") || lower_content.contains("enabled") {
-            score *= 0.2;
-        }
+    if lower_content.contains("\": true")
+        && lower_content.contains("\": false")
+        && (lower_content.contains("plugin") || lower_content.contains("enabled"))
+    {
+        score *= 0.2;
     }
 
     score
@@ -268,72 +425,130 @@ pub fn semantic_boosts(query: &str) -> Vec<(&'static str, f64)> {
 
 pub fn importance_boost(content_lower: &str) -> f64 {
     let mut max_b: f64 = 1.0;
-    if ["decided to", "decision", "chose", "trade-off", "tradeoff", "rationale",
-        "why we", "instead of", "opted for", "approach", "architecture", "design decision"]
-        .iter()
-        .any(|p| content_lower.contains(p))
+    if [
+        "decided to",
+        "decision",
+        "chose",
+        "trade-off",
+        "tradeoff",
+        "rationale",
+        "why we",
+        "instead of",
+        "opted for",
+        "approach",
+        "architecture",
+        "design decision",
+    ]
+    .iter()
+    .any(|p| content_lower.contains(p))
     {
         max_b = max_b.max(2.5);
     }
-    if ["fixed", "bug", "gotcha", "workaround", "edge case", "issue", "problem", "broke", "breaking"]
-        .iter()
-        .any(|p| content_lower.contains(p))
+    if [
+        "fixed",
+        "bug",
+        "gotcha",
+        "workaround",
+        "edge case",
+        "issue",
+        "problem",
+        "broke",
+        "breaking",
+    ]
+    .iter()
+    .any(|p| content_lower.contains(p))
     {
         max_b = max_b.max(2.0);
     }
-    if ["implemented", "shipped", "feature", "added", "built", "created", "new", "release"]
-        .iter()
-        .any(|p| content_lower.contains(p))
+    if [
+        "implemented",
+        "shipped",
+        "feature",
+        "added",
+        "built",
+        "created",
+        "new",
+        "release",
+    ]
+    .iter()
+    .any(|p| content_lower.contains(p))
     {
         max_b = max_b.max(1.5);
     }
-    if ["learned", "discovered", "insight", "found out", "realize", "understanding", "now know"]
-        .iter()
-        .any(|p| content_lower.contains(p))
+    if [
+        "learned",
+        "discovered",
+        "insight",
+        "found out",
+        "realize",
+        "understanding",
+        "now know",
+    ]
+    .iter()
+    .any(|p| content_lower.contains(p))
     {
         max_b = max_b.max(1.3);
     }
     max_b
 }
 
-static TECHNICAL_SYNONYMS: LazyLock<HashMap<&'static str, &'static [&'static str]>> = LazyLock::new(|| {
-    let mut m = HashMap::new();
-    m.insert("error", ["exception", "fail", "crash", "bug", "issue"].as_slice());
-    m.insert("fix", &["resolve", "solve", "repair", "correct"]);
-    m.insert("implement", &["create", "build", "develop", "add"]);
-    m.insert("optimize", &["improve", "enhance", "performance"]);
-    m.insert("debug", &["troubleshoot", "diagnose", "trace"]);
-    m.insert("deploy", &["publish", "release", "launch"]);
-    m.insert("auth", &["authentication", "login", "security"]);
-    m.insert("api", &["endpoint", "service", "request"]);
-    m
-});
+static TECHNICAL_SYNONYMS: LazyLock<HashMap<&'static str, &'static [&'static str]>> =
+    LazyLock::new(|| {
+        let mut m = HashMap::new();
+        m.insert(
+            "error",
+            ["exception", "fail", "crash", "bug", "issue"].as_slice(),
+        );
+        m.insert("fix", &["resolve", "solve", "repair", "correct"]);
+        m.insert("implement", &["create", "build", "develop", "add"]);
+        m.insert("optimize", &["improve", "enhance", "performance"]);
+        m.insert("debug", &["troubleshoot", "diagnose", "trace"]);
+        m.insert("deploy", &["publish", "release", "launch"]);
+        m.insert("auth", &["authentication", "login", "security"]);
+        m.insert("api", &["endpoint", "service", "request"]);
+        m
+    });
 
 static STEM_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(ing|ed|s|ly|tion|ment)$").unwrap());
 
 pub fn query_similarity(q1: &str, q2: &str) -> f64 {
     static STOP: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
-        ["the", "and", "for", "that", "this", "with", "from", "have", "has",
-         "how", "what", "when", "where", "why", "can", "could", "would",
-         "should", "want", "need", "help", "please", "just", "like", "some"]
-            .into_iter().collect()
+        [
+            "the", "and", "for", "that", "this", "with", "from", "have", "has", "how", "what",
+            "when", "where", "why", "can", "could", "would", "should", "want", "need", "help",
+            "please", "just", "like", "some",
+        ]
+        .into_iter()
+        .collect()
     });
 
-    let w1: Vec<String> = q1.to_lowercase().split_whitespace()
-        .filter(|w| w.len() > 2).map(String::from).collect();
-    let w2: Vec<String> = q2.to_lowercase().split_whitespace()
-        .filter(|w| w.len() > 2).map(String::from).collect();
+    let w1: Vec<String> = q1
+        .to_lowercase()
+        .split_whitespace()
+        .filter(|w| w.len() > 2)
+        .map(String::from)
+        .collect();
+    let w2: Vec<String> = q2
+        .to_lowercase()
+        .split_whitespace()
+        .filter(|w| w.len() > 2)
+        .map(String::from)
+        .collect();
     if w1.is_empty() || w2.is_empty() {
         return 0.0;
     }
 
-    let sig1: Vec<&str> = w1.iter()
+    let sig1: Vec<&str> = w1
+        .iter()
         .filter(|w| w.len() >= 4 && !STOP.contains(w.as_str()))
-        .map(|s| s.as_str()).collect();
-    let sig2: Vec<&str> = w2.iter()
+        .map(|s| s.as_str())
+        .collect();
+    let sig2: Vec<&str> = w2
+        .iter()
         .filter(|w| w.len() >= 4 && !STOP.contains(w.as_str()))
-        .map(|s| s.as_str()).collect();
+        .map(|s| s.as_str())
+        .collect();
 
     let mut total_score: f64 = 0.0;
     let mut sig_matches = 0usize;
@@ -413,4 +628,212 @@ pub fn content_signature(text: &str, tools: &[String], files: &[String]) -> Stri
     };
     let f = if files.is_empty() { "nofiles" } else { "files" };
     format!("{t}:{f}:{norm}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_uuid_valid() {
+        assert!(is_uuid("550e8400-e29b-41d4-a716-446655440000"));
+        assert!(is_uuid("  550e8400-e29b-41d4-a716-446655440000  "));
+    }
+
+    #[test]
+    fn is_uuid_invalid() {
+        assert!(!is_uuid("not-a-uuid"));
+        assert!(!is_uuid(""));
+        assert!(!is_uuid("550e8400-e29b-41d4-a716-44665544000")); // too short
+        assert!(!is_uuid("550e8400-e29b-41d4-a716-4466554400000")); // too long
+        assert!(!is_uuid("550e8400-e29b-41d4-a716-44665544000g")); // non-hex
+        assert!(!is_uuid("550e8400e29b41d4a716446655440000")); // no dashes
+    }
+
+    #[test]
+    fn normalize_basic() {
+        assert_eq!(normalize_for_search("Hello_World"), "hello world");
+        assert_eq!(normalize_for_search("src/main.rs"), "src main.rs");
+        assert_eq!(normalize_for_search("foo-bar"), "foo bar");
+        assert_eq!(normalize_for_search("UPPERCASE"), "uppercase");
+        assert_eq!(normalize_for_search(""), "");
+    }
+
+    #[test]
+    fn score_relevance_short_text_is_zero() {
+        assert_eq!(score_relevance("short", "query"), 0.0);
+    }
+
+    #[test]
+    fn score_relevance_matching_tech_term() {
+        let text = "I implemented a new webpack configuration for the project with optimized build settings";
+        let score = score_relevance(text, "webpack configuration");
+        assert!(score > 0.0, "Expected positive score, got {score}");
+    }
+
+    #[test]
+    fn score_relevance_no_match() {
+        let text =
+            "The weather today is sunny and warm with clear skies and gentle breeze from the south";
+        let score = score_relevance(text, "webpack docker kubernetes");
+        assert!(score <= 0.0, "Expected non-positive score, got {score}");
+    }
+
+    #[test]
+    fn score_relevance_exact_phrase_bonus() {
+        let text =
+            "We need to fix the docker build pipeline to improve deployment speed and reliability";
+        let phrase_score = score_relevance(text, "docker build");
+        let partial_score = score_relevance(text, "docker reliability");
+        assert!(
+            phrase_score > partial_score,
+            "Exact phrase should score higher"
+        );
+    }
+
+    #[test]
+    fn query_similarity_identical() {
+        let sim = query_similarity("implement authentication", "implement authentication");
+        assert!(sim > 0.8, "Expected high similarity, got {sim}");
+    }
+
+    #[test]
+    fn query_similarity_different() {
+        let sim = query_similarity("implement authentication", "weather forecast today");
+        assert!(sim < 0.3, "Expected low similarity, got {sim}");
+    }
+
+    #[test]
+    fn query_similarity_synonyms() {
+        let sim = query_similarity("fix error", "resolve bug");
+        assert!(
+            sim > 0.0,
+            "Expected positive similarity for synonyms, got {sim}"
+        );
+    }
+
+    #[test]
+    fn query_similarity_empty() {
+        assert_eq!(query_similarity("", "test"), 0.0);
+        assert_eq!(query_similarity("test", ""), 0.0);
+        assert_eq!(query_similarity("", ""), 0.0);
+    }
+
+    #[test]
+    fn content_signature_deterministic() {
+        let tools = vec!["Read".to_string()];
+        let files = vec!["/src/main.rs".to_string()];
+        let sig1 = content_signature("hello world 123", &tools, &files);
+        let sig2 = content_signature("hello world 123", &tools, &files);
+        assert_eq!(sig1, sig2);
+    }
+
+    #[test]
+    fn content_signature_normalizes_digits() {
+        let sig = content_signature("error on line 42", &[], &[]);
+        assert!(sig.contains('N'), "Digits should be replaced with N");
+        assert!(!sig.contains("42"));
+    }
+
+    #[test]
+    fn content_signature_differs_with_files() {
+        let sig_no_files = content_signature("test", &[], &[]);
+        let sig_with_files = content_signature("test", &[], &["main.rs".to_string()]);
+        assert_ne!(
+            sig_no_files, sig_with_files,
+            "Files should change the signature for deduplication"
+        );
+    }
+
+    #[test]
+    fn content_signature_same_files_same_sig() {
+        let files = vec!["main.rs".to_string()];
+        let sig1 = content_signature("test", &[], &files);
+        let sig2 = content_signature("same content different text", &[], &files);
+        assert_ne!(
+            sig1, sig2,
+            "Different content text should produce different signatures even with same files"
+        );
+    }
+
+    #[test]
+    fn content_signature_sorted_tools() {
+        let tools1 = vec!["Read".into(), "Edit".into()];
+        let tools2 = vec!["Edit".into(), "Read".into()];
+        let sig1 = content_signature("test", &tools1, &[]);
+        let sig2 = content_signature("test", &tools2, &[]);
+        assert_eq!(sig1, sig2, "Tool order should not matter");
+    }
+
+    #[test]
+    fn semantic_boosts_error_query() {
+        let boosts = semantic_boosts("fix error in code");
+        let types: Vec<&str> = boosts.iter().map(|(t, _)| *t).collect();
+        assert!(types.contains(&"error_resolution"));
+        assert!(types.contains(&"solutions"));
+    }
+
+    #[test]
+    fn semantic_boosts_implementation_query() {
+        let boosts = semantic_boosts("implement file upload");
+        let types: Vec<&str> = boosts.iter().map(|(t, _)| *t).collect();
+        assert!(types.contains(&"implementation"));
+        assert!(types.contains(&"file_operations"));
+    }
+
+    #[test]
+    fn semantic_boosts_empty_for_generic() {
+        let boosts = semantic_boosts("hello world");
+        assert!(boosts.is_empty());
+    }
+
+    #[test]
+    fn importance_boost_decision() {
+        assert!(importance_boost("we decided to use react instead of vue") > 1.0);
+    }
+
+    #[test]
+    fn importance_boost_bug_fix() {
+        assert!(importance_boost("fixed the edge case bug in auth handler") > 1.0);
+    }
+
+    #[test]
+    fn importance_boost_neutral() {
+        assert_eq!(
+            importance_boost("just a normal message nothing special here"),
+            1.0
+        );
+    }
+
+    #[test]
+    fn recency_multiplier_empty() {
+        assert_eq!(recency_multiplier(""), 1.0);
+    }
+
+    #[test]
+    fn recency_multiplier_old_date() {
+        assert_eq!(recency_multiplier("2020-01-01T00:00:00+00:00"), 1.0);
+    }
+
+    #[test]
+    fn recency_multiplier_invalid() {
+        assert_eq!(recency_multiplier("not-a-date"), 1.0);
+    }
+
+    #[test]
+    fn prefix_match_score_empty_query() {
+        assert_eq!(prefix_match_score("some text", &[], ""), 0.0);
+    }
+
+    #[test]
+    fn prefix_match_score_all_match() {
+        let score = prefix_match_score("implementing authentication system", &["impl", "auth"], "");
+        assert!(score > 0.0, "Expected positive score, got {score}");
+    }
+
+    #[test]
+    fn prefix_match_score_partial_miss() {
+        let score = prefix_match_score("implementing system", &["impl", "auth"], "");
+        assert_eq!(score, 0.0, "Should be zero when not all terms match");
+    }
 }

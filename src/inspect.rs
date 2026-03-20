@@ -33,7 +33,10 @@ fn find_case_insensitive(text: &str, keyword: &str) -> Option<(usize, usize)> {
                 Some(tc) if tc.to_lowercase().next() == Some(kc) => {
                     end += tc.len_utf8();
                 }
-                _ => { matched = false; break; }
+                _ => {
+                    matched = false;
+                    break;
+                }
             }
         }
         if matched {
@@ -65,7 +68,10 @@ pub fn inspect_session(session: &Session) -> Option<InspectInfo> {
         return None;
     }
     let meta = meta_opt.unwrap_or(SessionMeta {
-        summary: None, custom_title: None, model: None, total_tokens: 0,
+        summary: None,
+        custom_title: None,
+        model: None,
+        total_tokens: 0,
     });
 
     let mut tools_used: BTreeSet<String> = BTreeSet::new();
@@ -80,13 +86,28 @@ pub fn inspect_session(session: &Session) -> Option<InspectInfo> {
     let mut dec_set: HashSet<String> = HashSet::new();
 
     let accomplishment_signals = [
-        "successfully", "completed", "fixed", "implemented", "created",
-        "added", "updated", "resolved", "built", "configured",
-        "here's what we accomplished", "done", "finished",
+        "successfully",
+        "completed",
+        "fixed",
+        "implemented",
+        "created",
+        "added",
+        "updated",
+        "resolved",
+        "built",
+        "configured",
+        "here's what we accomplished",
+        "done",
+        "finished",
     ];
     let decision_signals = [
-        "decided to", "chose", "instead of", "opted for",
-        "trade-off", "rationale", "the approach",
+        "decided to",
+        "chose",
+        "instead of",
+        "opted for",
+        "trade-off",
+        "rationale",
+        "the approach",
     ];
 
     for msg in &messages {
@@ -111,20 +132,20 @@ pub fn inspect_session(session: &Session) -> Option<InspectInfo> {
             let cl = msg.content_lower();
             for sig in &accomplishment_signals {
                 if cl.contains(sig) {
-                    if let Some(snippet) = extract_sentence_around(&msg.content, sig) {
-                        if acc_set.insert(snippet.clone()) {
-                            accomplishments.push(snippet);
-                        }
+                    if let Some(snippet) = extract_sentence_around(&msg.content, sig)
+                        && acc_set.insert(snippet.clone())
+                    {
+                        accomplishments.push(snippet);
                     }
                     break;
                 }
             }
             for sig in &decision_signals {
                 if cl.contains(sig) {
-                    if let Some(snippet) = extract_sentence_around(&msg.content, sig) {
-                        if dec_set.insert(snippet.clone()) {
-                            decisions.push(snippet);
-                        }
+                    if let Some(snippet) = extract_sentence_around(&msg.content, sig)
+                        && dec_set.insert(snippet.clone())
+                    {
+                        decisions.push(snippet);
                     }
                     break;
                 }
@@ -132,13 +153,18 @@ pub fn inspect_session(session: &Session) -> Option<InspectInfo> {
         }
     }
 
-    let timestamps: Vec<&str> = messages.iter().map(|m| m.timestamp.as_str()).filter(|t| !t.is_empty()).collect();
+    let timestamps: Vec<&str> = messages
+        .iter()
+        .map(|m| m.timestamp.as_str())
+        .filter(|t| !t.is_empty())
+        .collect();
     let duration = if timestamps.len() >= 2 {
         let min_ts = timestamps.iter().min().unwrap();
         let max_ts = timestamps.iter().max().unwrap();
         let parse_ts = |s: &str| -> Option<DateTime<FixedOffset>> {
             let s = s.replace('Z', "+00:00");
-            DateTime::parse_from_rfc3339(&s).ok()
+            DateTime::parse_from_rfc3339(&s)
+                .ok()
                 .or_else(|| DateTime::parse_from_str(&s, "%Y-%m-%dT%H:%M:%S%.f%:z").ok())
         };
         match (parse_ts(min_ts), parse_ts(max_ts)) {
@@ -149,7 +175,8 @@ pub fn inspect_session(session: &Session) -> Option<InspectInfo> {
         0
     };
 
-    let effective_summary = meta.custom_title
+    let effective_summary = meta
+        .custom_title
         .or(meta.summary)
         .unwrap_or_else(|| session.summary.clone());
 
