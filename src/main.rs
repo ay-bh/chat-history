@@ -31,7 +31,7 @@ struct Cli {
     #[arg(long, global = true, help = "Filter by git branch substring")]
     branch: Option<String>,
 
-    #[arg(short = 'k', long, help = "Quick keyword filter")]
+    #[arg(short = 'k', long, global = true, help = "Quick keyword filter")]
     keyword: Option<String>,
 
     #[arg(short = 's', long, help = "Group sessions by day")]
