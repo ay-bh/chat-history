@@ -134,6 +134,19 @@ pub fn encode_path_for_claude(path: &Path) -> String {
     path.to_string_lossy().replace('/', "-")
 }
 
+fn normalize_for_project_match(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .to_lowercase()
+}
+
 pub fn copy_session_to_dir(session: &Session, target_dir: &Path) -> std::io::Result<()> {
     fs::create_dir_all(target_dir)?;
 
@@ -804,6 +817,7 @@ pub fn filter_sessions(
     project: Option<&str>,
     branch: Option<&str>,
 ) -> Vec<Session> {
+    let project_norm = project.map(normalize_for_project_match);
     let mut out: Vec<Session> = sessions
         .iter()
         .filter(|s| {
@@ -829,8 +843,8 @@ pub fn filter_sessions(
             {
                 return false;
             }
-            if let Some(proj) = project
-                && !s.project.to_lowercase().contains(&proj.to_lowercase())
+            if let Some(proj_norm) = project_norm.as_ref()
+                && !normalize_for_project_match(&s.project).contains(proj_norm)
             {
                 return false;
             }
@@ -980,6 +994,32 @@ mod tests {
         let filtered = filter_sessions(&sessions, None, None, None, None, Some("chat"), None);
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].project, "chat-history");
+    }
+
+    #[test]
+    fn filter_by_project_underscore_dash_mismatch() {
+        let sessions = vec![make_session(
+            "1",
+            "2025-01-01",
+            "cursor",
+            "proj-one-two-123",
+            "",
+            "",
+        )];
+        let filtered = filter_sessions(
+            &sessions,
+            None,
+            None,
+            None,
+            None,
+            Some("proj_one_two_123"),
+            None,
+        );
+        assert_eq!(
+            filtered.len(),
+            1,
+            "underscore in filter should match dashes in project path"
+        );
     }
 
     #[test]
