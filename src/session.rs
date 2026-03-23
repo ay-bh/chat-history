@@ -136,7 +136,13 @@ pub fn encode_path_for_claude(path: &Path) -> String {
 
 fn normalize_for_project_match(s: &str) -> String {
     s.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect::<String>()
         .to_lowercase()
 }
@@ -996,13 +1002,24 @@ mod tests {
             "1",
             "2025-01-01",
             "cursor",
-            "codemill-bhardayu-macro-mt-21188",
+            "proj-one-two-123",
             "",
-            "s1",
+            "",
         )];
-        let filtered =
-            filter_sessions(&sessions, None, None, None, None, Some("macro_mt_21188"), None);
-        assert_eq!(filtered.len(), 1, "underscore in filter should match dashes in project path");
+        let filtered = filter_sessions(
+            &sessions,
+            None,
+            None,
+            None,
+            None,
+            Some("proj_one_two_123"),
+            None,
+        );
+        assert_eq!(
+            filtered.len(),
+            1,
+            "underscore in filter should match dashes in project path"
+        );
     }
 
     #[test]
