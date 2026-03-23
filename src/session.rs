@@ -137,7 +137,7 @@ pub fn encode_path_for_claude(path: &Path) -> String {
 fn normalize_for_project_match(s: &str) -> String {
     s.chars()
         .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' {
+            if c.is_alphanumeric() || c == '-' {
                 c
             } else {
                 '-'
@@ -817,6 +817,7 @@ pub fn filter_sessions(
     project: Option<&str>,
     branch: Option<&str>,
 ) -> Vec<Session> {
+    let project_norm = project.map(normalize_for_project_match);
     let mut out: Vec<Session> = sessions
         .iter()
         .filter(|s| {
@@ -842,9 +843,8 @@ pub fn filter_sessions(
             {
                 return false;
             }
-            if let Some(proj) = project
-                && !normalize_for_project_match(&s.project)
-                    .contains(&normalize_for_project_match(proj))
+            if let Some(proj_norm) = project_norm.as_ref()
+                && !normalize_for_project_match(&s.project).contains(proj_norm)
             {
                 return false;
             }
