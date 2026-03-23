@@ -134,6 +134,13 @@ pub fn encode_path_for_claude(path: &Path) -> String {
     path.to_string_lossy().replace('/', "-")
 }
 
+fn normalize_for_project_match(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' })
+        .collect::<String>()
+        .to_lowercase()
+}
+
 pub fn copy_session_to_dir(session: &Session, target_dir: &Path) -> std::io::Result<()> {
     fs::create_dir_all(target_dir)?;
 
@@ -830,7 +837,8 @@ pub fn filter_sessions(
                 return false;
             }
             if let Some(proj) = project
-                && !s.project.to_lowercase().contains(&proj.to_lowercase())
+                && !normalize_for_project_match(&s.project)
+                    .contains(&normalize_for_project_match(proj))
             {
                 return false;
             }
@@ -980,6 +988,21 @@ mod tests {
         let filtered = filter_sessions(&sessions, None, None, None, None, Some("chat"), None);
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].project, "chat-history");
+    }
+
+    #[test]
+    fn filter_by_project_underscore_dash_mismatch() {
+        let sessions = vec![make_session(
+            "1",
+            "2025-01-01",
+            "cursor",
+            "codemill-bhardayu-macro-mt-21188",
+            "",
+            "s1",
+        )];
+        let filtered =
+            filter_sessions(&sessions, None, None, None, None, Some("macro_mt_21188"), None);
+        assert_eq!(filtered.len(), 1, "underscore in filter should match dashes in project path");
     }
 
     #[test]
