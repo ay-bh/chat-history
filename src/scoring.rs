@@ -1,4 +1,4 @@
-use chrono::{DateTime, FixedOffset, Local, Utc};
+use chrono::Local;
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
@@ -242,18 +242,8 @@ pub fn recency_multiplier(timestamp_str: &str) -> f64 {
     if timestamp_str.is_empty() {
         return 1.0;
     }
-    let ts_str = timestamp_str.replace('Z', "+00:00");
-    let ts = match DateTime::<FixedOffset>::parse_from_rfc3339(&ts_str) {
-        Ok(t) => t,
-        Err(_) => {
-            if let Ok(t) = DateTime::parse_from_str(&ts_str, "%Y-%m-%dT%H:%M:%S%.f%:z") {
-                t
-            } else if let Ok(t) = ts_str.parse::<DateTime<Utc>>() {
-                t.fixed_offset()
-            } else {
-                return 1.0;
-            }
-        }
+    let Some(ts) = crate::session::parse_any_timestamp(timestamp_str) else {
+        return 1.0;
     };
     let now = Local::now().fixed_offset();
     let age = now.signed_duration_since(ts);

@@ -1,5 +1,5 @@
 use crate::parser::{clean_prompt, extract_text, is_clear_metadata, is_warmup_message};
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, FixedOffset, NaiveDate, Utc};
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashSet;
@@ -187,7 +187,15 @@ fn mtime_iso(path: &Path) -> Option<String> {
     let mtime = meta.modified().ok()?;
     let dur = mtime.duration_since(SystemTime::UNIX_EPOCH).ok()?;
     let dt = DateTime::<Utc>::from_timestamp(dur.as_secs() as i64, 0)?;
-    Some(dt.format("%Y-%m-%dT%H:%M:%S").to_string())
+    Some(dt.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+}
+
+pub fn parse_any_timestamp(s: &str) -> Option<DateTime<FixedOffset>> {
+    let s = s.replace('Z', "+00:00");
+    DateTime::parse_from_rfc3339(&s)
+        .or_else(|_| DateTime::parse_from_str(&s, "%Y-%m-%dT%H:%M:%S%.f%:z"))
+        .ok()
+        .or_else(|| s.parse::<DateTime<Utc>>().ok().map(|t| t.fixed_offset()))
 }
 
 fn mtime_date(path: &Path) -> Option<String> {
@@ -1250,5 +1258,29 @@ mod tests {
         let data = r#"{"type":"user","message":{"content":"hello"}}"#;
         std::fs::write(tmp.path(), data).unwrap();
         assert_eq!(read_cwd_from_jsonl(tmp.path()), None);
+    }
+
+    #[test]
+    fn parse_any_timestamp_rfc3339() {
+        assert!(parse_any_timestamp("2025-01-15T10:30:00+00:00").is_some());
+    }
+
+    #[test]
+    fn parse_any_timestamp_z_suffix() {
+        assert!(parse_any_timestamp("2025-01-15T10:30:00Z").is_some());
+    }
+
+    #[test]
+    fn parse_any_timestamp_invalid() {
+        assert!(parse_any_timestamp("not-a-date").is_none());
+        assert!(parse_any_timestamp("").is_none());
+    }
+
+    #[test]
+    fn mtime_iso_appends_z() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let ts = mtime_iso(tmp.path()).unwrap();
+        assert!(ts.ends_with('Z'), "mtime_iso should produce Z-suffixed timestamps, got: {ts}");
+        assert!(parse_any_timestamp(&ts).is_some(), "mtime_iso output should be parseable");
     }
 }
