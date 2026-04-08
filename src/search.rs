@@ -7,6 +7,7 @@ use std::collections::{BTreeSet, HashMap};
 
 const MAX_MATCHES_PER_SESSION: usize = 3;
 const INDEX_QUALITY_THRESHOLD: f64 = 5.0;
+const MAX_TOTAL_BOOST: f64 = 10.0;
 
 pub struct IndexResult {
     pub session: Session,
@@ -300,68 +301,73 @@ pub fn scored_search(
                 return (s, msg);
             }
 
-            if match_count > 0 {
-                score *= (1.0 + 0.5 * match_count as f64).min(MAX_MULTIPLICATIVE_BOOST);
-            } else {
+            if match_count == 0 {
                 score *= 0.1;
+            }
+
+            let mut boost = 1.0_f64;
+
+            if match_count > 0 {
+                boost *= (1.0 + 0.5 * match_count as f64).min(MAX_MULTIPLICATIVE_BOOST);
             }
 
             for (btype, bval) in &boosts {
                 match *btype {
                     "error_resolution" if cl.contains("error") || cl.contains("exception") => {
-                        score *= bval
+                        boost *= bval
                     }
-                    "solutions" if cl.contains("fix") || cl.contains("resolve") => score *= bval,
+                    "solutions" if cl.contains("fix") || cl.contains("resolve") => boost *= bval,
                     "implementation" if cl.contains("implement") || cl.contains("create") => {
-                        score *= bval
+                        boost *= bval
                     }
                     "optimization"
                         if cl.contains("optimiz")
                             || cl.contains("performance")
                             || cl.contains("improve") =>
                     {
-                        score *= bval
+                        boost *= bval
                     }
                     "file_operations"
                         if cl.contains("file") || cl.contains("read") || cl.contains("write") =>
                     {
-                        score *= bval
+                        boost *= bval
                     }
                     "tool_usage" if cl.contains("tool") || !msg.tool_uses.is_empty() => {
-                        score *= bval
+                        boost *= bval
                     }
                     _ => {}
                 }
             }
 
-            score *= importance_boost(&cl);
+            boost *= importance_boost(&cl);
 
             if !msg.timestamp.is_empty() {
                 let recency = recency_multiplier(&msg.timestamp);
                 if recency >= 3.0 {
-                    score *= 1.5;
+                    boost *= 1.5;
                 } else if recency >= 2.0 {
-                    score *= 1.2;
+                    boost *= 1.2;
                 } else if recency >= 1.5 {
-                    score *= 1.1;
+                    boost *= 1.1;
                 }
             }
 
             if !msg.tool_uses.is_empty() {
-                score *= 1.3;
+                boost *= 1.3;
             }
             if !msg.files_referenced.is_empty() {
-                score *= 1.2;
+                boost *= 1.2;
             }
             if !msg.error_patterns.is_empty() {
-                score *= 1.4;
+                boost *= 1.4;
             }
             if msg.role == "assistant"
                 && (cl.contains("solution") || cl.contains("fixed") || cl.contains("resolved"))
             {
-                score *= 1.6;
+                boost *= 1.6;
             }
 
+            score *= boost.min(MAX_TOTAL_BOOST);
             msg.final_score = score;
             (s, msg)
         })
@@ -605,5 +611,26 @@ mod tests {
             display: "test".into(),
         }];
         assert!(!index_quality_ok(&below));
+    }
+
+    #[test]
+    fn max_total_boost_caps_combined_multiplier() {
+        // Simulate worst case: all boosts active
+        let mut boost = 1.0_f64;
+        boost *= MAX_MULTIPLICATIVE_BOOST; // match count
+        boost *= 3.0; // semantic: error_resolution
+        boost *= 2.5; // importance_boost max
+        boost *= 1.5; // recency
+        boost *= 1.3; // tool_uses
+        boost *= 1.2; // files_referenced
+        boost *= 1.4; // error_patterns
+        boost *= 1.6; // solution words
+        // Uncapped would be ~118x
+        assert!(
+            boost > MAX_TOTAL_BOOST,
+            "uncapped boost should exceed limit"
+        );
+        let capped = boost.min(MAX_TOTAL_BOOST);
+        assert_eq!(capped, MAX_TOTAL_BOOST, "capped boost should equal limit");
     }
 }
