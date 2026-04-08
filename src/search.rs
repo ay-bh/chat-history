@@ -258,8 +258,10 @@ pub fn scored_search(
                     continue;
                 }
 
+                if tf_cutoff.is_some() && msg.timestamp.is_empty() {
+                    continue;
+                }
                 if let Some(cutoff) = tf_cutoff
-                    && !msg.timestamp.is_empty()
                     && let Some(ts) = parse_timestamp(&msg.timestamp)
                     && ts < cutoff
                 {
