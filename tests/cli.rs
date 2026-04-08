@@ -914,6 +914,142 @@ fn cursor_session_deep_search() {
 }
 
 #[test]
+fn timeframe_excludes_empty_timestamp_messages() {
+    let tmp = TempDir::new().unwrap();
+    // Claude session with timestamps + Cursor session without timestamps
+    setup_transcript_fixture(&tmp);
+    setup_cursor_fixture(&tmp);
+
+    // Without timeframe: deep search should find Cursor results
+    let output = Command::cargo_bin("chat-history")
+        .unwrap()
+        .args(["search", "database", "--deep"])
+        .env("CLAUDE_CONFIG_DIR", tmp.path())
+        .env("HOME", tmp.path())
+        .env("NO_COLOR", "1")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("database"),
+        "without timeframe, cursor results should appear: {stdout}"
+    );
+
+    // With timeframe: empty-timestamp Cursor messages should be excluded
+    let output = Command::cargo_bin("chat-history")
+        .unwrap()
+        .args(["search", "database", "--deep", "--timeframe", "today"])
+        .env("CLAUDE_CONFIG_DIR", tmp.path())
+        .env("HOME", tmp.path())
+        .env("NO_COLOR", "1")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        !stdout.contains("connection pooling"),
+        "with timeframe, empty-timestamp cursor messages should be excluded: {stdout}"
+    );
+}
+
+#[test]
+fn local_flag_works_with_search() {
+    let tmp = TempDir::new().unwrap();
+
+    // Create two projects with different names
+    let proj_a_dir = tmp.path().join("projects").join("-Users-test-alpha");
+    fs::create_dir_all(&proj_a_dir).unwrap();
+    let session_a = "aaaa1111-2222-3333-4444-555555555555";
+    let jsonl_a = proj_a_dir.join(format!("{session_a}.jsonl"));
+    let msg_a = serde_json::json!({"type":"user","cwd":"/Users/test/alpha","message":{"role":"user","content":"deploy the authentication service to production"},"timestamp":"2025-01-15T10:00:00Z","uuid":"u1"});
+    fs::write(&jsonl_a, serde_json::to_string(&msg_a).unwrap()).unwrap();
+    let index_a = serde_json::json!({
+        "entries": [{
+            "sessionId": session_a,
+            "summary": "deploy auth to prod",
+            "firstPrompt": "deploy the authentication service",
+            "created": "2025-01-15T10:00:00Z",
+            "modified": "2025-01-15T10:00:00Z",
+            "messageCount": 1,
+            "gitBranch": "main",
+            "projectPath": "/Users/test/alpha",
+            "fullPath": jsonl_a.to_string_lossy(),
+            "isSidechain": false
+        }]
+    });
+    fs::write(
+        proj_a_dir.join("sessions-index.json"),
+        serde_json::to_string(&index_a).unwrap(),
+    )
+    .unwrap();
+
+    let proj_b_dir = tmp.path().join("projects").join("-Users-test-beta");
+    fs::create_dir_all(&proj_b_dir).unwrap();
+    let session_b = "bbbb1111-2222-3333-4444-555555555555";
+    let jsonl_b = proj_b_dir.join(format!("{session_b}.jsonl"));
+    let msg_b = serde_json::json!({"type":"user","cwd":"/Users/test/beta","message":{"role":"user","content":"deploy the notification service to staging"},"timestamp":"2025-01-15T10:00:00Z","uuid":"u2"});
+    fs::write(&jsonl_b, serde_json::to_string(&msg_b).unwrap()).unwrap();
+    let index_b = serde_json::json!({
+        "entries": [{
+            "sessionId": session_b,
+            "summary": "deploy notifications",
+            "firstPrompt": "deploy the notification service",
+            "created": "2025-01-15T10:00:00Z",
+            "modified": "2025-01-15T10:00:00Z",
+            "messageCount": 1,
+            "gitBranch": "main",
+            "projectPath": "/Users/test/beta",
+            "fullPath": jsonl_b.to_string_lossy(),
+            "isSidechain": false
+        }]
+    });
+    fs::write(
+        proj_b_dir.join("sessions-index.json"),
+        serde_json::to_string(&index_b).unwrap(),
+    )
+    .unwrap();
+
+    // Without -L: both projects appear
+    let output = Command::cargo_bin("chat-history")
+        .unwrap()
+        .env("CLAUDE_CONFIG_DIR", tmp.path())
+        .env("HOME", tmp.path())
+        .env("NO_COLOR", "1")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("2 sessions"),
+        "without -L both sessions should appear: {stdout}"
+    );
+
+    // With -L from a directory named "alpha": only alpha project matches
+    let alpha_dir = tmp.path().join("alpha");
+    fs::create_dir_all(&alpha_dir).unwrap();
+    let output = Command::cargo_bin("chat-history")
+        .unwrap()
+        .args(["-L", "search", "deploy", "--deep"])
+        .current_dir(&alpha_dir)
+        .env("CLAUDE_CONFIG_DIR", tmp.path())
+        .env("HOME", tmp.path())
+        .env("NO_COLOR", "1")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(output.status.success(), "command failed. stderr: {stderr}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("authentication"),
+        "search -L from alpha dir should find alpha session: {stdout}"
+    );
+    assert!(
+        !stdout.contains("notification"),
+        "search -L from alpha dir should not find beta session: {stdout}"
+    );
+}
+
+#[test]
 fn mixed_sources_both_listed() {
     let tmp = TempDir::new().unwrap();
     setup_fixture(&tmp);
