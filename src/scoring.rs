@@ -660,6 +660,30 @@ mod tests {
     }
 
     #[test]
+    fn score_relevance_zero_for_all_sub20_byte_messages() {
+        assert_eq!(score_relevance("hi", "hi"), 0.0);
+        assert_eq!(score_relevance("ok", "ok"), 0.0);
+        assert_eq!(score_relevance("yes", "yes"), 0.0);
+        assert_eq!(score_relevance("fix ci", "fix ci"), 0.0);
+        assert_eq!(score_relevance("git rebase", "git rebase"), 0.0);
+        assert_eq!(score_relevance("ls -la", "ls -la"), 0.0);
+        assert_eq!(score_relevance("run tests", "tests"), 0.0);
+        let just_under = "a]".repeat(9); // 18 bytes
+        assert_eq!(score_relevance(&just_under, "a"), 0.0);
+    }
+
+    #[test]
+    fn score_relevance_nonzero_at_20_bytes_when_matching() {
+        let exactly_20 = "fix the broken tests"; // 20 bytes
+        assert_eq!(exactly_20.len(), 20);
+        let score = score_relevance(exactly_20, "fix");
+        assert!(
+            score > 0.0,
+            "20-byte matching message should score > 0, got {score}"
+        );
+    }
+
+    #[test]
     fn score_relevance_matching_tech_term() {
         let text = "I implemented a new webpack configuration for the project with optimized build settings";
         let score = score_relevance(text, "webpack configuration");
@@ -830,6 +854,74 @@ mod tests {
     fn prefix_match_score_partial_miss() {
         let score = prefix_match_score("implementing system", &["impl", "auth"], "");
         assert_eq!(score, 0.0, "Should be zero when not all terms match");
+    }
+
+    #[test]
+    fn prefix_match_score_short_messages_matching_query() {
+        let score = prefix_match_score("fix ci", &["fix"], "");
+        assert!(
+            score > 0.0,
+            "'fix ci' should score > 0 for query 'fix', got {score}"
+        );
+
+        let score = prefix_match_score("git rebase", &["git"], "");
+        assert!(
+            score > 0.0,
+            "'git rebase' should score > 0 for query 'git', got {score}"
+        );
+
+        let score = prefix_match_score("run tests", &["run", "tests"], "");
+        assert!(
+            score > 0.0,
+            "'run tests' should score > 0 for matching query, got {score}"
+        );
+    }
+
+    #[test]
+    fn prefix_match_score_short_messages_no_match() {
+        let score = prefix_match_score("hi", &["docker"], "");
+        assert_eq!(
+            score, 0.0,
+            "'hi' should score 0 for unrelated query 'docker'"
+        );
+
+        let score = prefix_match_score("ok", &["webpack"], "");
+        assert_eq!(
+            score, 0.0,
+            "'ok' should score 0 for unrelated query 'webpack'"
+        );
+
+        let score = prefix_match_score("yes", &["authentication"], "");
+        assert_eq!(score, 0.0, "'yes' should score 0 for unrelated query");
+    }
+
+    #[test]
+    fn combined_score_short_unrelated_message_is_zero() {
+        let msg = "ok";
+        let query = "docker";
+        let hist = score_relevance(msg, query);
+        let normalized = normalize_for_search(msg);
+        let prefix = prefix_match_score(&normalized, &["docker"], "");
+        let total = hist + prefix * 2.0;
+        assert_eq!(
+            total, 0.0,
+            "Unrelated short message total score must be 0, got {total}"
+        );
+    }
+
+    #[test]
+    fn combined_score_short_matching_message_via_prefix() {
+        let msg = "fix ci";
+        let query = "fix";
+        let hist = score_relevance(msg, query);
+        assert_eq!(hist, 0.0, "score_relevance should be 0 for short text");
+        let normalized = normalize_for_search(msg);
+        let prefix = prefix_match_score(&normalized, &["fix"], "");
+        let total = hist + prefix * 2.0;
+        assert!(
+            total > 0.0,
+            "Matching short message should get positive total from prefix_match_score, got {total}"
+        );
     }
 
     #[test]

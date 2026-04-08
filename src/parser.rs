@@ -385,9 +385,11 @@ mod tests {
     }
 
     #[test]
-    fn is_noise_empty() {
+    fn is_noise_empty_and_whitespace() {
         assert!(is_noise(""));
         assert!(is_noise("   "));
+        assert!(is_noise("\t\n"));
+        assert!(is_noise("  \n  \t  "));
     }
 
     #[test]
@@ -395,23 +397,64 @@ mod tests {
         assert!(!is_noise("hi"));
         assert!(!is_noise("ok"));
         assert!(!is_noise("yes"));
+        assert!(!is_noise("no"));
+        assert!(!is_noise("y"));
+        assert!(!is_noise("n"));
         assert!(!is_noise("fix ci"));
         assert!(!is_noise("ls -la"));
         assert!(!is_noise("git rebase"));
+        assert!(!is_noise("run tests"));
+        assert!(!is_noise("do it"));
+        assert!(!is_noise("why?"));
+        assert!(!is_noise("thanks"));
     }
 
     #[test]
-    fn is_noise_known_patterns() {
+    fn is_noise_all_known_patterns() {
         assert!(is_noise(
-            "Hello! I'm Claude, ready to help you with anything"
+            "this session is being continued from a previous one"
         ));
+        assert!(is_noise("caveat: some important note here"));
         assert!(is_noise("You are Claude Code, an AI assistant"));
+        assert!(is_noise("I'm currently in read-only mode"));
+        assert!(is_noise("I cannot make changes to files"));
+        assert!(is_noise("I'm in plan mode right now"));
+        assert!(is_noise("Hello! I'm Claude, ready to help"));
+        assert!(is_noise("I am Claude and I can help"));
+        assert!(is_noise("I'm ready to help you with your project"));
+        assert!(is_noise("What would you like me to work on?"));
+        assert!(is_noise("How can I assist you today?"));
+        assert!(is_noise("I understand that I'm in a sandbox"));
+    }
+
+    #[test]
+    fn is_noise_patterns_are_case_insensitive() {
+        assert!(is_noise("YOU ARE CLAUDE CODE, an advanced AI"));
+        assert!(is_noise("Hello! I'M CLAUDE, ready to help"));
+        assert!(is_noise("HOW CAN I ASSIST you?"));
     }
 
     #[test]
     fn is_noise_valid_content() {
         assert!(!is_noise("rebuild docker container with new config"));
         assert!(!is_noise("implement the authentication system"));
+    }
+
+    #[test]
+    fn is_noise_does_not_false_positive_on_substrings() {
+        assert!(!is_noise("the session data is persisted to disk"));
+        assert!(!is_noise("help me understand the codebase"));
+        assert!(!is_noise("make changes to the parser module"));
+        assert!(!is_noise("I'm working on plan mode switching logic"));
+    }
+
+    #[test]
+    fn is_noise_unicode_and_punctuation() {
+        assert!(!is_noise("日本語テスト"));
+        assert!(!is_noise("café"));
+        assert!(!is_noise("..."));
+        assert!(!is_noise("???"));
+        assert!(!is_noise("🚀"));
     }
 
     #[test]
