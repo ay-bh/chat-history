@@ -1,5 +1,4 @@
 use crate::session::*;
-use chrono::{DateTime, FixedOffset};
 use std::collections::{BTreeSet, HashSet};
 
 pub struct InspectInfo {
@@ -161,12 +160,7 @@ pub fn inspect_session(session: &Session) -> Option<InspectInfo> {
     let duration = if timestamps.len() >= 2 {
         let min_ts = timestamps.iter().min().unwrap();
         let max_ts = timestamps.iter().max().unwrap();
-        let parse_ts = |s: &str| -> Option<DateTime<FixedOffset>> {
-            let s = s.replace('Z', "+00:00");
-            DateTime::parse_from_rfc3339(&s)
-                .ok()
-                .or_else(|| DateTime::parse_from_str(&s, "%Y-%m-%dT%H:%M:%S%.f%:z").ok())
-        };
+        let parse_ts = crate::session::parse_any_timestamp;
         match (parse_ts(min_ts), parse_ts(max_ts)) {
             (Some(t1), Some(t2)) => (t2 - t1).num_minutes(),
             _ => 0,

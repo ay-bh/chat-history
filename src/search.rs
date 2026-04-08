@@ -143,11 +143,7 @@ fn parse_timeframe_duration(tf: &str) -> chrono::Duration {
 }
 
 fn parse_timestamp(ts: &str) -> Option<DateTime<FixedOffset>> {
-    let s = ts.replace('Z', "+00:00");
-    DateTime::parse_from_rfc3339(&s)
-        .or_else(|_| DateTime::parse_from_str(&s, "%Y-%m-%dT%H:%M:%S%.f%:z"))
-        .ok()
-        .or_else(|| s.parse::<DateTime<Utc>>().ok().map(|t| t.fixed_offset()))
+    crate::session::parse_any_timestamp(ts)
 }
 
 pub fn scored_search(
