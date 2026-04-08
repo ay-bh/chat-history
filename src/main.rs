@@ -165,6 +165,14 @@ fn main() {
     let from_d = parse_date_arg(&cli.from_date);
     let to_d = parse_date_arg(&cli.to_date);
 
+    let project_filter = if cli.local && cli.project.is_none() {
+        std::env::current_dir()
+            .ok()
+            .and_then(|cwd| cwd.file_name().map(|n| n.to_string_lossy().to_string()))
+    } else {
+        cli.project.clone()
+    };
+
     match cli.command {
         Some(Commands::Search {
             query,
@@ -180,7 +188,7 @@ fn main() {
                 to_d,
                 cli.keyword.as_deref(),
                 cli.source.as_deref(),
-                cli.project.as_deref(),
+                project_filter.as_deref(),
                 cli.branch.as_deref(),
             );
 
@@ -336,13 +344,6 @@ fn main() {
         }
         Some(Commands::InstallSkill) => unreachable!(),
         None => {
-            let mut project_filter = cli.project.as_deref().map(String::from);
-            if cli.local
-                && project_filter.is_none()
-                && let Ok(cwd) = std::env::current_dir()
-            {
-                project_filter = cwd.file_name().map(|n| n.to_string_lossy().to_string());
-            }
             let filtered = filter_sessions(
                 &sessions,
                 from_d,
