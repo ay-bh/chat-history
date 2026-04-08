@@ -1280,7 +1280,13 @@ mod tests {
     fn mtime_iso_appends_z() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let ts = mtime_iso(tmp.path()).unwrap();
-        assert!(ts.ends_with('Z'), "mtime_iso should produce Z-suffixed timestamps, got: {ts}");
-        assert!(parse_any_timestamp(&ts).is_some(), "mtime_iso output should be parseable");
+        assert!(
+            ts.ends_with('Z'),
+            "mtime_iso should produce Z-suffixed timestamps, got: {ts}"
+        );
+        assert!(
+            parse_any_timestamp(&ts).is_some(),
+            "mtime_iso output should be parseable"
+        );
     }
 }
