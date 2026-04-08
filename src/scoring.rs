@@ -668,8 +668,8 @@ mod tests {
         assert_eq!(score_relevance("git rebase", "git rebase"), 0.0);
         assert_eq!(score_relevance("ls -la", "ls -la"), 0.0);
         assert_eq!(score_relevance("run tests", "tests"), 0.0);
-        let just_under = "a]".repeat(9); // 18 bytes
-        assert_eq!(score_relevance(&just_under, "a"), 0.0);
+        let just_under = "aa aa aa aa aa aa"; // 17 bytes, "aa" passes the >=2 query filter
+        assert_eq!(score_relevance(just_under, "aa"), 0.0);
     }
 
     #[test]
