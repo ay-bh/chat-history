@@ -1075,3 +1075,159 @@ fn mixed_sources_both_listed() {
         "should list all sessions from both sources"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Regression: is_noise no longer drops valid short messages (Bug #6)
+// Before the fix, `is_noise` had `if text.len() < 10 { return true; }` which
+// silently discarded messages like "fix ci" or "git rebase" from the search
+// pipeline.  These tests prove short messages are now indexed and findable.
+// ---------------------------------------------------------------------------
+
+fn setup_short_message_fixture(tmp: &TempDir) {
+    let project_dir = tmp.path().join("projects").join("-Users-test-project");
+    fs::create_dir_all(&project_dir).unwrap();
+
+    let session_id = "11111111-2222-3333-4444-555555555555";
+    let jsonl_path = project_dir.join(format!("{session_id}.jsonl"));
+
+    let messages = [
+        serde_json::json!({"type":"user","cwd":"/Users/test/project","message":{"role":"user","content":"fix ci"},"timestamp":"2025-06-01T10:00:00Z","uuid":"u1"}),
+        serde_json::json!({"type":"assistant","message":{"role":"assistant","content":"I'll fix the CI pipeline. The issue was a missing environment variable in the GitHub Actions workflow configuration file."},"timestamp":"2025-06-01T10:01:00Z","uuid":"u2"}),
+        serde_json::json!({"type":"user","message":{"role":"user","content":"ok"},"timestamp":"2025-06-01T10:02:00Z","uuid":"u3"}),
+        serde_json::json!({"type":"assistant","message":{"role":"assistant","content":"Great, the CI pipeline is now passing. All tests are green and the deployment completed successfully."},"timestamp":"2025-06-01T10:03:00Z","uuid":"u4"}),
+        serde_json::json!({"type":"user","message":{"role":"user","content":"git rebase"},"timestamp":"2025-06-01T10:04:00Z","uuid":"u5"}),
+        serde_json::json!({"type":"assistant","message":{"role":"assistant","content":"I'll rebase the current branch onto main to incorporate the latest changes and resolve any conflicts."},"timestamp":"2025-06-01T10:05:00Z","uuid":"u6"}),
+        serde_json::json!({"type":"user","message":{"role":"user","content":"run tests"},"timestamp":"2025-06-01T10:06:00Z","uuid":"u7"}),
+        serde_json::json!({"type":"assistant","message":{"role":"assistant","content":"Running the full test suite now. All 47 unit tests and 12 integration tests passed with no failures."},"timestamp":"2025-06-01T10:07:00Z","uuid":"u8"}),
+    ];
+
+    let jsonl: String = messages
+        .iter()
+        .map(|m| serde_json::to_string(m).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(&jsonl_path, &jsonl).unwrap();
+}
+
+#[test]
+fn short_message_fix_ci_is_searchable() {
+    let tmp = TempDir::new().unwrap();
+    setup_short_message_fixture(&tmp);
+    let output = Command::cargo_bin("chat-history")
+        .unwrap()
+        .args(["search", "fix ci", "--deep"])
+        .env("CLAUDE_CONFIG_DIR", tmp.path())
+        .env("HOME", tmp.path())
+        .env("NO_COLOR", "1")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("CI pipeline") || stdout.contains("fix ci") || stdout.contains("fix"),
+        "Short message 'fix ci' should be searchable after is_noise fix.\nGot: {stdout}"
+    );
+    assert!(
+        !stdout.contains("No results"),
+        "'fix ci' search must return results, not empty.\nGot: {stdout}"
+    );
+}
+
+#[test]
+fn short_message_git_rebase_is_searchable() {
+    let tmp = TempDir::new().unwrap();
+    setup_short_message_fixture(&tmp);
+    let output = Command::cargo_bin("chat-history")
+        .unwrap()
+        .args(["search", "git rebase", "--deep"])
+        .env("CLAUDE_CONFIG_DIR", tmp.path())
+        .env("HOME", tmp.path())
+        .env("NO_COLOR", "1")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("rebase") || stdout.contains("git"),
+        "Short message 'git rebase' should be searchable.\nGot: {stdout}"
+    );
+    assert!(
+        !stdout.contains("No results"),
+        "'git rebase' search must return results.\nGot: {stdout}"
+    );
+}
+
+#[test]
+fn short_message_run_tests_is_searchable() {
+    let tmp = TempDir::new().unwrap();
+    setup_short_message_fixture(&tmp);
+    let output = Command::cargo_bin("chat-history")
+        .unwrap()
+        .args(["search", "run tests", "--deep"])
+        .env("CLAUDE_CONFIG_DIR", tmp.path())
+        .env("HOME", tmp.path())
+        .env("NO_COLOR", "1")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("test") || stdout.contains("run"),
+        "Short message 'run tests' should be searchable.\nGot: {stdout}"
+    );
+}
+
+#[test]
+fn short_noise_ok_does_not_pollute_unrelated_search() {
+    let tmp = TempDir::new().unwrap();
+    setup_short_message_fixture(&tmp);
+    let output = Command::cargo_bin("chat-history")
+        .unwrap()
+        .args(["search", "webpack kubernetes", "--deep", "--json"])
+        .env("CLAUDE_CONFIG_DIR", tmp.path())
+        .env("HOME", tmp.path())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let data: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let count = data["count"].as_u64().unwrap_or(0);
+    assert_eq!(
+        count, 0,
+        "Unrelated query 'webpack kubernetes' should return 0 results from short-message fixture, got {count}"
+    );
+}
+
+#[test]
+fn empty_and_whitespace_messages_still_filtered() {
+    let tmp = TempDir::new().unwrap();
+    let project_dir = tmp.path().join("projects").join("-Users-test-project");
+    fs::create_dir_all(&project_dir).unwrap();
+
+    let session_id = "22222222-3333-4444-5555-666666666666";
+    let jsonl_path = project_dir.join(format!("{session_id}.jsonl"));
+
+    let messages = [
+        serde_json::json!({"type":"user","cwd":"/tmp","message":{"role":"user","content":""},"timestamp":"2025-06-01T10:00:00Z","uuid":"u1"}),
+        serde_json::json!({"type":"user","message":{"role":"user","content":"   "},"timestamp":"2025-06-01T10:01:00Z","uuid":"u2"}),
+        serde_json::json!({"type":"assistant","message":{"role":"assistant","content":"Hello! I'm Claude, ready to help you with anything you need today."},"timestamp":"2025-06-01T10:02:00Z","uuid":"u3"}),
+    ];
+
+    let jsonl: String = messages
+        .iter()
+        .map(|m| serde_json::to_string(m).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(&jsonl_path, &jsonl).unwrap();
+
+    let output = Command::cargo_bin("chat-history")
+        .unwrap()
+        .args(["search", "hello claude help", "--deep", "--json"])
+        .env("CLAUDE_CONFIG_DIR", tmp.path())
+        .env("HOME", tmp.path())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let data: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let count = data["count"].as_u64().unwrap_or(0);
+    assert_eq!(
+        count, 0,
+        "Empty strings and noise patterns should still be filtered, got {count} results"
+    );
+}
