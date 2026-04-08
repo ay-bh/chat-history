@@ -401,7 +401,8 @@ pub fn score_relevance(text: &str, query: &str) -> f64 {
 
 fn has_query_word(query_lower: &str, word: &str) -> bool {
     query_lower
-        .split_whitespace()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
         .any(|w| w == word || w.starts_with(word))
 }
 
@@ -857,6 +858,20 @@ mod tests {
         assert!(!has_query_word("complement this", "implement"));
         assert!(!has_query_word("profile settings", "file"));
         assert!(!has_query_word("terror attack", "error"));
+    }
+
+    #[test]
+    fn has_query_word_with_punctuation() {
+        assert!(has_query_word("(error)", "error"));
+        assert!(has_query_word("\"error\"", "error"));
+        assert!(has_query_word("`error`", "error"));
+    }
+
+    #[test]
+    fn has_query_word_with_delimiters() {
+        assert!(has_query_word("fix-error", "error"));
+        assert!(has_query_word("fix-error", "fix"));
+        assert!(has_query_word("error/fix", "fix"));
     }
 
     #[test]
