@@ -389,25 +389,32 @@ pub fn score_relevance(text: &str, query: &str) -> f64 {
     score
 }
 
+fn has_query_word(query_lower: &str, word: &str) -> bool {
+    query_lower
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .any(|w| w == word || w.starts_with(word))
+}
+
 pub fn semantic_boosts(query: &str) -> Vec<(&'static str, f64)> {
     let lq = query.to_lowercase();
     let mut boosts = Vec::new();
-    if lq.contains("error") {
+    if has_query_word(&lq, "error") {
         boosts.push(("error_resolution", 3.0));
     }
-    if lq.contains("implement") {
+    if has_query_word(&lq, "implement") {
         boosts.push(("implementation", 2.5));
     }
-    if lq.contains("optimize") {
+    if has_query_word(&lq, "optimize") || has_query_word(&lq, "optimiz") {
         boosts.push(("optimization", 2.0));
     }
-    if lq.contains("fix") {
+    if has_query_word(&lq, "fix") {
         boosts.push(("solutions", 2.8));
     }
-    if lq.contains("file") {
+    if has_query_word(&lq, "file") {
         boosts.push(("file_operations", 2.0));
     }
-    if lq.contains("tool") {
+    if has_query_word(&lq, "tool") {
         boosts.push(("tool_usage", 2.2));
     }
     boosts
@@ -454,11 +461,9 @@ pub fn importance_boost(content_lower: &str) -> f64 {
         "implemented",
         "shipped",
         "feature",
-        "added",
         "built",
         "created",
-        "new",
-        "release",
+        "released",
     ]
     .iter()
     .any(|p| content_lower.contains(p))
@@ -825,5 +830,67 @@ mod tests {
     fn prefix_match_score_partial_miss() {
         let score = prefix_match_score("implementing system", &["impl", "auth"], "");
         assert_eq!(score, 0.0, "Should be zero when not all terms match");
+    }
+
+    #[test]
+    fn has_query_word_exact() {
+        assert!(has_query_word("fix error", "fix"));
+        assert!(has_query_word("fix error", "error"));
+    }
+
+    #[test]
+    fn has_query_word_prefix() {
+        assert!(has_query_word("implementing auth", "implement"));
+    }
+
+    #[test]
+    fn has_query_word_no_substring() {
+        assert!(!has_query_word("complement this", "implement"));
+        assert!(!has_query_word("profile settings", "file"));
+        assert!(!has_query_word("terror attack", "error"));
+    }
+
+    #[test]
+    fn has_query_word_with_punctuation() {
+        assert!(has_query_word("(error)", "error"));
+        assert!(has_query_word("\"error\"", "error"));
+        assert!(has_query_word("`error`", "error"));
+    }
+
+    #[test]
+    fn has_query_word_with_delimiters() {
+        assert!(has_query_word("fix-error", "error"));
+        assert!(has_query_word("fix-error", "fix"));
+        assert!(has_query_word("error/fix", "fix"));
+    }
+
+    #[test]
+    fn semantic_boosts_no_false_positive() {
+        assert!(semantic_boosts("complement").is_empty());
+        assert!(semantic_boosts("profile").is_empty());
+        assert!(semantic_boosts("terror").is_empty());
+    }
+
+    #[test]
+    fn semantic_boosts_still_matches_real_words() {
+        assert!(!semantic_boosts("fix error").is_empty());
+        assert!(!semantic_boosts("implementing auth").is_empty());
+    }
+
+    #[test]
+    fn importance_boost_no_false_positive_new() {
+        assert_eq!(importance_boost("the renewal process was slow"), 1.0);
+        assert_eq!(importance_boost("reading the news about technology"), 1.0);
+    }
+
+    #[test]
+    fn importance_boost_no_false_positive_added() {
+        assert_eq!(importance_boost("the padded container looked correct"), 1.0);
+    }
+
+    #[test]
+    fn importance_boost_still_triggers_on_real_words() {
+        assert!(importance_boost("we implemented the authentication feature") > 1.0);
+        assert!(importance_boost("successfully built the docker image") > 1.0);
     }
 }
