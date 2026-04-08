@@ -944,6 +944,7 @@ fn timeframe_excludes_empty_timestamp_messages() {
         .env("NO_COLOR", "1")
         .output()
         .unwrap();
+    assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(
         !stdout.contains("connection pooling"),
@@ -1016,29 +1017,35 @@ fn local_flag_works_with_search() {
         .env("NO_COLOR", "1")
         .output()
         .unwrap();
+    assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(
         stdout.contains("2 sessions"),
         "without -L both sessions should appear: {stdout}"
     );
 
-    // With --project filter on search: only matching project
+    // With -L from a directory named "alpha": only alpha project matches
+    let alpha_dir = tmp.path().join("alpha");
+    fs::create_dir_all(&alpha_dir).unwrap();
     let output = Command::cargo_bin("chat-history")
         .unwrap()
-        .args(["search", "deploy", "--deep", "--project", "alpha"])
+        .args(["-L", "search", "deploy", "--deep"])
+        .current_dir(&alpha_dir)
         .env("CLAUDE_CONFIG_DIR", tmp.path())
         .env("HOME", tmp.path())
         .env("NO_COLOR", "1")
         .output()
         .unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(output.status.success(), "command failed. stderr: {stderr}");
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(
         stdout.contains("authentication"),
-        "search --project alpha should find alpha session: {stdout}"
+        "search -L from alpha dir should find alpha session: {stdout}"
     );
     assert!(
         !stdout.contains("notification"),
-        "search --project alpha should not find beta session: {stdout}"
+        "search -L from alpha dir should not find beta session: {stdout}"
     );
 }
 
