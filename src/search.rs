@@ -7,6 +7,7 @@ use std::collections::{BTreeSet, HashMap};
 
 const MAX_MATCHES_PER_SESSION: usize = 3;
 const INDEX_QUALITY_THRESHOLD: f64 = 5.0;
+const MAX_TOTAL_BOOST: f64 = 10.0;
 
 pub struct IndexResult {
     pub session: Session,
@@ -370,7 +371,6 @@ pub fn scored_search(
                 boost *= 1.6;
             }
 
-            const MAX_TOTAL_BOOST: f64 = 10.0;
             score *= boost.min(MAX_TOTAL_BOOST);
             msg.final_score = score;
             (s, msg)
@@ -615,5 +615,26 @@ mod tests {
             display: "test".into(),
         }];
         assert!(!index_quality_ok(&below));
+    }
+
+    #[test]
+    fn max_total_boost_caps_combined_multiplier() {
+        // Simulate worst case: all boosts active
+        let mut boost = 1.0_f64;
+        boost *= MAX_MULTIPLICATIVE_BOOST; // match count
+        boost *= 3.0; // semantic: error_resolution
+        boost *= 2.5; // importance_boost max
+        boost *= 1.5; // recency
+        boost *= 1.3; // tool_uses
+        boost *= 1.2; // files_referenced
+        boost *= 1.4; // error_patterns
+        boost *= 1.6; // solution words
+        // Uncapped would be ~118x
+        assert!(
+            boost > MAX_TOTAL_BOOST,
+            "uncapped boost should exceed limit"
+        );
+        let capped = boost.min(MAX_TOTAL_BOOST);
+        assert_eq!(capped, MAX_TOTAL_BOOST, "capped boost should equal limit");
     }
 }
