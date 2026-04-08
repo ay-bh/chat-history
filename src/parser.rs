@@ -191,10 +191,11 @@ pub fn clean_prompt(text: &str) -> String {
 }
 
 pub fn is_noise(text: &str) -> bool {
-    if text.len() < 10 {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
         return true;
     }
-    let lower = text.to_lowercase();
+    let lower = trimmed.to_lowercase();
     NOISE_PATTERNS.iter().any(|p| lower.contains(p))
 }
 
@@ -384,11 +385,19 @@ mod tests {
     }
 
     #[test]
-    fn is_noise_short_text() {
-        assert!(is_noise("hi"));
-        assert!(is_noise("ok"));
-        assert!(is_noise("yes"));
+    fn is_noise_empty() {
         assert!(is_noise(""));
+        assert!(is_noise("   "));
+    }
+
+    #[test]
+    fn is_noise_allows_short_messages() {
+        assert!(!is_noise("hi"));
+        assert!(!is_noise("ok"));
+        assert!(!is_noise("yes"));
+        assert!(!is_noise("fix ci"));
+        assert!(!is_noise("ls -la"));
+        assert!(!is_noise("git rebase"));
     }
 
     #[test]
