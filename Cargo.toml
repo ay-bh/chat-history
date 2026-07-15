@@ -21,7 +21,7 @@ name = "ch"
 path = "src/main.rs"
 
 [dependencies]
-chrono = { version = "0.4", features = ["serde"] }
+chrono = { version = "0.4.31", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 glob = "0.3"
 rayon = "1.10"

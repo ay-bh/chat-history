@@ -237,6 +237,12 @@ fn main() {
                 }
             }
 
+            if scoring::is_uuid(&query)
+                && !json_output
+                && !pre.iter().any(|s| s.id.eq_ignore_ascii_case(query.trim()))
+            {
+                eprintln!("No session with that ID — searching transcripts...");
+            }
             let results = search::scored_search(&pre, &query, &scope, limit, timeframe.as_deref());
             if json_output {
                 display::print_search_results_json(&results, &query);

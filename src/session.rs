@@ -1247,22 +1247,23 @@ pub fn filter_sessions(
     let mut out: Vec<Session> = sessions
         .iter()
         .filter(|s| {
-            if s.date.is_empty() {
-                return false;
-            }
-            let d = match NaiveDate::parse_from_str(&s.date, "%Y-%m-%d") {
-                Ok(d) => d,
-                Err(_) => return false,
-            };
-            if let Some(fd) = from_date
-                && d < fd
-            {
-                return false;
-            }
-            if let Some(td) = to_date
-                && d > td
-            {
-                return false;
+            // Only require a parseable date when a date filter is in play;
+            // a session with a missing date must still list otherwise.
+            if from_date.is_some() || to_date.is_some() {
+                let d = match NaiveDate::parse_from_str(&s.date, "%Y-%m-%d") {
+                    Ok(d) => d,
+                    Err(_) => return false,
+                };
+                if let Some(fd) = from_date
+                    && d < fd
+                {
+                    return false;
+                }
+                if let Some(td) = to_date
+                    && d > td
+                {
+                    return false;
+                }
             }
             if let Some(src) = source
                 && s.source != src
@@ -1514,9 +1515,19 @@ mod tests {
     }
 
     #[test]
-    fn filter_excludes_empty_date() {
+    fn filter_keeps_dateless_sessions_when_no_date_filter() {
+        // A missing/unparseable date should only matter when the user is
+        // actually filtering by date — otherwise the session must still list.
         let sessions = vec![make_session("1", "", "claude", "/proj", "", "no date")];
         let filtered = filter_sessions(&sessions, None, None, None, None, None, None);
+        assert_eq!(filtered.len(), 1);
+    }
+
+    #[test]
+    fn filter_excludes_dateless_sessions_from_date_range() {
+        let sessions = vec![make_session("1", "", "claude", "/proj", "", "no date")];
+        let from = NaiveDate::from_ymd_opt(2025, 1, 1).unwrap();
+        let filtered = filter_sessions(&sessions, Some(from), None, None, None, None, None);
         assert!(filtered.is_empty());
     }
 

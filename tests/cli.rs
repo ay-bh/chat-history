@@ -480,6 +480,22 @@ fn search_uuid_case_insensitive_finds_session() {
 }
 
 #[test]
+fn search_uuid_miss_prints_fallthrough_notice() {
+    let tmp = TempDir::new().unwrap();
+    setup_transcript_fixture(&tmp);
+    Command::cargo_bin("chat-history")
+        .unwrap()
+        .args(["search", "99999999-9999-9999-9999-999999999999"])
+        .env("CLAUDE_CONFIG_DIR", tmp.path())
+        .env("HOME", tmp.path())
+        .env_remove("CODEX_HOME")
+        .env("NO_COLOR", "1")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("searching transcripts"));
+}
+
+#[test]
 fn search_uuid_mentioned_in_content_falls_back_to_content_search() {
     let tmp = TempDir::new().unwrap();
     let project_dir = tmp.path().join("projects").join("-Users-test-project");
