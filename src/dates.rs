@@ -19,12 +19,13 @@ pub fn parse_human_date(s: &str) -> Option<NaiveDate> {
 
     if let Some(caps) = AGO_RE.captures(&lower) {
         let n: i64 = caps[1].parse().ok()?;
-        return Some(match &caps[2] {
-            "day" => today - Duration::days(n),
-            "week" => today - Duration::weeks(n),
-            "month" => today - Duration::days(n * 30),
-            _ => return None,
-        });
+        let dur = match &caps[2] {
+            "day" => Duration::try_days(n),
+            "week" => Duration::try_weeks(n),
+            "month" => n.checked_mul(30).and_then(Duration::try_days),
+            _ => None,
+        }?;
+        return today.checked_sub_signed(dur);
     }
 
     if let Some(caps) = LAST_RE.captures(&lower) {
@@ -97,6 +98,13 @@ mod tests {
     fn parse_invalid() {
         assert_eq!(parse_human_date("not a date"), None);
         assert_eq!(parse_human_date(""), None);
+    }
+
+    #[test]
+    fn parse_out_of_range_relative_dates_return_none() {
+        assert_eq!(parse_human_date("100000000 days ago"), None);
+        assert_eq!(parse_human_date("100000000 weeks ago"), None);
+        assert_eq!(parse_human_date("10000000000000000 months ago"), None);
     }
 
     #[test]

@@ -51,13 +51,27 @@ fn extract_sentence_around(text: &str, keyword: &str) -> Option<String> {
     let end = text[kw_end..]
         .find('.')
         .map(|p| kw_end + p + 1)
-        .unwrap_or_else(|| text.len().min(idx + 150));
+        .unwrap_or_else(|| text.floor_char_boundary(text.len().min(idx + 150)));
     let sentence = text[start..end].trim();
     if sentence.len() > 200 {
         let trunc = text.floor_char_boundary(start + 197).min(end);
         Some(format!("{}...", text[start..trunc].trim()))
     } else {
         Some(sentence.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_sentence_multibyte_boundary_no_panic() {
+        // No '.' after the keyword and a 3-byte char straddling the idx+150
+        // fallback cut point: must not panic on a non-boundary byte index.
+        let text = format!("fixed: {}", "日".repeat(100));
+        let sentence = extract_sentence_around(&text, "fixed");
+        assert!(sentence.is_some());
     }
 }
 

@@ -162,6 +162,14 @@ fn parse_date_arg(val: &Option<String>) -> Option<chrono::NaiveDate> {
 }
 
 fn main() {
+    // Rust ignores SIGPIPE by default, turning writes to a closed pipe
+    // (e.g. `chat-history ... | head`) into println! panics. Restore the
+    // conventional Unix behavior of terminating quietly.
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+
     let cli = Cli::parse();
 
     if matches!(cli.command, Some(Commands::InstallSkill)) {

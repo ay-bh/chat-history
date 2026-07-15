@@ -387,6 +387,61 @@ fn setup_transcript_fixture(tmp: &TempDir) {
     .unwrap();
 }
 
+// A transcript large enough (>64KB of output) to overflow an OS pipe buffer,
+// so a downstream reader exiting early reliably triggers EPIPE on write.
+fn setup_large_transcript_fixture(tmp: &TempDir) -> &'static str {
+    let project_dir = tmp.path().join("projects").join("-Users-test-project");
+    fs::create_dir_all(&project_dir).unwrap();
+
+    let session_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+    let jsonl_path = project_dir.join(format!("{session_id}.jsonl"));
+
+    let filler = "lorem ipsum dolor sit amet consectetur adipiscing elit ".repeat(5);
+    let mut lines = Vec::new();
+    for i in 0..400 {
+        let (etype, role) = if i % 2 == 0 {
+            ("user", "user")
+        } else {
+            ("assistant", "assistant")
+        };
+        lines.push(
+            serde_json::to_string(&serde_json::json!({
+                "type": etype,
+                "message": {"role": role, "content": format!("message {i}: {filler}")},
+                "timestamp": format!("2025-01-15T10:{:02}:00Z", i % 60),
+                "uuid": format!("u{i}")
+            }))
+            .unwrap(),
+        );
+    }
+    fs::write(&jsonl_path, lines.join("\n")).unwrap();
+    session_id
+}
+
+#[test]
+#[cfg(unix)]
+fn piped_output_closed_early_does_not_panic() {
+    let tmp = TempDir::new().unwrap();
+    let session_id = setup_large_transcript_fixture(&tmp);
+    let bin = assert_cmd::cargo::cargo_bin("chat-history");
+    let out = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "'{}' view {session_id} --plain | head -n 1",
+            bin.display()
+        ))
+        .env("CLAUDE_CONFIG_DIR", tmp.path())
+        .env("HOME", tmp.path())
+        .env_remove("CODEX_HOME")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("panicked"),
+        "binary panicked on closed pipe: {stderr}"
+    );
+}
+
 fn setup_rich_transcript_fixture(tmp: &TempDir) {
     let project_dir = tmp.path().join("projects").join("-Users-test-project");
     fs::create_dir_all(&project_dir).unwrap();
