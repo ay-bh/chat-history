@@ -155,7 +155,10 @@ pub fn scored_search(
     timeframe: Option<&str>,
 ) -> Vec<SearchResult> {
     if is_uuid(query) {
-        if let Some(s) = sessions.iter().find(|s| s.id == query.trim()) {
+        if let Some(s) = sessions
+            .iter()
+            .find(|s| s.id.eq_ignore_ascii_case(query.trim()))
+        {
             let (messages, _) = parse_session(s, false);
             if let Some(mut msg) = messages.into_iter().next() {
                 msg.final_score = 100.0;
@@ -186,7 +189,8 @@ pub fn scored_search(
                 message: stub,
             }];
         }
-        return Vec::new();
+        // No session has this id — fall through to content search so a UUID
+        // that was discussed inside a conversation is still findable.
     }
 
     let tf_cutoff: Option<DateTime<FixedOffset>> = timeframe.map(|tf| {

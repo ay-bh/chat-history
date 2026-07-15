@@ -394,6 +394,11 @@ pub fn load_claude_sessions() -> Vec<Session> {
         };
         for entry in index.entries {
             indexed_ids.insert(entry.session_id.clone());
+            let date = entry
+                .created
+                .get(..10)
+                .map(str::to_string)
+                .unwrap_or_else(|| mtime_date(Path::new(&entry.full_path)).unwrap_or_default());
             sessions.push(Session {
                 source: "claude".into(),
                 id: entry.session_id,
@@ -401,7 +406,7 @@ pub fn load_claude_sessions() -> Vec<Session> {
                 first_prompt: entry.first_prompt.chars().take(300).collect(),
                 created: entry.created.clone(),
                 modified: entry.modified,
-                date: entry.created.get(..10).unwrap_or("").to_string(),
+                date,
                 messages: entry.message_count,
                 branch: entry.git_branch,
                 project: entry.project_path,
@@ -760,6 +765,9 @@ pub fn parse_claude_jsonl(
     let mut messages = Vec::new();
     let mut meta = SessionMeta::default();
     let mut skip_next_assistant = false;
+    // One API response is stored as one JSONL record per content block, each
+    // repeating the same message id and usage — count usage once per id.
+    let mut counted_usage_ids: HashSet<String> = HashSet::new();
     let mut user_texts = Vec::new();
     let mut total_chars: usize = 0;
     let max_chars: usize = 4 * 1024 * 1024;
@@ -839,7 +847,11 @@ pub fn parse_claude_jsonl(
             {
                 meta.model = Some(m.to_string());
             }
-            if extract_meta && let Some(usage) = msg_obj.get("usage") {
+            let msg_id = msg_obj.get("id").and_then(Value::as_str).unwrap_or("");
+            if extract_meta
+                && let Some(usage) = msg_obj.get("usage")
+                && (msg_id.is_empty() || counted_usage_ids.insert(msg_id.to_string()))
+            {
                 let tok = usage
                     .get("input_tokens")
                     .and_then(Value::as_u64)

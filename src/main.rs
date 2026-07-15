@@ -192,6 +192,18 @@ fn main() {
         cli.project.clone()
     };
 
+    // The filter flags are global, so honor them everywhere they can apply:
+    // search scoping, `--last` selection, and the default listing.
+    let filtered = filter_sessions(
+        &sessions,
+        from_d,
+        to_d,
+        cli.keyword.as_deref(),
+        cli.source.as_deref(),
+        project_filter.as_deref(),
+        cli.branch.as_deref(),
+    );
+
     match cli.command {
         Some(Commands::Search {
             query,
@@ -201,15 +213,7 @@ fn main() {
             timeframe,
             json_output,
         }) => {
-            let pre = filter_sessions(
-                &sessions,
-                from_d,
-                to_d,
-                cli.keyword.as_deref(),
-                cli.source.as_deref(),
-                project_filter.as_deref(),
-                cli.branch.as_deref(),
-            );
+            let pre = filtered;
 
             if !deep && scope == "all" && !scoring::is_uuid(&query) {
                 let idx_results = search::index_search(&pre, &query, limit);
@@ -242,7 +246,7 @@ fn main() {
         }
         Some(Commands::Inspect { session_id, last }) => {
             let session = if last {
-                sessions.iter().max_by_key(|s| {
+                filtered.iter().max_by_key(|s| {
                     if s.modified.is_empty() {
                         &s.created
                     } else {
@@ -271,7 +275,7 @@ fn main() {
             plain,
         }) => {
             let session = if last {
-                sessions.iter().max_by_key(|s| {
+                filtered.iter().max_by_key(|s| {
                     if s.modified.is_empty() {
                         &s.created
                     } else {
@@ -366,15 +370,6 @@ fn main() {
         }
         Some(Commands::InstallSkill) => unreachable!(),
         None => {
-            let filtered = filter_sessions(
-                &sessions,
-                from_d,
-                to_d,
-                cli.keyword.as_deref(),
-                cli.source.as_deref(),
-                project_filter.as_deref(),
-                cli.branch.as_deref(),
-            );
             if cli.summarize {
                 display::print_summarized(&filtered);
             } else {

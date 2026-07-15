@@ -61,6 +61,20 @@ fn extract_sentence_around(text: &str, keyword: &str) -> Option<String> {
     }
 }
 
+fn session_duration_minutes(timestamps: &[&str]) -> i64 {
+    let parsed: Vec<_> = timestamps
+        .iter()
+        .filter_map(|t| crate::session::parse_any_timestamp(t))
+        .collect();
+    if parsed.len() < 2 {
+        return 0;
+    }
+    match (parsed.iter().min(), parsed.iter().max()) {
+        (Some(t1), Some(t2)) => (*t2 - *t1).num_minutes(),
+        _ => 0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -72,6 +86,14 @@ mod tests {
         let text = format!("fixed: {}", "日".repeat(100));
         let sentence = extract_sentence_around(&text, "fixed");
         assert!(sentence.is_some());
+    }
+
+    #[test]
+    fn duration_orders_by_parsed_time_not_string() {
+        // 23:00-08:00 is 07:00Z the next day: chronologically LATER than
+        // 01:00Z despite sorting earlier as a string.
+        let ts = ["2025-01-15T23:00:00-08:00", "2025-01-16T01:00:00Z"];
+        assert_eq!(session_duration_minutes(&ts), 360);
     }
 }
 
@@ -166,17 +188,7 @@ pub fn inspect_session(session: &Session) -> Option<InspectInfo> {
         .map(|m| m.timestamp.as_str())
         .filter(|t| !t.is_empty())
         .collect();
-    let duration = if timestamps.len() >= 2 {
-        let min_ts = timestamps.iter().min().unwrap();
-        let max_ts = timestamps.iter().max().unwrap();
-        let parse_ts = crate::session::parse_any_timestamp;
-        match (parse_ts(min_ts), parse_ts(max_ts)) {
-            (Some(t1), Some(t2)) => (t2 - t1).num_minutes(),
-            _ => 0,
-        }
-    } else {
-        0
-    };
+    let duration = session_duration_minutes(&timestamps);
 
     let effective_summary = meta
         .custom_title

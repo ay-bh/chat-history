@@ -387,6 +387,151 @@ fn setup_transcript_fixture(tmp: &TempDir) {
     .unwrap();
 }
 
+#[test]
+fn inspect_last_respects_source_filter() {
+    let tmp = TempDir::new().unwrap();
+    setup_transcript_fixture(&tmp); // claude, modified 2025-01-15
+    setup_codex_fixture(&tmp); // codex, modified 2026-06-10 (newest overall)
+    Command::cargo_bin("chat-history")
+        .unwrap()
+        .args(["inspect", "--last", "--source", "claude"])
+        .env("CLAUDE_CONFIG_DIR", tmp.path())
+        .env("HOME", tmp.path())
+        .env_remove("CODEX_HOME")
+        .env("NO_COLOR", "1")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("webpack and docker config"))
+        .stdout(predicate::str::contains("migrate the auth service").not());
+}
+
+#[test]
+fn inspect_counts_usage_once_per_api_message() {
+    let tmp = TempDir::new().unwrap();
+    let project_dir = tmp.path().join("projects").join("-Users-test-project");
+    fs::create_dir_all(&project_dir).unwrap();
+    let session_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+    // One API response stored as two JSONL records (one per content block),
+    // both carrying the same message id and identical usage.
+    let usage = serde_json::json!({"input_tokens": 500, "output_tokens": 200, "cache_creation_input_tokens": 100, "cache_read_input_tokens": 50});
+    let lines = [
+        serde_json::json!({"type":"user","cwd":"/Users/test/project","message":{"role":"user","content":"please fix the flaky test"},"timestamp":"2025-01-15T10:00:00Z","uuid":"u1"}),
+        serde_json::json!({"type":"assistant","message":{"id":"msg_01","role":"assistant","usage":usage,"content":[{"type":"text","text":"Looking at the test now."}]},"timestamp":"2025-01-15T10:01:00Z","uuid":"u2"}),
+        serde_json::json!({"type":"assistant","message":{"id":"msg_01","role":"assistant","usage":usage,"content":[{"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"/x"}}]},"timestamp":"2025-01-15T10:01:01Z","uuid":"u3"}),
+    ];
+    fs::write(
+        project_dir.join(format!("{session_id}.jsonl")),
+        lines
+            .into_iter()
+            .map(|v| serde_json::to_string(&v).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+    .unwrap();
+
+    Command::cargo_bin("chat-history")
+        .unwrap()
+        .args(["inspect", session_id])
+        .env("CLAUDE_CONFIG_DIR", tmp.path())
+        .env("HOME", tmp.path())
+        .env_remove("CODEX_HOME")
+        .env("NO_COLOR", "1")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("tokens: 850"));
+}
+
+#[test]
+fn search_uuid_case_insensitive_finds_session() {
+    let tmp = TempDir::new().unwrap();
+    setup_transcript_fixture(&tmp);
+    Command::cargo_bin("chat-history")
+        .unwrap()
+        .args(["search", "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE"])
+        .env("CLAUDE_CONFIG_DIR", tmp.path())
+        .env("HOME", tmp.path())
+        .env_remove("CODEX_HOME")
+        .env("NO_COLOR", "1")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("No results").not())
+        .stdout(predicate::str::contains("webpack and docker config"));
+}
+
+#[test]
+fn search_uuid_mentioned_in_content_falls_back_to_content_search() {
+    let tmp = TempDir::new().unwrap();
+    let project_dir = tmp.path().join("projects").join("-Users-test-project");
+    fs::create_dir_all(&project_dir).unwrap();
+    let session_id = "dddddddd-eeee-ffff-0000-111111111111";
+    let lines = [
+        serde_json::json!({"type":"user","cwd":"/Users/test/project","message":{"role":"user","content":"the request 550e8400-e29b-41d4-a716-446655440000 keeps failing in production"},"timestamp":"2025-03-01T10:00:00Z","uuid":"u1"}),
+        serde_json::json!({"type":"assistant","message":{"role":"assistant","content":"That request id points to a timeout in the payment service."},"timestamp":"2025-03-01T10:01:00Z","uuid":"u2"}),
+    ];
+    fs::write(
+        project_dir.join(format!("{session_id}.jsonl")),
+        lines
+            .into_iter()
+            .map(|v| serde_json::to_string(&v).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+    .unwrap();
+
+    Command::cargo_bin("chat-history")
+        .unwrap()
+        .args(["search", "550e8400-e29b-41d4-a716-446655440000", "--deep"])
+        .env("CLAUDE_CONFIG_DIR", tmp.path())
+        .env("HOME", tmp.path())
+        .env_remove("CODEX_HOME")
+        .env("NO_COLOR", "1")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("No results").not());
+}
+
+#[test]
+fn index_entry_missing_created_still_listed() {
+    let tmp = TempDir::new().unwrap();
+    let project_dir = tmp.path().join("projects").join("-Users-test-project");
+    fs::create_dir_all(&project_dir).unwrap();
+    let session_id = "bbbbbbbb-cccc-dddd-eeee-ffffffffffff";
+    let jsonl_path = project_dir.join(format!("{session_id}.jsonl"));
+    fs::write(
+        &jsonl_path,
+        serde_json::to_string(&serde_json::json!({"type":"user","message":{"role":"user","content":"hello"},"timestamp":"2025-01-15T10:00:00Z","uuid":"u1"})).unwrap(),
+    )
+    .unwrap();
+    let index = serde_json::json!({
+        "entries": [{
+            "sessionId": session_id,
+            "summary": "session without created field",
+            "firstPrompt": "hello",
+            "modified": "2025-01-15T11:00:00Z",
+            "messageCount": 1,
+            "gitBranch": "main",
+            "projectPath": "/Users/test/project",
+            "fullPath": jsonl_path.to_string_lossy(),
+            "isSidechain": false
+        }]
+    });
+    fs::write(
+        project_dir.join("sessions-index.json"),
+        serde_json::to_string(&index).unwrap(),
+    )
+    .unwrap();
+
+    Command::cargo_bin("chat-history")
+        .unwrap()
+        .env("CLAUDE_CONFIG_DIR", tmp.path())
+        .env("HOME", tmp.path())
+        .env_remove("CODEX_HOME")
+        .env("NO_COLOR", "1")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("session without created field"));
+}
+
 // A transcript large enough (>64KB of output) to overflow an OS pipe buffer,
 // so a downstream reader exiting early reliably triggers EPIPE on write.
 fn setup_large_transcript_fixture(tmp: &TempDir) -> &'static str {
