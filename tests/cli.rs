@@ -1684,9 +1684,10 @@ fn short_message_run_tests_is_searchable() {
         .env("NO_COLOR", "1")
         .output()
         .unwrap();
+    assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(
-        !stdout.contains("No results"),
+        stdout.contains("results for") && !stdout.contains("No results"),
         "Short message 'run tests' should be searchable.\nGot: {stdout}"
     );
 }

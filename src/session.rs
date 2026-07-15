@@ -211,11 +211,11 @@ fn claude_ai_title(path: &Path) -> Option<String> {
 }
 
 pub fn encode_path_for_claude(path: &Path) -> String {
-    // Claude Code encodes project dirs by replacing every non-alphanumeric
-    // character with '-', not just path separators.
+    // Claude Code encodes project dirs by replacing every character outside
+    // ASCII [a-zA-Z0-9] with '-' (claude-code#19972), not just separators.
     path.to_string_lossy()
         .chars()
-        .map(|c| if c.is_alphanumeric() { c } else { '-' })
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect()
 }
 
@@ -1366,6 +1366,16 @@ mod tests {
         // resume copies the session where Claude Code never looks.
         let path = std::path::Path::new("/Users/x/my_app.v2");
         assert_eq!(encode_path_for_claude(path), "-Users-x-my-app-v2");
+    }
+
+    #[test]
+    fn encode_path_replaces_non_ascii() {
+        // Claude Code keeps only ASCII alphanumerics (claude-code#19972):
+        // CJK/accented characters become '-' too.
+        let path = std::path::Path::new("/Users/x/café");
+        assert_eq!(encode_path_for_claude(path), "-Users-x-caf-");
+        let cjk = std::path::Path::new("/Users/x/研究");
+        assert_eq!(encode_path_for_claude(cjk), "-Users-x---");
     }
 
     #[test]
