@@ -252,13 +252,7 @@ fn main() {
         }
         Some(Commands::Inspect { session_id, last }) => {
             let session = if last {
-                filtered.iter().max_by_key(|s| {
-                    if s.modified.is_empty() {
-                        &s.created
-                    } else {
-                        &s.modified
-                    }
-                })
+                filtered.iter().max_by_key(|s| session::recency_key(s))
             } else if let Some(sid) = &session_id {
                 find_session(&sessions, sid)
             } else {
@@ -281,13 +275,7 @@ fn main() {
             plain,
         }) => {
             let session = if last {
-                filtered.iter().max_by_key(|s| {
-                    if s.modified.is_empty() {
-                        &s.created
-                    } else {
-                        &s.modified
-                    }
-                })
+                filtered.iter().max_by_key(|s| session::recency_key(s))
             } else if let Some(sid) = &session_id {
                 find_session(&sessions, sid)
             } else {

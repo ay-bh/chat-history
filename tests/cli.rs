@@ -528,6 +528,86 @@ fn search_uuid_mentioned_in_content_falls_back_to_content_search() {
 }
 
 #[test]
+fn inspect_accepts_uppercase_session_id() {
+    let tmp = TempDir::new().unwrap();
+    setup_transcript_fixture(&tmp);
+    Command::cargo_bin("chat-history")
+        .unwrap()
+        .args(["inspect", "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE"])
+        .env("CLAUDE_CONFIG_DIR", tmp.path())
+        .env("HOME", tmp.path())
+        .env_remove("CODEX_HOME")
+        .env("NO_COLOR", "1")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("webpack and docker config"));
+}
+
+#[test]
+fn view_last_respects_source_filter() {
+    let tmp = TempDir::new().unwrap();
+    setup_transcript_fixture(&tmp); // claude, modified 2025-01-15
+    setup_codex_fixture(&tmp); // codex, modified 2026-06-10 (newest overall)
+    Command::cargo_bin("chat-history")
+        .unwrap()
+        .args(["view", "--last", "--source", "claude", "--plain"])
+        .env("CLAUDE_CONFIG_DIR", tmp.path())
+        .env("HOME", tmp.path())
+        .env_remove("CODEX_HOME")
+        .env("NO_COLOR", "1")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("webpack"))
+        .stdout(predicate::str::contains("migrate the auth service").not());
+}
+
+#[test]
+fn index_entry_garbage_created_falls_back_to_mtime() {
+    let tmp = TempDir::new().unwrap();
+    let project_dir = tmp.path().join("projects").join("-Users-test-project");
+    fs::create_dir_all(&project_dir).unwrap();
+    let session_id = "cccccccc-dddd-eeee-ffff-000000000000";
+    let jsonl_path = project_dir.join(format!("{session_id}.jsonl"));
+    fs::write(
+        &jsonl_path,
+        serde_json::to_string(&serde_json::json!({"type":"user","message":{"role":"user","content":"hello"},"timestamp":"2025-01-15T10:00:00Z","uuid":"u1"})).unwrap(),
+    )
+    .unwrap();
+    let index = serde_json::json!({
+        "entries": [{
+            "sessionId": session_id,
+            "summary": "session with garbage created",
+            "firstPrompt": "hello",
+            "created": "garbage-not-a-date",
+            "modified": "2025-01-15T11:00:00Z",
+            "messageCount": 1,
+            "gitBranch": "main",
+            "projectPath": "/Users/test/project",
+            "fullPath": jsonl_path.to_string_lossy(),
+            "isSidechain": false
+        }]
+    });
+    fs::write(
+        project_dir.join("sessions-index.json"),
+        serde_json::to_string(&index).unwrap(),
+    )
+    .unwrap();
+
+    // The file's mtime (today) is the fallback date, so a wide date filter
+    // must still include the session instead of silently dropping it.
+    Command::cargo_bin("chat-history")
+        .unwrap()
+        .args(["--from", "2020-01-01"])
+        .env("CLAUDE_CONFIG_DIR", tmp.path())
+        .env("HOME", tmp.path())
+        .env_remove("CODEX_HOME")
+        .env("NO_COLOR", "1")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("session with garbage created"));
+}
+
+#[test]
 fn index_entry_missing_created_still_listed() {
     let tmp = TempDir::new().unwrap();
     let project_dir = tmp.path().join("projects").join("-Users-test-project");
@@ -723,7 +803,7 @@ fn deep_search_with_transcript() {
         .assert()
         .success()
         .stdout(predicate::str::contains("No results").not())
-        .stdout(predicate::str::contains("results for"));
+        .stdout(predicate::str::contains("webpack and docker config"));
 }
 
 #[test]
@@ -1376,7 +1456,7 @@ fn cursor_session_deep_search() {
         .assert()
         .success()
         .stdout(predicate::str::contains("No results").not())
-        .stdout(predicate::str::contains("results for"));
+        .stdout(predicate::str::contains("r2d2"));
 }
 
 #[test]

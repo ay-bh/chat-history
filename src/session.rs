@@ -402,6 +402,7 @@ pub fn load_claude_sessions() -> Vec<Session> {
             let date = entry
                 .created
                 .get(..10)
+                .filter(|d| NaiveDate::parse_from_str(d, "%Y-%m-%d").is_ok())
                 .map(str::to_string)
                 .unwrap_or_else(|| mtime_date(Path::new(&entry.full_path)).unwrap_or_default());
             sessions.push(Session {
@@ -1295,27 +1296,32 @@ pub fn filter_sessions(
         })
         .cloned()
         .collect();
-    out.sort_by(|a, b| {
-        let ma = if a.modified.is_empty() {
-            &a.created
-        } else {
-            &a.modified
-        };
-        let mb = if b.modified.is_empty() {
-            &b.created
-        } else {
-            &b.modified
-        };
-        mb.cmp(ma)
-    });
+    out.sort_by_key(|s| std::cmp::Reverse(recency_key(s)));
     out
+}
+
+/// Recency ordering for "newest first" sorts and `--last`: parsed timestamp
+/// when possible (raw string comparison misorders mixed UTC offsets), raw
+/// string as a tiebreak/fallback for unparseable values.
+pub fn recency_key(s: &Session) -> (Option<DateTime<FixedOffset>>, String) {
+    let ts = if s.modified.is_empty() {
+        &s.created
+    } else {
+        &s.modified
+    };
+    (parse_any_timestamp(ts), ts.clone())
 }
 
 pub fn find_session<'a>(sessions: &'a [Session], sid: &str) -> Option<&'a Session> {
     sessions
         .iter()
-        .find(|s| s.id == sid)
-        .or_else(|| sessions.iter().find(|s| s.id.starts_with(sid)))
+        .find(|s| s.id.eq_ignore_ascii_case(sid))
+        .or_else(|| {
+            sessions.iter().find(|s| {
+                s.id.get(..sid.len())
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case(sid))
+            })
+        })
 }
 
 #[cfg(test)]
@@ -1512,6 +1518,33 @@ mod tests {
         let filtered = filter_sessions(&sessions, None, Some(to), None, None, None, None);
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].summary, "old");
+    }
+
+    #[test]
+    fn find_session_is_case_insensitive() {
+        let sessions = vec![make_session(
+            "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            "2025-01-15",
+            "claude",
+            "/p",
+            "",
+            "s",
+        )];
+        assert!(find_session(&sessions, "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE").is_some());
+        assert!(find_session(&sessions, "AAAAAAAA").is_some(), "prefix");
+        assert!(find_session(&sessions, "zzzz").is_none());
+    }
+
+    #[test]
+    fn filter_sorts_by_parsed_time_not_string() {
+        // 16:00+05:30 is 10:30Z — chronologically EARLIER than 12:00Z but
+        // lexicographically greater as a string.
+        let mut offset = make_session("1", "2026-07-15", "claude", "/p", "", "offset");
+        offset.modified = "2026-07-15T16:00:00+05:30".into();
+        let mut zulu = make_session("2", "2026-07-15", "claude", "/p", "", "zulu");
+        zulu.modified = "2026-07-15T12:00:00Z".into();
+        let out = filter_sessions(&[offset, zulu], None, None, None, None, None, None);
+        assert_eq!(out[0].summary, "zulu");
     }
 
     #[test]
