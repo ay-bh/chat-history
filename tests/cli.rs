@@ -327,7 +327,8 @@ fn keyword_filter_with_search() {
         .env("HOME", tmp.path())
         .assert()
         .success()
-        .stdout(predicate::str::contains("docker"));
+        .stdout(predicate::str::contains("No results").not())
+        .stdout(predicate::str::contains("webpack and docker config"));
 }
 
 #[test]
@@ -705,7 +706,8 @@ fn deep_search_with_transcript() {
         .env("HOME", tmp.path())
         .assert()
         .success()
-        .stdout(predicate::str::contains("webpack"));
+        .stdout(predicate::str::contains("No results").not())
+        .stdout(predicate::str::contains("results for"));
 }
 
 #[test]
@@ -1009,7 +1011,8 @@ fn deep_search_finds_tool_output_content() {
         .env("HOME", tmp.path())
         .assert()
         .success()
-        .stdout(predicate::str::contains("rate limiting"));
+        .stdout(predicate::str::contains("No results").not())
+        .stdout(predicate::str::contains("sliding window approach"));
 }
 
 #[test]
@@ -1272,7 +1275,8 @@ fn codex_session_deep_search() {
         .env_remove("CODEX_HOME")
         .assert()
         .success()
-        .stdout(predicate::str::contains("async"));
+        .stdout(predicate::str::contains("No results").not())
+        .stdout(predicate::str::contains("migrate the auth service"));
 }
 
 #[test]
@@ -1355,7 +1359,8 @@ fn cursor_session_deep_search() {
         .env("CLAUDE_CONFIG_DIR", tmp.path())
         .assert()
         .success()
-        .stdout(predicate::str::contains("pooling"));
+        .stdout(predicate::str::contains("No results").not())
+        .stdout(predicate::str::contains("results for"));
 }
 
 #[test]
@@ -1681,7 +1686,7 @@ fn short_message_run_tests_is_searchable() {
         .unwrap();
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(
-        stdout.contains("test") || stdout.contains("run"),
+        !stdout.contains("No results"),
         "Short message 'run tests' should be searchable.\nGot: {stdout}"
     );
 }

@@ -66,7 +66,7 @@ The short alias `ch` works identically: `ch search "auth"`, `ch inspect --last`,
 
 ## Interpreting output
 
-- `CC` = Claude Code session, `CR` = Cursor session
+- `CC` = Claude Code session, `CR` = Cursor session, `CX` = Codex session
 - Score (`★ N.N`) = relevance score (higher = better match)
 - `[summary]`, `[first_prompt]`, `[branch]` = which field matched in index search
 - `inspect` shows: duration, message count, model name, token count, tools used, files touched, accomplishments, key decisions

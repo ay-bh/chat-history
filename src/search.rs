@@ -154,43 +154,43 @@ pub fn scored_search(
     limit: usize,
     timeframe: Option<&str>,
 ) -> Vec<SearchResult> {
-    if is_uuid(query) {
-        if let Some(s) = sessions
+    // On a UUID-shaped query try a direct session-id lookup first; on miss,
+    // fall through to content search so a UUID that was discussed inside a
+    // conversation is still findable.
+    if is_uuid(query)
+        && let Some(s) = sessions
             .iter()
             .find(|s| s.id.eq_ignore_ascii_case(query.trim()))
-        {
-            let (messages, _) = parse_session(s, false);
-            if let Some(mut msg) = messages.into_iter().next() {
-                msg.final_score = 100.0;
-                return vec![SearchResult {
-                    session: s.clone(),
-                    message: msg,
-                }];
-            }
-            let stub = Message {
-                uuid: String::new(),
-                timestamp: String::new(),
-                role: "user".into(),
-                content: if !s.summary.is_empty() {
-                    s.summary.clone()
-                } else {
-                    s.first_prompt.clone()
-                },
-                session_id: s.id.clone(),
-                project_path: s.project.clone(),
-                tool_uses: Vec::new(),
-                files_referenced: Vec::new(),
-                error_patterns: Vec::new(),
-                relevance_score: 0.0,
-                final_score: 100.0,
-            };
+    {
+        let (messages, _) = parse_session(s, false);
+        if let Some(mut msg) = messages.into_iter().next() {
+            msg.final_score = 100.0;
             return vec![SearchResult {
                 session: s.clone(),
-                message: stub,
+                message: msg,
             }];
         }
-        // No session has this id — fall through to content search so a UUID
-        // that was discussed inside a conversation is still findable.
+        let stub = Message {
+            uuid: String::new(),
+            timestamp: String::new(),
+            role: "user".into(),
+            content: if !s.summary.is_empty() {
+                s.summary.clone()
+            } else {
+                s.first_prompt.clone()
+            },
+            session_id: s.id.clone(),
+            project_path: s.project.clone(),
+            tool_uses: Vec::new(),
+            files_referenced: Vec::new(),
+            error_patterns: Vec::new(),
+            relevance_score: 0.0,
+            final_score: 100.0,
+        };
+        return vec![SearchResult {
+            session: s.clone(),
+            message: stub,
+        }];
     }
 
     let tf_cutoff: Option<DateTime<FixedOffset>> = timeframe.map(|tf| {

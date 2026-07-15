@@ -2074,11 +2074,16 @@ mod tests {
     #[test]
     #[ignore = "manual: requires local Claude transcript"]
     fn claude_ai_title_real_session() {
-        let p = Path::new(concat!(
-            env!("HOME"),
-            "/.claude/projects/-Users-ayushbhardwaj-Documents-GitHub-chat-history/",
-            "5e081f75-04b9-4461-a805-8bfb9f8c75fc.jsonl"
-        ));
+        // Resolve HOME at runtime: env! would make compilation fail on any
+        // host without HOME set (e.g. Windows), even though this test is
+        // ignored — ignored tests are still compiled.
+        let Ok(home) = std::env::var("HOME") else {
+            return;
+        };
+        let p = std::path::PathBuf::from(home).join(
+            ".claude/projects/-Users-ayushbhardwaj-Documents-GitHub-chat-history/5e081f75-04b9-4461-a805-8bfb9f8c75fc.jsonl",
+        );
+        let p = p.as_path();
         if !p.exists() {
             return;
         }

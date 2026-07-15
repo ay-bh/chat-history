@@ -75,28 +75,6 @@ fn session_duration_minutes(timestamps: &[&str]) -> i64 {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn extract_sentence_multibyte_boundary_no_panic() {
-        // No '.' after the keyword and a 3-byte char straddling the idx+150
-        // fallback cut point: must not panic on a non-boundary byte index.
-        let text = format!("fixed: {}", "日".repeat(100));
-        let sentence = extract_sentence_around(&text, "fixed");
-        assert!(sentence.is_some());
-    }
-
-    #[test]
-    fn duration_orders_by_parsed_time_not_string() {
-        // 23:00-08:00 is 07:00Z the next day: chronologically LATER than
-        // 01:00Z despite sorting earlier as a string.
-        let ts = ["2025-01-15T23:00:00-08:00", "2025-01-16T01:00:00Z"];
-        assert_eq!(session_duration_minutes(&ts), 360);
-    }
-}
-
 pub fn inspect_session(session: &Session) -> Option<InspectInfo> {
     let (messages, meta_opt) = parse_session(session, true);
     if messages.is_empty() {
@@ -219,4 +197,26 @@ pub fn inspect_session(session: &Session) -> Option<InspectInfo> {
         model: meta.model.unwrap_or_default(),
         total_tokens: meta.total_tokens,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_sentence_multibyte_boundary_no_panic() {
+        // No '.' after the keyword and a 3-byte char straddling the idx+150
+        // fallback cut point: must not panic on a non-boundary byte index.
+        let text = format!("fixed: {}", "日".repeat(100));
+        let sentence = extract_sentence_around(&text, "fixed");
+        assert!(sentence.is_some());
+    }
+
+    #[test]
+    fn duration_orders_by_parsed_time_not_string() {
+        // 23:00-08:00 is 07:00Z the next day: chronologically LATER than
+        // 01:00Z despite sorting earlier as a string.
+        let ts = ["2025-01-15T23:00:00-08:00", "2025-01-16T01:00:00Z"];
+        assert_eq!(session_duration_minutes(&ts), 360);
+    }
 }
