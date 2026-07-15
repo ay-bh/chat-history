@@ -211,7 +211,12 @@ fn claude_ai_title(path: &Path) -> Option<String> {
 }
 
 pub fn encode_path_for_claude(path: &Path) -> String {
-    path.to_string_lossy().replace('/', "-")
+    // Claude Code encodes project dirs by replacing every non-alphanumeric
+    // character with '-', not just path separators.
+    path.to_string_lossy()
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '-' })
+        .collect()
 }
 
 fn normalize_for_project_match(s: &str) -> String {
@@ -1352,6 +1357,15 @@ mod tests {
     #[test]
     fn encode_path_root() {
         assert_eq!(encode_path_for_claude(std::path::Path::new("/")), "-");
+    }
+
+    #[test]
+    fn encode_path_replaces_all_non_alphanumerics() {
+        // Claude Code replaces every non-alphanumeric character with '-',
+        // not just '/'; dots and underscores must match its encoding or
+        // resume copies the session where Claude Code never looks.
+        let path = std::path::Path::new("/Users/x/my_app.v2");
+        assert_eq!(encode_path_for_claude(path), "-Users-x-my-app-v2");
     }
 
     #[test]

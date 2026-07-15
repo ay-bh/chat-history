@@ -14,6 +14,7 @@ static STRIP_TAGS: &[&str] = &[
     "open_and_recently_viewed_files",
     "user_info",
     "system_reminder",
+    "system-reminder",
     "git_status",
     "external_links",
     "rules",
@@ -377,6 +378,14 @@ mod tests {
     #[test]
     fn clean_prompt_collapses_newlines() {
         assert_eq!(clean_prompt("hello\n\n\n\n\nworld"), "hello\n\nworld");
+    }
+
+    #[test]
+    fn clean_prompt_strips_hyphenated_system_reminder() {
+        // Claude Code injects hyphenated <system-reminder> blocks into user
+        // message text; Cursor uses the underscore form.
+        let text = "<system-reminder>\ninjected boilerplate\n</system-reminder>\nfix the login bug";
+        assert_eq!(clean_prompt(text), "fix the login bug");
     }
 
     #[test]

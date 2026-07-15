@@ -305,7 +305,9 @@ fn main() {
                 std::process::exit(1);
             };
             let (messages, _) = parse_session(session, false);
-            display::export_transcript(&messages, session, output.as_deref());
+            if !display::export_transcript(&messages, session, output.as_deref()) {
+                std::process::exit(1);
+            }
         }
         Some(Commands::Resume { session_id }) => {
             let Some(session) = find_session(&sessions, &session_id) else {

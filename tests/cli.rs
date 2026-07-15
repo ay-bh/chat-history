@@ -388,6 +388,26 @@ fn setup_transcript_fixture(tmp: &TempDir) {
 }
 
 #[test]
+fn export_write_failure_exits_nonzero() {
+    let tmp = TempDir::new().unwrap();
+    setup_transcript_fixture(&tmp);
+    Command::cargo_bin("chat-history")
+        .unwrap()
+        .args([
+            "export",
+            "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            "-o",
+            "/nonexistent-dir-for-test/out.md",
+        ])
+        .env("CLAUDE_CONFIG_DIR", tmp.path())
+        .env("HOME", tmp.path())
+        .env_remove("CODEX_HOME")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Error writing"));
+}
+
+#[test]
 fn inspect_last_respects_source_filter() {
     let tmp = TempDir::new().unwrap();
     setup_transcript_fixture(&tmp); // claude, modified 2025-01-15

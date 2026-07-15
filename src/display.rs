@@ -505,7 +505,7 @@ pub fn print_plain(messages: &[Message]) {
     }
 }
 
-pub fn export_transcript(messages: &[Message], session: &Session, out_path: Option<&str>) {
+pub fn export_transcript(messages: &[Message], session: &Session, out_path: Option<&str>) -> bool {
     let summary = if session.summary.is_empty() {
         "(no summary)"
     } else {
@@ -555,7 +555,13 @@ pub fn export_transcript(messages: &[Message], session: &Session, out_path: Opti
         format!("{}_{safe}.md", session.date)
     });
     match std::fs::write(&path, &content) {
-        Ok(_) => println!("Exported to {path}"),
-        Err(e) => eprintln!("Error writing {path}: {e}"),
+        Ok(_) => {
+            println!("Exported to {path}");
+            true
+        }
+        Err(e) => {
+            eprintln!("Error writing {path}: {e}");
+            false
+        }
     }
 }
