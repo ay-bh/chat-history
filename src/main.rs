@@ -47,6 +47,7 @@ struct Cli {
     #[arg(
         short = 'L',
         long = "local",
+        global = true,
         help = "Only show sessions from current workspace"
     )]
     local: bool,

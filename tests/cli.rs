@@ -315,6 +315,42 @@ fn list_title_is_single_line_without_preamble() {
 }
 
 #[test]
+fn local_flag_is_accepted_after_subcommands() {
+    let tmp = TempDir::new().unwrap();
+    setup_fixture(&tmp);
+    Command::cargo_bin("chat-history")
+        .unwrap()
+        .args(["search", "nomatchquery", "-L"])
+        .env("CLAUDE_CONFIG_DIR", tmp.path())
+        .env("HOME", tmp.path())
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("unexpected argument").not());
+}
+
+#[test]
+fn empty_codex_home_is_treated_as_unset() {
+    let tmp = TempDir::new().unwrap();
+    let cwd = TempDir::new().unwrap();
+    Command::cargo_bin("chat-history")
+        .unwrap()
+        .arg("install-skill")
+        .current_dir(cwd.path())
+        .env("HOME", tmp.path())
+        .env_remove("USERPROFILE")
+        .env("CODEX_HOME", "")
+        .assert()
+        .success();
+    // Falls back to ~/.codex instead of a cwd-relative skills/ directory.
+    assert!(
+        tmp.path()
+            .join(".codex/skills/chat-history/SKILL.md")
+            .exists()
+    );
+    assert!(!cwd.path().join("skills").exists());
+}
+
+#[test]
 fn ambiguous_short_id_lists_candidates_and_fails() {
     let tmp = TempDir::new().unwrap();
     let project_dir = tmp.path().join("projects").join("-Users-test-ambig");

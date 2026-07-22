@@ -40,7 +40,7 @@ pub fn skill_targets() -> Vec<(PathBuf, &'static str)> {
         targets.push((home.join(".claude/skills/chat-history"), "Claude Code"));
     }
     // Codex: CODEX_HOME, or home-derived ~/.codex when home is known.
-    if std::env::var_os("CODEX_HOME").is_some() || home.is_some() {
+    if std::env::var_os("CODEX_HOME").is_some_and(|v| !v.is_empty()) || home.is_some() {
         targets.push((session::codex_home().join("skills/chat-history"), "Codex"));
     }
     targets

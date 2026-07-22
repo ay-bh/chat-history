@@ -111,7 +111,11 @@ fn cursor_projects_dir() -> PathBuf {
 }
 
 pub fn codex_home() -> PathBuf {
-    if let Some(dir) = std::env::var_os("CODEX_HOME") {
+    // A set-but-empty CODEX_HOME conventionally means unset; honoring it
+    // would resolve everything relative to the current directory.
+    if let Some(dir) = std::env::var_os("CODEX_HOME")
+        && !dir.is_empty()
+    {
         return PathBuf::from(dir);
     }
     home_dir().join(".codex")
