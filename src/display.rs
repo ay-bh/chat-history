@@ -6,7 +6,9 @@ use std::collections::BTreeMap;
 use std::sync::LazyLock;
 
 static USE_COLOR: LazyLock<bool> = LazyLock::new(|| {
-    std::io::IsTerminal::is_terminal(&std::io::stdout()) && std::env::var("NO_COLOR").is_err()
+    std::io::IsTerminal::is_terminal(&std::io::stdout())
+        && std::env::var("NO_COLOR").is_err()
+        && std::env::var("TERM").map(|t| t != "dumb").unwrap_or(true)
 });
 
 macro_rules! c {

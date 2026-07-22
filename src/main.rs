@@ -10,7 +10,18 @@ use clap::{Parser, Subcommand};
 #[command(
     name = "chat-history",
     about = "Search Claude Code + Cursor + Codex conversation history",
-    version
+    long_about = "Search Claude Code + Cursor + Codex conversation history.\n\n\
+        With no command, lists sessions newest first; every row shows a short\n\
+        session ID usable with inspect/view/export/resume/find.",
+    version,
+    after_help = "EXAMPLES:\n  \
+        chat-history                                  list sessions, newest first\n  \
+        chat-history --from yesterday --to yesterday  sessions from a specific day\n  \
+        chat-history search \"auth error\" --deep --json\n  \
+        chat-history inspect 6b1094cd                 summarize by short ID\n  \
+        chat-history view 6b1094cd --plain | less\n\n\
+        EXIT CODES:\n  \
+        0 success, 1 not found / IO error, 2 usage error or ambiguous session ID"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -26,7 +37,12 @@ struct Cli {
     #[arg(long = "to", global = true, help = "End date")]
     to_date: Option<String>,
 
-    #[arg(long, global = true, help = "Filter by source (claude/cursor/codex)")]
+    #[arg(
+        long,
+        global = true,
+        value_parser = ["claude", "cursor", "codex"],
+        help = "Filter by source"
+    )]
     source: Option<String>,
 
     #[arg(long, global = true, help = "Filter by project path substring")]
@@ -62,42 +78,64 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Search session content and metadata (add --deep --json from agents)
     Search {
+        /// Search query, or a full session UUID for direct lookup
         query: String,
-        #[arg(long, default_value = "all")]
+        /// What to search within transcripts
+        #[arg(long, default_value = "all", value_parser = ["all", "errors", "similar", "tools", "files"])]
         scope: String,
+        /// Search full transcript content instead of the fast index
         #[arg(long)]
         deep: bool,
+        /// Maximum number of results
         #[arg(long, default_value_t = 15)]
         limit: usize,
+        /// Only messages newer than this (e.g. "2 days", "1 week")
         #[arg(long)]
         timeframe: Option<String>,
+        /// Structured JSON output (session_id, score, snippet, tools, files)
         #[arg(long = "json")]
         json_output: bool,
     },
+    /// Summarize a session: accomplishments, tools, files, model, tokens
     Inspect {
+        /// Session ID or unique prefix
         session_id: Option<String>,
+        /// Inspect the most recent session
         #[arg(long)]
         last: bool,
     },
+    /// Print a session transcript
     View {
+        /// Session ID or unique prefix
         session_id: Option<String>,
+        /// View the most recent session
         #[arg(long)]
         last: bool,
+        /// Show tool call names inline
         #[arg(long)]
         tools: bool,
+        /// Plain text without formatting, pipe-friendly
         #[arg(long)]
         plain: bool,
     },
+    /// Export a session transcript as markdown
     Export {
+        /// Session ID or unique prefix
         session_id: String,
+        /// Output file (stdout if omitted)
         #[arg(short = 'o', long)]
         output: Option<String>,
     },
+    /// Resume a Claude Code or Codex session in its original tool
     Resume {
+        /// Session ID or unique prefix
         session_id: String,
     },
+    /// Print the transcript file path for scripting
     Find {
+        /// Session ID or unique prefix
         session_id: String,
     },
     /// Install the agent skill for Claude Code, Cursor, and Codex
@@ -106,6 +144,11 @@ enum Commands {
         /// Overwrite existing skills even if they were user-edited
         #[arg(long)]
         force: bool,
+    },
+    /// Generate shell completions (bash, zsh, fish, elvish, powershell)
+    Completions {
+        /// Shell to generate completions for
+        shell: clap_complete::Shell,
     },
 }
 
@@ -139,7 +182,7 @@ fn parse_date_arg(val: &Option<String>) -> Option<chrono::NaiveDate> {
                 "Invalid date: '{}'. Try: YYYY-MM-DD, today, yesterday, '3 days ago', 'last week'",
                 v
             );
-            std::process::exit(1);
+            std::process::exit(2);
         })
     })
 }
@@ -154,6 +197,17 @@ fn main() {
     }
 
     let cli = Cli::parse();
+
+    if let Some(Commands::Completions { shell }) = &cli.command {
+        use clap::CommandFactory;
+        clap_complete::generate(
+            *shell,
+            &mut Cli::command(),
+            "chat-history",
+            &mut std::io::stdout(),
+        );
+        return;
+    }
 
     if let Some(Commands::InstallSkill { force }) = &cli.command {
         install_skill(*force);
@@ -342,7 +396,7 @@ fn main() {
             let session = resolve_session_or_exit(&sessions, &session_id);
             println!("{}", session.file);
         }
-        Some(Commands::InstallSkill { .. }) => unreachable!(),
+        Some(Commands::InstallSkill { .. }) | Some(Commands::Completions { .. }) => unreachable!(),
         None => {
             if cli.summarize {
                 display::print_summarized(&filtered);
