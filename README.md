@@ -22,12 +22,12 @@ The first time you run `chat-history` / `ch`, it quietly installs the bundled ag
 - `~/.claude/skills/chat-history/SKILL.md`
 - `$CODEX_HOME/skills/chat-history/SKILL.md` (or `~/.codex/...`)
 
-On Windows, the same paths are under `%USERPROFILE%`. Later CLI upgrades refresh **managed** copies automatically. User-edited skills are left alone.
+On Windows, the same paths are under `%USERPROFILE%`. Later CLI upgrades refresh **managed** copies automatically (those written by this CLI, tracked via a `.chat-history-managed` sidecar). User-edited skills are left alone. Skills installed by older versions without that sidecar are left alone by the quiet path — run `install-skill` once after upgrading to adopt them.
 
 Optional explicit install / reinstall:
 
 ```bash
-chat-history install-skill           # same rules as auto-install
+chat-history install-skill           # refresh managed + adopt legacy (pre-sidecar) installs
 chat-history install-skill --force   # overwrite even user-edited skills
 ```
 

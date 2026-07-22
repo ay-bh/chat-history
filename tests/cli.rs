@@ -161,6 +161,54 @@ fn ensure_skills_preserves_user_edits() {
 }
 
 #[test]
+fn install_skill_adopts_legacy_without_sidecar() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join(".claude/skills/chat-history");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("SKILL.md"), "legacy 0.2.x skill without sidecar").unwrap();
+
+    Command::cargo_bin("chat-history")
+        .unwrap()
+        .arg("install-skill")
+        .env("HOME", tmp.path())
+        .env_remove("USERPROFILE")
+        .env_remove("CODEX_HOME")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("refreshed"));
+
+    let content = fs::read_to_string(dir.join("SKILL.md")).unwrap();
+    assert_ne!(content, "legacy 0.2.x skill without sidecar");
+    assert!(content.contains("chat-history"));
+    assert!(dir.join(".chat-history-managed").exists());
+}
+
+#[test]
+fn install_skill_hints_on_user_edited() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join(".claude/skills/chat-history");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("SKILL.md"), "user customized skill").unwrap();
+    fs::write(dir.join(".chat-history-managed"), "deadbeefdeadbeef").unwrap();
+
+    Command::cargo_bin("chat-history")
+        .unwrap()
+        .arg("install-skill")
+        .env("HOME", tmp.path())
+        .env_remove("USERPROFILE")
+        .env_remove("CODEX_HOME")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("user-edited"))
+        .stdout(predicate::str::contains("--force"));
+
+    assert_eq!(
+        fs::read_to_string(dir.join("SKILL.md")).unwrap(),
+        "user customized skill"
+    );
+}
+
+#[test]
 fn install_skill_force_overwrites_user_edits() {
     let tmp = TempDir::new().unwrap();
     let dir = tmp.path().join(".claude/skills/chat-history");

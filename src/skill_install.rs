@@ -10,9 +10,7 @@ pub const MANAGED_SIDECAR: &str = ".chat-history-managed";
 
 /// Resolve the user home directory (macOS/Linux `HOME`, Windows `USERPROFILE`).
 pub fn user_home() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
+    session::user_home()
 }
 
 /// Stable content fingerprint for managed-skill detection (FNV-1a 64-bit).
@@ -36,12 +34,13 @@ fn skill_path(dir: &Path) -> PathBuf {
 /// Target skill directories for Cursor, Claude Code, and Codex.
 pub fn skill_targets() -> Vec<(PathBuf, &'static str)> {
     let mut targets = Vec::new();
-    if let Some(home) = user_home() {
+    let home = user_home();
+    if let Some(ref home) = home {
         targets.push((home.join(".cursor/skills/chat-history"), "Cursor"));
         targets.push((home.join(".claude/skills/chat-history"), "Claude Code"));
     }
     // Codex: CODEX_HOME, or home-derived ~/.codex when home is known.
-    if std::env::var_os("CODEX_HOME").is_some() || user_home().is_some() {
+    if std::env::var_os("CODEX_HOME").is_some() || home.is_some() {
         targets.push((session::codex_home().join("skills/chat-history"), "Codex"));
     }
     targets
@@ -59,19 +58,34 @@ fn write_managed_skill(dir: &Path) -> bool {
     std::fs::write(&sidecar, content_hash(SKILL_CONTENT)).is_ok()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// Silent auto-path: never overwrite user edits or ambiguous legacy copies.
+    Quiet,
+    /// `install-skill`: refresh managed + adopt sidecar-less legacy; keep user edits.
+    Explicit,
+    /// `install-skill --force`: overwrite everything.
+    Force,
+}
+
+#[derive(Debug, PartialEq, Eq)]
 enum EnsureAction {
     Wrote,
     Refreshed,
-    Skipped,
+    AlreadyCurrent,
+    /// Sidecar present but content hash no longer matches — treat as user edit.
+    LeftUserEdited,
+    /// Sidecar-less copy that differs from embedded (quiet path only).
+    LeftLegacy,
     Failed,
 }
 
-fn ensure_one(dir: &Path, force: bool) -> EnsureAction {
+fn ensure_one(dir: &Path, mode: Mode) -> EnsureAction {
     let skill = skill_path(dir);
     let sidecar = sidecar_path(dir);
     let embedded_hash = content_hash(SKILL_CONTENT);
 
-    if force {
+    if mode == Mode::Force {
         return if write_managed_skill(dir) {
             EnsureAction::Wrote
         } else {
@@ -96,7 +110,7 @@ fn ensure_one(dir: &Path, force: bool) -> EnsureAction {
                     if managed == on_disk_hash {
                         // Still our copy. Refresh if embedded skill changed.
                         if on_disk_hash == embedded_hash {
-                            EnsureAction::Skipped
+                            EnsureAction::AlreadyCurrent
                         } else if write_managed_skill(dir) {
                             EnsureAction::Refreshed
                         } else {
@@ -104,18 +118,26 @@ fn ensure_one(dir: &Path, force: bool) -> EnsureAction {
                         }
                     } else {
                         // Sidecar present but content changed → user-edited.
-                        EnsureAction::Skipped
+                        EnsureAction::LeftUserEdited
                     }
                 }
                 Err(_) => {
-                    // Legacy install (no sidecar). Adopt only if it already
-                    // matches the current embedded skill; never overwrite edits
-                    // or older defaults we can't prove are ours.
+                    // Legacy install (no sidecar).
                     if on_disk_hash == embedded_hash {
-                        let _ = std::fs::write(&sidecar, embedded_hash);
-                        EnsureAction::Skipped
+                        let _ = std::fs::write(&sidecar, &embedded_hash);
+                        EnsureAction::AlreadyCurrent
+                    } else if mode == Mode::Explicit {
+                        // Explicit install-skill: adopt pre-sidecar installs so
+                        // upgrades that re-run install-skill get the new skill
+                        // (matches 0.2.x "re-run install-skill after upgrades").
+                        if write_managed_skill(dir) {
+                            EnsureAction::Refreshed
+                        } else {
+                            EnsureAction::Failed
+                        }
                     } else {
-                        EnsureAction::Skipped
+                        // Quiet path: don't guess — leave alone.
+                        EnsureAction::LeftLegacy
                     }
                 }
             }
@@ -124,16 +146,17 @@ fn ensure_one(dir: &Path, force: bool) -> EnsureAction {
 }
 
 /// Quietly install or refresh managed skills. Never prints; never overwrites
-/// user-edited skills. Safe to call on every CLI invocation.
+/// user-edited or ambiguous legacy skills. Safe to call on every CLI invocation.
 pub fn ensure_skills() {
     for (dir, _) in skill_targets() {
-        let _ = ensure_one(&dir, false);
+        let _ = ensure_one(&dir, Mode::Quiet);
     }
 }
 
 /// Explicit install used by `chat-history install-skill`.
 ///
-/// Without `force`, same rules as [`ensure_skills`] but reports what happened.
+/// Without `force`, refreshes managed copies and adopts sidecar-less legacy
+/// installs, but leaves verified user edits alone (prints a `--force` hint).
 /// With `force`, overwrites even user-edited skills.
 pub fn install_skill(force: bool) {
     let targets = skill_targets();
@@ -142,9 +165,10 @@ pub fn install_skill(force: bool) {
         std::process::exit(1);
     }
 
+    let mode = if force { Mode::Force } else { Mode::Explicit };
     let mut any_ok = false;
     for (dir, name) in &targets {
-        match ensure_one(dir, force) {
+        match ensure_one(dir, mode) {
             EnsureAction::Wrote => {
                 println!("  installed → {}", skill_path(dir).display());
                 any_ok = true;
@@ -153,13 +177,24 @@ pub fn install_skill(force: bool) {
                 println!("  refreshed → {}", skill_path(dir).display());
                 any_ok = true;
             }
-            EnsureAction::Skipped => {
-                if skill_path(dir).exists() {
-                    println!("  unchanged → {}", skill_path(dir).display());
-                    any_ok = true;
-                } else {
-                    eprintln!("  skip {name}: could not write to {}", dir.display());
-                }
+            EnsureAction::AlreadyCurrent => {
+                println!("  already current → {}", skill_path(dir).display());
+                any_ok = true;
+            }
+            EnsureAction::LeftUserEdited => {
+                println!(
+                    "  left alone → {} (user-edited; use --force to overwrite)",
+                    skill_path(dir).display()
+                );
+                any_ok = true;
+            }
+            EnsureAction::LeftLegacy => {
+                // Only reachable in Quiet mode; keep arm for exhaustiveness.
+                println!(
+                    "  left alone → {} (not managed; use --force to overwrite)",
+                    skill_path(dir).display()
+                );
+                any_ok = true;
             }
             EnsureAction::Failed => {
                 eprintln!("  skip {name}: could not write to {}", dir.display());
@@ -181,7 +216,7 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
-    fn with_home<F: FnOnce(&Path)>(f: F) {
+    fn with_tmp<F: FnOnce(&Path)>(f: F) {
         let tmp = TempDir::new().unwrap();
         f(tmp.path());
     }
@@ -194,9 +229,9 @@ mod tests {
 
     #[test]
     fn writes_when_missing() {
-        with_home(|home| {
+        with_tmp(|home| {
             let dir = home.join(".claude/skills/chat-history");
-            assert!(matches!(ensure_one(&dir, false), EnsureAction::Wrote));
+            assert!(matches!(ensure_one(&dir, Mode::Quiet), EnsureAction::Wrote));
             assert_eq!(fs::read_to_string(skill_path(&dir)).unwrap(), SKILL_CONTENT);
             assert_eq!(
                 fs::read_to_string(sidecar_path(&dir)).unwrap(),
@@ -207,24 +242,34 @@ mod tests {
 
     #[test]
     fn refreshes_managed_stale_copy() {
-        with_home(|home| {
+        with_tmp(|home| {
             let dir = home.join(".claude/skills/chat-history");
             fs::create_dir_all(&dir).unwrap();
             fs::write(skill_path(&dir), "old default").unwrap();
             fs::write(sidecar_path(&dir), content_hash("old default")).unwrap();
-            assert!(matches!(ensure_one(&dir, false), EnsureAction::Refreshed));
+            assert!(matches!(
+                ensure_one(&dir, Mode::Quiet),
+                EnsureAction::Refreshed
+            ));
             assert_eq!(fs::read_to_string(skill_path(&dir)).unwrap(), SKILL_CONTENT);
         });
     }
 
     #[test]
     fn preserves_user_edits() {
-        with_home(|home| {
+        with_tmp(|home| {
             let dir = home.join(".claude/skills/chat-history");
             fs::create_dir_all(&dir).unwrap();
             fs::write(skill_path(&dir), "my custom skill").unwrap();
             fs::write(sidecar_path(&dir), content_hash("old default")).unwrap();
-            assert!(matches!(ensure_one(&dir, false), EnsureAction::Skipped));
+            assert!(matches!(
+                ensure_one(&dir, Mode::Quiet),
+                EnsureAction::LeftUserEdited
+            ));
+            assert!(matches!(
+                ensure_one(&dir, Mode::Explicit),
+                EnsureAction::LeftUserEdited
+            ));
             assert_eq!(
                 fs::read_to_string(skill_path(&dir)).unwrap(),
                 "my custom skill"
@@ -233,12 +278,15 @@ mod tests {
     }
 
     #[test]
-    fn preserves_legacy_without_sidecar() {
-        with_home(|home| {
+    fn quiet_preserves_legacy_without_sidecar() {
+        with_tmp(|home| {
             let dir = home.join(".claude/skills/chat-history");
             fs::create_dir_all(&dir).unwrap();
             fs::write(skill_path(&dir), "legacy custom").unwrap();
-            assert!(matches!(ensure_one(&dir, false), EnsureAction::Skipped));
+            assert!(matches!(
+                ensure_one(&dir, Mode::Quiet),
+                EnsureAction::LeftLegacy
+            ));
             assert_eq!(
                 fs::read_to_string(skill_path(&dir)).unwrap(),
                 "legacy custom"
@@ -248,23 +296,44 @@ mod tests {
     }
 
     #[test]
+    fn explicit_adopts_legacy_without_sidecar() {
+        with_tmp(|home| {
+            let dir = home.join(".claude/skills/chat-history");
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(skill_path(&dir), "legacy 0.2.x skill").unwrap();
+            assert!(matches!(
+                ensure_one(&dir, Mode::Explicit),
+                EnsureAction::Refreshed
+            ));
+            assert_eq!(fs::read_to_string(skill_path(&dir)).unwrap(), SKILL_CONTENT);
+            assert_eq!(
+                fs::read_to_string(sidecar_path(&dir)).unwrap(),
+                content_hash(SKILL_CONTENT)
+            );
+        });
+    }
+
+    #[test]
     fn force_overwrites_user_edits() {
-        with_home(|home| {
+        with_tmp(|home| {
             let dir = home.join(".claude/skills/chat-history");
             fs::create_dir_all(&dir).unwrap();
             fs::write(skill_path(&dir), "my custom skill").unwrap();
-            assert!(matches!(ensure_one(&dir, true), EnsureAction::Wrote));
+            assert!(matches!(ensure_one(&dir, Mode::Force), EnsureAction::Wrote));
             assert_eq!(fs::read_to_string(skill_path(&dir)).unwrap(), SKILL_CONTENT);
         });
     }
 
     #[test]
     fn adopts_legacy_matching_embedded() {
-        with_home(|home| {
+        with_tmp(|home| {
             let dir = home.join(".claude/skills/chat-history");
             fs::create_dir_all(&dir).unwrap();
             fs::write(skill_path(&dir), SKILL_CONTENT).unwrap();
-            assert!(matches!(ensure_one(&dir, false), EnsureAction::Skipped));
+            assert!(matches!(
+                ensure_one(&dir, Mode::Quiet),
+                EnsureAction::AlreadyCurrent
+            ));
             assert_eq!(
                 fs::read_to_string(sidecar_path(&dir)).unwrap(),
                 content_hash(SKILL_CONTENT)
