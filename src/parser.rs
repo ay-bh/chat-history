@@ -19,6 +19,8 @@ static STRIP_TAGS: &[&str] = &[
     "external_links",
     "rules",
     "agent_skills",
+    "manually_attached_skills",
+    "recommended_plugins",
 ];
 
 static STRIP_TAG_REGEXES: LazyLock<Vec<Regex>> = LazyLock::new(|| {
@@ -190,6 +192,37 @@ pub fn clean_prompt(text: &str) -> String {
     }
     result = CLEAN_MULTI_NL_RE.replace_all(&result, "\n\n").to_string();
     result.trim().to_string()
+}
+
+// Preamble tags stripped from titles even when unclosed (truncated prompts
+// often cut off before the closing tag). `user_query` is excluded — its body
+// IS the title.
+static TITLE_PREAMBLE_RES: LazyLock<Vec<Regex>> = LazyLock::new(|| {
+    STRIP_TAGS
+        .iter()
+        .chain(std::iter::once(&"timestamp"))
+        .map(|tag| Regex::new(&format!(r"(?s)<{tag}>.*?(</{tag}>|\z)")).unwrap())
+        .collect()
+});
+static TITLE_LEFTOVER_TAG_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"</?[a-zA-Z][a-zA-Z0-9_-]{0,60}>").unwrap());
+static TITLE_WS_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s+").unwrap());
+
+/// One-line title for list/search rows: strips prompt preamble (even when a
+/// closing tag is missing), collapses all whitespace, truncates with an
+/// ellipsis on a char boundary. Returns "" when nothing human-readable is left.
+pub fn display_title(text: &str, max: usize) -> String {
+    let mut t = clean_prompt(text);
+    for re in TITLE_PREAMBLE_RES.iter() {
+        t = re.replace_all(&t, " ").to_string();
+    }
+    let t = TITLE_LEFTOVER_TAG_RE.replace_all(&t, " ");
+    let t = TITLE_WS_RE.replace_all(t.trim(), " ").to_string();
+    let mut out: String = t.chars().take(max).collect();
+    if t.chars().count() > max {
+        out.push('…');
+    }
+    out
 }
 
 pub fn is_noise(text: &str) -> bool {
@@ -583,5 +616,41 @@ mod tests {
         let long = "a".repeat(1000);
         let result = truncate_for_search(&long, 100);
         assert!(result.len() <= 200); // head + tail with space
+    }
+
+    #[test]
+    fn display_title_strips_unclosed_preamble_tag() {
+        let raw =
+            "<manually_attached_skills>\nThe user has manually attached the following skills t";
+        assert_eq!(display_title(raw, 80), "");
+    }
+
+    #[test]
+    fn display_title_keeps_text_after_closed_preamble() {
+        let raw =
+            "<manually_attached_skills>skill stuff</manually_attached_skills>\nfix the login bug";
+        assert_eq!(display_title(raw, 80), "fix the login bug");
+    }
+
+    #[test]
+    fn display_title_collapses_newlines_to_one_line() {
+        let raw = "fix the\n\nlogin   bug\ttoday";
+        assert_eq!(display_title(raw, 80), "fix the login bug today");
+    }
+
+    #[test]
+    fn display_title_truncates_with_ellipsis() {
+        let raw = "a".repeat(100);
+        let out = display_title(&raw, 10);
+        assert_eq!(out.chars().count(), 11);
+        assert!(out.ends_with('…'));
+    }
+
+    #[test]
+    fn display_title_strips_stray_tags_and_keeps_user_query_body() {
+        let raw = "<user_query>how do I deploy this?</user_query>";
+        assert_eq!(display_title(raw, 80), "how do I deploy this?");
+        let raw2 = "<timestamp>2026-07-22T10:00:00Z</timestamp>ship the release";
+        assert_eq!(display_title(raw2, 80), "ship the release");
     }
 }

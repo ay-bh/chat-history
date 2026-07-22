@@ -1,5 +1,5 @@
 use crate::inspect::InspectInfo;
-use crate::parser::{clean_prompt, snippet_around_match};
+use crate::parser::{clean_prompt, display_title, snippet_around_match};
 use crate::search::{IndexResult, SearchResult};
 use crate::session::{Message, Session};
 use std::collections::BTreeMap;
@@ -41,6 +41,26 @@ fn src_tag(source: &str) -> String {
     }
 }
 
+/// Dim 8-char session-id chip. Every prefix resolves via `inspect`/`view`/
+/// `resume`/`find`, so each row carries its own address.
+fn id_chip(id: &str) -> String {
+    let short: String = id.chars().take(8).collect();
+    format!("{}{:8}{}", c!("dim"), short, c!("reset"))
+}
+
+/// Best one-line title for a session: summary, else cleaned first prompt.
+fn title_of(summary: &str, first_prompt: &str, max: usize) -> String {
+    let t = display_title(summary, max);
+    if !t.is_empty() {
+        return t;
+    }
+    let t = display_title(first_prompt, max);
+    if !t.is_empty() {
+        return t;
+    }
+    "(untitled)".into()
+}
+
 pub fn print_list(sessions: &[Session], verbose: bool) {
     if sessions.is_empty() {
         println!("{}No sessions found.{}", c!("dim"), c!("reset"));
@@ -54,16 +74,7 @@ pub fn print_list(sessions: &[Session], verbose: bool) {
     );
     for (i, s) in sessions.iter().enumerate() {
         let tag = src_tag(&s.source);
-        let summary = if !s.summary.is_empty() {
-            s.summary.chars().take(100).collect::<String>()
-        } else if !s.first_prompt.is_empty() {
-            clean_prompt(&s.first_prompt)
-                .chars()
-                .take(100)
-                .collect::<String>()
-        } else {
-            "(empty)".into()
-        };
+        let title = title_of(&s.summary, &s.first_prompt, 72);
         let branch = if s.branch.is_empty() {
             String::new()
         } else {
@@ -80,7 +91,7 @@ pub fn print_list(sessions: &[Session], verbose: bool) {
             String::new()
         };
         println!(
-            "  {}{:3}.{} {} {}{}{}  {}{}{}{}{}{}",
+            "  {}{:3}.{} {} {}{}{}  {}  {}{}{}{}{}{}",
             c!("dim"),
             i + 1,
             c!("reset"),
@@ -88,8 +99,9 @@ pub fn print_list(sessions: &[Session], verbose: bool) {
             c!("cyan"),
             s.date,
             c!("reset"),
+            id_chip(&s.id),
             c!("bold"),
-            summary,
+            title,
             c!("reset"),
             sidechain,
             branch,
@@ -131,22 +143,19 @@ pub fn print_summarized(sessions: &[Session]) {
             c!("reset")
         );
         for s in ds {
-            let title = if !s.summary.is_empty() {
-                s.summary.chars().take(80).collect::<String>()
-            } else if !s.first_prompt.is_empty() {
-                clean_prompt(&s.first_prompt)
-                    .chars()
-                    .take(80)
-                    .collect::<String>()
-            } else {
-                "(empty)".into()
-            };
+            let title = title_of(&s.summary, &s.first_prompt, 72);
             let branch = if s.branch.is_empty() {
                 String::new()
             } else {
                 format!(" {}({}){}", c!("magenta"), s.branch, c!("reset"))
             };
-            println!("    {} {}{}", src_tag(&s.source), title, branch);
+            println!(
+                "    {} {}  {}{}",
+                src_tag(&s.source),
+                id_chip(&s.id),
+                title,
+                branch
+            );
         }
         println!();
     }
@@ -170,19 +179,14 @@ pub fn print_index_results(results: &[IndexResult], query: &str) {
         let tag = src_tag(&r.session.source);
         let score = format!("{}★ {:.1}{}", c!("yellow"), r.score, c!("reset"));
         let field = format!("{} [{}]{}", c!("dim"), r.matched_field, c!("reset"));
-        let summary_or_display = if !r.session.summary.is_empty() {
-            r.session.summary.chars().take(80).collect::<String>()
-        } else {
-            r.display.chars().take(80).collect::<String>()
-        };
-        let sid_short: String = r.session.id.chars().take(8).collect();
+        let title = title_of(&r.session.summary, &r.display, 72);
         let branch = if r.session.branch.is_empty() {
             String::new()
         } else {
             format!(" {}({}){}", c!("magenta"), r.session.branch, c!("reset"))
         };
         println!(
-            "  {}{:3}.{} {} {}{}{} {}{} {}{}{}{}  {}[{}]{}",
+            "  {}{:3}.{} {} {}{}{} {} {}{} {}{}{}{}",
             c!("dim"),
             i + 1,
             c!("reset"),
@@ -190,15 +194,13 @@ pub fn print_index_results(results: &[IndexResult], query: &str) {
             c!("cyan"),
             r.session.date,
             c!("reset"),
+            id_chip(&r.session.id),
             score,
             field,
             c!("bold"),
-            summary_or_display,
+            title,
             c!("reset"),
-            branch,
-            c!("dim"),
-            sid_short,
-            c!("reset")
+            branch
         );
     }
     println!();
@@ -224,24 +226,14 @@ pub fn print_search_results(results: &[SearchResult], query: &str) {
             r.message.final_score,
             c!("reset")
         );
-        let sid_short: String = r.session.id.chars().take(8).collect();
         let role_str = if r.message.role == "user" {
             format!("{}You{}", c!("green"), c!("reset"))
         } else {
             format!("{}Assistant{}", c!("blue"), c!("reset"))
         };
-        let display_title = if !r.session.summary.is_empty() {
-            r.session.summary.chars().take(80).collect::<String>()
-        } else if !r.session.first_prompt.is_empty() {
-            clean_prompt(&r.session.first_prompt)
-                .chars()
-                .take(80)
-                .collect::<String>()
-        } else {
-            "(no summary)".into()
-        };
+        let title = title_of(&r.session.summary, &r.session.first_prompt, 72);
         println!(
-            "  {}{:3}.{} {} {}{}{} {}  {}{}{}  {}[{}]{}",
+            "  {}{:3}.{} {} {}{}{} {} {}  {}{}{}",
             c!("dim"),
             i + 1,
             c!("reset"),
@@ -249,12 +241,10 @@ pub fn print_search_results(results: &[SearchResult], query: &str) {
             c!("cyan"),
             r.session.date,
             c!("reset"),
+            id_chip(&r.session.id),
             score,
             c!("bold"),
-            display_title,
-            c!("reset"),
-            c!("dim"),
-            sid_short,
+            title,
             c!("reset")
         );
         let snippet = snippet_around_match(&r.message.content, query, 200);
@@ -329,10 +319,11 @@ pub fn print_index_results_json(results: &[IndexResult], query: &str) {
 
 pub fn print_inspect(info: &InspectInfo) {
     let tag = src_tag(&info.source);
-    let summary = if info.summary.is_empty() {
+    let cleaned = display_title(&info.summary, 120);
+    let summary = if cleaned.is_empty() {
         "(no summary)"
     } else {
-        &info.summary
+        &cleaned
     };
     println!("\n{}", "─".repeat(80));
     println!("  {}  {}{}{}", tag, c!("bold"), summary, c!("reset"));
@@ -432,10 +423,11 @@ pub fn print_inspect(info: &InspectInfo) {
 
 pub fn print_transcript(messages: &[Message], session: &Session, show_tools: bool) {
     let tag = src_tag(&session.source);
-    let summary = if session.summary.is_empty() {
+    let cleaned = title_of(&session.summary, &session.first_prompt, 120);
+    let summary = if cleaned == "(untitled)" {
         "(no summary)"
     } else {
-        &session.summary
+        &cleaned
     };
     println!("\n{}", "─".repeat(80));
     println!("  {}  {}{}{}", tag, c!("bold"), summary, c!("reset"));

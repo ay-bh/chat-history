@@ -249,6 +249,71 @@ fn skill_targets_honor_userprofile_without_home() {
     );
 }
 
+#[test]
+fn list_shows_short_ids_by_default() {
+    let tmp = TempDir::new().unwrap();
+    setup_fixture(&tmp);
+    Command::cargo_bin("chat-history")
+        .unwrap()
+        .env("CLAUDE_CONFIG_DIR", tmp.path())
+        .env("HOME", tmp.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("aaaaaaaa"))
+        .stdout(predicate::str::contains("11111111"))
+        .stdout(predicate::str::contains("aaaaaaaa-bbbb").not());
+}
+
+#[test]
+fn summarized_shows_short_ids() {
+    let tmp = TempDir::new().unwrap();
+    setup_fixture(&tmp);
+    Command::cargo_bin("chat-history")
+        .unwrap()
+        .arg("-s")
+        .env("CLAUDE_CONFIG_DIR", tmp.path())
+        .env("HOME", tmp.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("aaaaaaaa"))
+        .stdout(predicate::str::contains("11111111"));
+}
+
+#[test]
+fn list_title_is_single_line_without_preamble() {
+    let tmp = TempDir::new().unwrap();
+    let project_dir = tmp.path().join("projects").join("-Users-test-noisy");
+    fs::create_dir_all(&project_dir).unwrap();
+    let index = serde_json::json!({
+        "entries": [{
+            "sessionId": "99999999-8888-7777-6666-555555555555",
+            "summary": "",
+            "firstPrompt": "<manually_attached_skills>\nThe user has manually attached the following skills to their message.\n</manually_attached_skills>\nfix the flaky\n\ntest suite",
+            "created": "2025-04-01T10:00:00Z",
+            "modified": "2025-04-01T11:00:00Z",
+            "messageCount": 2,
+            "gitBranch": "",
+            "projectPath": "/Users/test/noisy",
+            "fullPath": "",
+            "isSidechain": false
+        }]
+    });
+    fs::write(
+        project_dir.join("sessions-index.json"),
+        serde_json::to_string(&index).unwrap(),
+    )
+    .unwrap();
+
+    Command::cargo_bin("chat-history")
+        .unwrap()
+        .env("CLAUDE_CONFIG_DIR", tmp.path())
+        .env("HOME", tmp.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("fix the flaky test suite"))
+        .stdout(predicate::str::contains("manually_attached_skills").not());
+}
+
 fn setup_fixture(tmp: &TempDir) {
     let project_dir = tmp.path().join("projects").join("-Users-test-project");
     fs::create_dir_all(&project_dir).unwrap();

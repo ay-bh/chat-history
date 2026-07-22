@@ -25,9 +25,9 @@ Search, inspect, and export Claude Code, Cursor, and Codex conversation history.
 
 **Temporal question** ("what did I work on yesterday?") — list, don't search:
 
-1. `chat-history --from yesterday --to yesterday -v` — `-v` shows session IDs.
+1. `chat-history --from yesterday --to yesterday` — every row shows a short session ID; `-s` groups by day for multi-day overviews.
    - `--from X` alone means **X through today**. Always pair with `--to` when the user means a specific day.
-   - `-s` groups by day for multi-day overviews, but the grouped view hides session IDs even with `-v` — use the flat `-v` list when you need IDs.
+   - Short IDs work everywhere a session ID is accepted (`inspect`, `view`, `resume`, `find`); `-v` adds full IDs and file paths.
 2. `chat-history inspect <id>` for accomplishments, tools, files touched.
 
 ## Choosing the best hit
@@ -39,7 +39,6 @@ Search, inspect, and export Claude Code, Cursor, and Codex conversation history.
 ## Common mistakes
 
 - Only `search` accepts `--json`; the session list and `inspect` reject it.
-- The session list shows no IDs unless you pass `-v`.
 - The only subcommands are `search`, `inspect`, `view`, `export`, `resume`, `find`, `install-skill`. Do not guess others; run `chat-history --help` when unsure.
 - Don't dump raw JSON or full transcripts at the user — summarize, cite the session ID and date.
 - Some Cursor sessions have thin metadata (`(no summary)`, `duration: 0min`, raw first-message titles). If `inspect` is thin, fall back to `chat-history view <id> --plain`.
@@ -48,7 +47,7 @@ Search, inspect, and export Claude Code, Cursor, and Codex conversation history.
 
 ```bash
 # List sessions
-chat-history                                      # newest first (-v for IDs and paths)
+chat-history                                      # newest first; short IDs on every row (-v for full IDs + paths)
 chat-history --from yesterday --to yesterday -s   # a specific day, grouped
 chat-history --from "3 days ago"                  # natural-language dates
 chat-history --source claude                      # claude | cursor | codex
