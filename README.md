@@ -12,18 +12,26 @@ Scoring logic ported from [claude-historian-mcp](https://github.com/Vvkmnn/claud
 
 ```bash
 cargo install chat-history
-chat-history install-skill
 ```
 
 `cargo install` puts `chat-history` and `ch` on `PATH` (`~/.cargo/bin/`).
 
-`install-skill` writes the bundled skill to:
+The first time you run `chat-history` / `ch`, it quietly installs the bundled agent skill to:
 
 - `~/.cursor/skills/chat-history/SKILL.md`
 - `~/.claude/skills/chat-history/SKILL.md`
 - `$CODEX_HOME/skills/chat-history/SKILL.md` (or `~/.codex/...`)
 
-Re-run `install-skill` after upgrades. The skill is active immediately — no restart needed.
+On Windows, the same paths are under `%USERPROFILE%`. Later CLI upgrades refresh **managed** copies automatically. User-edited skills are left alone.
+
+Optional explicit install / reinstall:
+
+```bash
+chat-history install-skill           # same rules as auto-install
+chat-history install-skill --force   # overwrite even user-edited skills
+```
+
+The skill is active immediately — no restart needed.
 
 ### Build from source
 
@@ -31,8 +39,9 @@ Re-run `install-skill` after upgrades. The skill is active immediately — no re
 git clone https://github.com/ay-bh/chat-history.git
 cd chat-history
 cargo install --path .
-chat-history install-skill
 ```
+
+Run any `chat-history` command once to install the skill (or `chat-history install-skill`).
 
 ## Agent usage
 

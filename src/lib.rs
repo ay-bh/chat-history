@@ -5,3 +5,4 @@ pub mod parser;
 pub mod scoring;
 pub mod search;
 pub mod session;
+pub mod skill_install;

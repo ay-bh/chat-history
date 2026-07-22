@@ -15,6 +15,13 @@ cargo install chat-history
 
 This installs both `chat-history` and `ch` (short alias) into `~/.cargo/bin/`.
 
+The skill is installed automatically the first time the CLI runs (and managed copies are refreshed on later upgrades). Optional:
+
+```bash
+chat-history install-skill           # explicit install / status
+chat-history install-skill --force   # overwrite user-edited skills
+```
+
 ## When to use
 
 - User asks about past conversations or sessions

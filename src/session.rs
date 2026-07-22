@@ -91,7 +91,10 @@ fn home_dir() -> PathBuf {
 }
 
 fn dirs_next() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
+    // macOS/Linux use HOME; Windows typically uses USERPROFILE.
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
 }
 
 pub fn claude_projects_dir() -> PathBuf {

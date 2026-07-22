@@ -89,6 +89,7 @@ fn install_skill_creates_files() {
         .unwrap()
         .arg("install-skill")
         .env("HOME", tmp.path())
+        .env_remove("USERPROFILE")
         .env_remove("CODEX_HOME")
         .assert()
         .success()
@@ -100,12 +101,102 @@ fn install_skill_creates_files() {
     );
     assert!(
         tmp.path()
+            .join(".claude/skills/chat-history/.chat-history-managed")
+            .exists()
+    );
+    assert!(
+        tmp.path()
             .join(".cursor/skills/chat-history/SKILL.md")
             .exists()
     );
     assert!(
         tmp.path()
             .join(".codex/skills/chat-history/SKILL.md")
+            .exists()
+    );
+}
+
+#[test]
+fn ensure_skills_runs_on_normal_invocation() {
+    let tmp = TempDir::new().unwrap();
+    Command::cargo_bin("chat-history")
+        .unwrap()
+        .env("HOME", tmp.path())
+        .env_remove("USERPROFILE")
+        .env_remove("CODEX_HOME")
+        .assert()
+        .success();
+    assert!(
+        tmp.path()
+            .join(".claude/skills/chat-history/SKILL.md")
+            .exists()
+    );
+    assert!(
+        tmp.path()
+            .join(".claude/skills/chat-history/.chat-history-managed")
+            .exists()
+    );
+}
+
+#[test]
+fn ensure_skills_preserves_user_edits() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join(".claude/skills/chat-history");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("SKILL.md"), "user customized skill").unwrap();
+    fs::write(dir.join(".chat-history-managed"), "deadbeefdeadbeef").unwrap();
+
+    Command::cargo_bin("chat-history")
+        .unwrap()
+        .env("HOME", tmp.path())
+        .env_remove("USERPROFILE")
+        .env_remove("CODEX_HOME")
+        .assert()
+        .success();
+
+    assert_eq!(
+        fs::read_to_string(dir.join("SKILL.md")).unwrap(),
+        "user customized skill"
+    );
+}
+
+#[test]
+fn install_skill_force_overwrites_user_edits() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join(".claude/skills/chat-history");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("SKILL.md"), "user customized skill").unwrap();
+
+    Command::cargo_bin("chat-history")
+        .unwrap()
+        .args(["install-skill", "--force"])
+        .env("HOME", tmp.path())
+        .env_remove("USERPROFILE")
+        .env_remove("CODEX_HOME")
+        .assert()
+        .success();
+
+    let content = fs::read_to_string(dir.join("SKILL.md")).unwrap();
+    assert_ne!(content, "user customized skill");
+    assert!(content.contains("chat-history"));
+    assert!(dir.join(".chat-history-managed").exists());
+}
+
+#[test]
+fn skill_targets_honor_userprofile_without_home() {
+    let tmp = TempDir::new().unwrap();
+    Command::cargo_bin("chat-history")
+        .unwrap()
+        .arg("install-skill")
+        .env_remove("HOME")
+        .env("USERPROFILE", tmp.path())
+        .env_remove("CODEX_HOME")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("installed"));
+    assert!(
+        tmp.path()
+            .join(".claude/skills/chat-history/SKILL.md")
             .exists()
     );
 }
