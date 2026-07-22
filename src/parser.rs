@@ -204,18 +204,28 @@ static TITLE_PREAMBLE_RES: LazyLock<Vec<Regex>> = LazyLock::new(|| {
         .map(|tag| Regex::new(&format!(r"(?s)<{tag}>.*?(</{tag}>|\z)")).unwrap())
         .collect()
 });
+// Lowercase snake/kebab tags of ≥3 chars: catches machine preamble markup
+// while leaving code-like tokens (`Vec<String>`, `<T>`) in titles.
 static TITLE_LEFTOVER_TAG_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"</?[a-zA-Z][a-zA-Z0-9_-]{0,60}>").unwrap());
+    LazyLock::new(|| Regex::new(r"</?[a-z][a-z0-9_-]{2,60}>").unwrap());
 static TITLE_WS_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s+").unwrap());
 
-/// One-line title for list/search rows: strips prompt preamble (even when a
-/// closing tag is missing), collapses all whitespace, truncates with an
-/// ellipsis on a char boundary. Returns "" when nothing human-readable is left.
-pub fn display_title(text: &str, max: usize) -> String {
+/// Content-level cleaning for stored first prompts: strips preamble (even
+/// when a closing tag is missing) and collapses whitespace, but keeps
+/// code-like tokens and adds no display artifacts.
+pub fn clean_first_prompt(text: &str) -> String {
     let mut t = clean_prompt(text);
     for re in TITLE_PREAMBLE_RES.iter() {
         t = re.replace_all(&t, " ").to_string();
     }
+    TITLE_WS_RE.replace_all(t.trim(), " ").to_string()
+}
+
+/// One-line title for list/search rows: [`clean_first_prompt`] plus stray-tag
+/// removal and ellipsis truncation on a char boundary. Returns "" when
+/// nothing human-readable is left.
+pub fn display_title(text: &str, max: usize) -> String {
+    let t = clean_first_prompt(text);
     let t = TITLE_LEFTOVER_TAG_RE.replace_all(&t, " ");
     let t = TITLE_WS_RE.replace_all(t.trim(), " ").to_string();
     let mut out: String = t.chars().take(max).collect();
@@ -644,6 +654,26 @@ mod tests {
         let out = display_title(&raw, 10);
         assert_eq!(out.chars().count(), 11);
         assert!(out.ends_with('…'));
+    }
+
+    #[test]
+    fn display_title_keeps_code_like_tokens() {
+        assert_eq!(
+            display_title("implement Vec<String> parsing for <T>", 80),
+            "implement Vec<String> parsing for <T>"
+        );
+    }
+
+    #[test]
+    fn clean_first_prompt_no_ellipsis_and_keeps_code_tokens() {
+        let raw = format!(
+            "<manually_attached_skills>\nstuff\n</manually_attached_skills>\nfix Vec<String> bug {}",
+            "y".repeat(400)
+        );
+        let out = clean_first_prompt(&raw);
+        assert!(out.starts_with("fix Vec<String> bug"));
+        assert!(!out.contains('…'));
+        assert!(!out.contains("manually_attached_skills"));
     }
 
     #[test]

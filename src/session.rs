@@ -1,5 +1,5 @@
 use crate::parser::{
-    clean_prompt, display_title, extract_text, is_clear_metadata, is_warmup_message,
+    clean_first_prompt, clean_prompt, extract_text, is_clear_metadata, is_warmup_message,
 };
 use chrono::{DateTime, FixedOffset, NaiveDate, Utc};
 use serde::Deserialize;
@@ -359,9 +359,9 @@ fn cursor_first_prompt_jsonl(path: &Path) -> String {
         // Clean before truncating: the first user message often opens with
         // kilobytes of preamble tags, and a raw prefix would cut off before
         // the actual query.
-        let cleaned = display_title(&text, 300);
+        let cleaned = clean_first_prompt(&text);
         if !cleaned.is_empty() && !is_warmup_message(&cleaned) && !is_clear_metadata(&cleaned) {
-            return cleaned;
+            return cleaned.chars().take(300).collect();
         }
     }
     String::new()
