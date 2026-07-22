@@ -171,7 +171,16 @@ pub fn inspect_session(session: &Session) -> Option<InspectInfo> {
     let effective_summary = meta
         .custom_title
         .or(meta.summary)
-        .unwrap_or_else(|| session.summary.clone());
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| {
+            if !session.summary.is_empty() {
+                session.summary.clone()
+            } else {
+                // Same fallback the list rows use, so a session titled by its
+                // first prompt doesn't inspect as "(no summary)".
+                crate::parser::display_title(&session.first_prompt, 120)
+            }
+        });
 
     accomplishments.truncate(10);
     decisions.truncate(5);

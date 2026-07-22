@@ -1332,16 +1332,38 @@ pub fn recency_key(s: &Session) -> (Option<DateTime<FixedOffset>>, String) {
     (parse_any_timestamp(ts), ts.clone())
 }
 
-pub fn find_session<'a>(sessions: &'a [Session], sid: &str) -> Option<&'a Session> {
-    sessions
+pub enum SessionLookup<'a> {
+    Found(&'a Session),
+    /// Multiple sessions share the prefix — never silently pick one.
+    Ambiguous(Vec<&'a Session>),
+    NotFound,
+}
+
+pub fn lookup_session<'a>(sessions: &'a [Session], sid: &str) -> SessionLookup<'a> {
+    if let Some(s) = sessions.iter().find(|s| s.id.eq_ignore_ascii_case(sid)) {
+        return SessionLookup::Found(s);
+    }
+    let matches: Vec<&Session> = sessions
         .iter()
-        .find(|s| s.id.eq_ignore_ascii_case(sid))
-        .or_else(|| {
-            sessions.iter().find(|s| {
-                s.id.get(..sid.len())
-                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case(sid))
-            })
+        .filter(|s| {
+            s.id.get(..sid.len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(sid))
         })
+        .collect();
+    match matches.len() {
+        0 => SessionLookup::NotFound,
+        1 => SessionLookup::Found(matches[0]),
+        _ => SessionLookup::Ambiguous(matches),
+    }
+}
+
+/// Exact id or *unique* prefix. Ambiguous prefixes resolve to None; callers
+/// that can report candidates should use [`lookup_session`] instead.
+pub fn find_session<'a>(sessions: &'a [Session], sid: &str) -> Option<&'a Session> {
+    match lookup_session(sessions, sid) {
+        SessionLookup::Found(s) => Some(s),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -1403,6 +1425,25 @@ mod tests {
         assert_eq!(encode_path_for_claude(path), "-Users-x-caf-");
         let cjk = std::path::Path::new("/Users/x/研究");
         assert_eq!(encode_path_for_claude(cjk), "-Users-x---");
+    }
+
+    #[test]
+    fn lookup_session_reports_ambiguous_prefix() {
+        let sessions = vec![
+            make_session("abc-123", "2025-01-01", "claude", "/proj", "main", "one"),
+            make_session("abc-456", "2025-01-02", "cursor", "/proj", "main", "two"),
+        ];
+        match lookup_session(&sessions, "abc") {
+            SessionLookup::Ambiguous(candidates) => assert_eq!(candidates.len(), 2),
+            _ => panic!("expected ambiguous lookup"),
+        }
+        // find_session must not silently pick one of them.
+        assert!(find_session(&sessions, "abc").is_none());
+        // A unique longer prefix still resolves.
+        assert!(matches!(
+            lookup_session(&sessions, "abc-1"),
+            SessionLookup::Found(s) if s.id == "abc-123"
+        ));
     }
 
     #[test]

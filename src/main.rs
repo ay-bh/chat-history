@@ -1,6 +1,6 @@
 use chat_history::dates::parse_human_date;
 use chat_history::session::{
-    self, filter_sessions, find_session, load_all_sessions, parse_session,
+    self, SessionLookup, filter_sessions, load_all_sessions, lookup_session, parse_session,
 };
 use chat_history::skill_install::{ensure_skills, install_skill};
 use chat_history::{display, inspect, scoring, search};
@@ -106,6 +106,29 @@ enum Commands {
         #[arg(long)]
         force: bool,
     },
+}
+
+/// Resolve a session id or prefix, or exit: candidates are listed on an
+/// ambiguous prefix so a short id never silently picks the wrong session.
+fn resolve_session_or_exit<'a>(
+    sessions: &'a [session::Session],
+    sid: &str,
+) -> &'a session::Session {
+    match lookup_session(sessions, sid) {
+        SessionLookup::Found(s) => s,
+        SessionLookup::Ambiguous(candidates) => {
+            eprintln!("Session ID \"{sid}\" is ambiguous — it matches:");
+            for s in &candidates {
+                eprintln!("  {}  {}  {}", s.id, s.date, s.source);
+            }
+            eprintln!("Use a longer prefix.");
+            std::process::exit(2);
+        }
+        SessionLookup::NotFound => {
+            eprintln!("Session not found: {sid}");
+            std::process::exit(1);
+        }
+    }
 }
 
 fn parse_date_arg(val: &Option<String>) -> Option<chrono::NaiveDate> {
@@ -215,15 +238,15 @@ fn main() {
         }
         Some(Commands::Inspect { session_id, last }) => {
             let session = if last {
-                filtered.iter().max_by_key(|s| session::recency_key(s))
+                let Some(s) = filtered.iter().max_by_key(|s| session::recency_key(s)) else {
+                    eprintln!("Session not found");
+                    std::process::exit(1);
+                };
+                s
             } else if let Some(sid) = &session_id {
-                find_session(&sessions, sid)
+                resolve_session_or_exit(&sessions, sid)
             } else {
                 eprintln!("Provide a session ID or use --last");
-                std::process::exit(1);
-            };
-            let Some(session) = session else {
-                eprintln!("Session not found");
                 std::process::exit(1);
             };
             match inspect::inspect_session(session) {
@@ -238,15 +261,15 @@ fn main() {
             plain,
         }) => {
             let session = if last {
-                filtered.iter().max_by_key(|s| session::recency_key(s))
+                let Some(s) = filtered.iter().max_by_key(|s| session::recency_key(s)) else {
+                    eprintln!("Session not found");
+                    std::process::exit(1);
+                };
+                s
             } else if let Some(sid) = &session_id {
-                find_session(&sessions, sid)
+                resolve_session_or_exit(&sessions, sid)
             } else {
                 eprintln!("Provide a session ID or use --last");
-                std::process::exit(1);
-            };
-            let Some(session) = session else {
-                eprintln!("Session not found");
                 std::process::exit(1);
             };
             let (messages, _) = parse_session(session, false);
@@ -257,20 +280,14 @@ fn main() {
             }
         }
         Some(Commands::Export { session_id, output }) => {
-            let Some(session) = find_session(&sessions, &session_id) else {
-                eprintln!("Session not found: {session_id}");
-                std::process::exit(1);
-            };
+            let session = resolve_session_or_exit(&sessions, &session_id);
             let (messages, _) = parse_session(session, false);
             if !display::export_transcript(&messages, session, output.as_deref()) {
                 std::process::exit(1);
             }
         }
         Some(Commands::Resume { session_id }) => {
-            let Some(session) = find_session(&sessions, &session_id) else {
-                eprintln!("Session not found: {session_id}");
-                std::process::exit(1);
-            };
+            let session = resolve_session_or_exit(&sessions, &session_id);
             if session.source != "claude" && session.source != "codex" {
                 eprintln!("Resume is only supported for Claude Code and Codex sessions.");
                 std::process::exit(1);
@@ -321,10 +338,7 @@ fn main() {
             std::process::exit(1);
         }
         Some(Commands::Find { session_id }) => {
-            let Some(session) = find_session(&sessions, &session_id) else {
-                eprintln!("Session not found: {session_id}");
-                std::process::exit(1);
-            };
+            let session = resolve_session_or_exit(&sessions, &session_id);
             println!("{}", session.file);
         }
         Some(Commands::InstallSkill { .. }) => unreachable!(),

@@ -314,6 +314,67 @@ fn list_title_is_single_line_without_preamble() {
         .stdout(predicate::str::contains("manually_attached_skills").not());
 }
 
+#[test]
+fn ambiguous_short_id_lists_candidates_and_fails() {
+    let tmp = TempDir::new().unwrap();
+    let project_dir = tmp.path().join("projects").join("-Users-test-ambig");
+    fs::create_dir_all(&project_dir).unwrap();
+    let index = serde_json::json!({
+        "entries": [{
+            "sessionId": "abcd1234-0000-0000-0000-000000000001",
+            "summary": "first candidate",
+            "firstPrompt": "one",
+            "created": "2025-05-01T10:00:00Z",
+            "modified": "2025-05-01T11:00:00Z",
+            "messageCount": 2,
+            "gitBranch": "",
+            "projectPath": "/Users/test/ambig",
+            "fullPath": "",
+            "isSidechain": false
+        }, {
+            "sessionId": "abcd1234-0000-0000-0000-000000000002",
+            "summary": "second candidate",
+            "firstPrompt": "two",
+            "created": "2025-05-02T10:00:00Z",
+            "modified": "2025-05-02T11:00:00Z",
+            "messageCount": 2,
+            "gitBranch": "",
+            "projectPath": "/Users/test/ambig",
+            "fullPath": "",
+            "isSidechain": false
+        }]
+    });
+    fs::write(
+        project_dir.join("sessions-index.json"),
+        serde_json::to_string(&index).unwrap(),
+    )
+    .unwrap();
+
+    Command::cargo_bin("chat-history")
+        .unwrap()
+        .args(["find", "abcd1234"])
+        .env("CLAUDE_CONFIG_DIR", tmp.path())
+        .env("HOME", tmp.path())
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("ambiguous"))
+        .stderr(predicate::str::contains(
+            "abcd1234-0000-0000-0000-000000000001",
+        ))
+        .stderr(predicate::str::contains(
+            "abcd1234-0000-0000-0000-000000000002",
+        ));
+
+    // A longer, unique prefix still resolves.
+    Command::cargo_bin("chat-history")
+        .unwrap()
+        .args(["find", "abcd1234-0000-0000-0000-000000000001"])
+        .env("CLAUDE_CONFIG_DIR", tmp.path())
+        .env("HOME", tmp.path())
+        .assert()
+        .success();
+}
+
 fn setup_fixture(tmp: &TempDir) {
     let project_dir = tmp.path().join("projects").join("-Users-test-project");
     fs::create_dir_all(&project_dir).unwrap();
