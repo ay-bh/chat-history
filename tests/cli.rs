@@ -355,6 +355,33 @@ fn completions_generate_for_bash() {
 }
 
 #[test]
+fn completions_use_invoked_binary_name() {
+    let tmp = TempDir::new().unwrap();
+    Command::cargo_bin("ch")
+        .unwrap()
+        .env("CLAUDE_CONFIG_DIR", tmp.path())
+        .env("HOME", tmp.path())
+        .env_remove("CODEX_HOME")
+        .args(["completions", "bash"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("complete -F _ch "))
+        .stdout(predicate::str::contains("chat-history").not());
+}
+
+#[test]
+fn missing_session_id_is_usage_error() {
+    for subcmd in ["inspect", "view"] {
+        let (mut cmd, _tmp) = isolated_cmd();
+        cmd.arg(subcmd)
+            .assert()
+            .failure()
+            .code(2)
+            .stderr(predicate::str::contains("--last"));
+    }
+}
+
+#[test]
 fn help_shows_examples_and_subcommand_about() {
     Command::cargo_bin("chat-history")
         .unwrap()
@@ -450,6 +477,7 @@ fn ambiguous_short_id_lists_candidates_and_fails() {
         .env("HOME", tmp.path())
         .assert()
         .failure()
+        .code(2)
         .stderr(predicate::str::contains("ambiguous"))
         .stderr(predicate::str::contains(
             "abcd1234-0000-0000-0000-000000000001",

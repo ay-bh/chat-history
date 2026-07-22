@@ -71,6 +71,9 @@ chat-history view <id> --tools
 chat-history export <id> -o session.md
 chat-history resume <id>                  # Claude Code or Codex only
 chat-history find <id>                    # absolute path for further tooling
+
+# Shell completions (bash, zsh, fish, elvish, powershell)
+chat-history completions zsh
 ```
 
 `ch` is a drop-in alias: `ch search "auth" --deep --json`.
@@ -87,8 +90,8 @@ chat-history --branch feature-xyz
 chat-history --from "3 days ago" --to today
 chat-history --sidechains                 # include hidden subagent/sidechain sessions
 
-# Apply workspace scope to a search (-L must precede the subcommand)
-chat-history -L search "auth" --deep --json
+# Apply workspace scope to a search (-L works before or after the subcommand)
+chat-history search "auth" --deep --json -L
 
 # Listing-only presentation flags
 chat-history --from yesterday -s          # group by day

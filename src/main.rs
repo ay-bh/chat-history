@@ -200,12 +200,16 @@ fn main() {
 
     if let Some(Commands::Completions { shell }) = &cli.command {
         use clap::CommandFactory;
-        clap_complete::generate(
-            *shell,
-            &mut Cli::command(),
-            "chat-history",
-            &mut std::io::stdout(),
-        );
+        // Use the invoked binary name so the `ch` alias gets working
+        // completions too, not a `_chat-history` function it never triggers.
+        let bin = std::env::args()
+            .next()
+            .as_deref()
+            .map(std::path::Path::new)
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "chat-history".to_string());
+        clap_complete::generate(*shell, &mut Cli::command(), bin, &mut std::io::stdout());
         return;
     }
 
@@ -302,7 +306,7 @@ fn main() {
                 resolve_session_or_exit(&sessions, sid)
             } else {
                 eprintln!("Provide a session ID or use --last");
-                std::process::exit(1);
+                std::process::exit(2);
             };
             match inspect::inspect_session(session) {
                 Some(info) => display::print_inspect(&info),
@@ -325,7 +329,7 @@ fn main() {
                 resolve_session_or_exit(&sessions, sid)
             } else {
                 eprintln!("Provide a session ID or use --last");
-                std::process::exit(1);
+                std::process::exit(2);
             };
             let (messages, _) = parse_session(session, false);
             if plain {
