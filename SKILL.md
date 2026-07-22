@@ -39,7 +39,7 @@ Search, inspect, and export Claude Code, Cursor, and Codex conversation history.
 ## Common mistakes
 
 - Only `search` accepts `--json`; the session list and `inspect` reject it.
-- The only subcommands are `search`, `inspect`, `view`, `export`, `resume`, `find`, `install-skill`. Do not guess others; run `chat-history --help` when unsure.
+- The only subcommands are `search`, `inspect`, `view`, `export`, `resume`, `find`, `install-skill`, `completions`. Do not guess others; run `chat-history --help` when unsure.
 - Don't dump raw JSON or full transcripts at the user — summarize, cite the session ID and date.
 - Some Cursor sessions have thin metadata (`(no summary)`, `duration: 0min`, raw first-message titles). If `inspect` is thin, fall back to `chat-history view <id> --plain`.
 
@@ -67,6 +67,7 @@ chat-history view <id> --plain             # transcript, pipe-friendly (--tools 
 chat-history export <id> -o session.md
 chat-history resume <id>                   # resume a Claude Code or Codex session
 chat-history find <id>                     # print transcript file path for scripting
+chat-history completions zsh               # shell completions (bash/zsh/fish/elvish/powershell)
 ```
 
 - `--scope` values: `all` (default), `errors` (messages with error patterns or the word "error"), `similar` (user messages only — similar past queries), `tools` (messages with tool calls), `files` (messages referencing files). Any scope other than `all` always searches full transcripts.
