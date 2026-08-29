@@ -1,6 +1,7 @@
 use chat_history::dates::parse_human_date;
 use chat_history::session::{
-    self, SessionLookup, filter_sessions, load_all_sessions, lookup_session, parse_session,
+    self, ResumeAction, SessionLookup, filter_sessions, load_sessions, lookup_session,
+    parse_session, session_copies,
 };
 use chat_history::skill_install::{ensure_skills, install_skill};
 use chat_history::{display, inspect, scoring, search};
@@ -12,12 +13,16 @@ use clap::{Parser, Subcommand};
     about = "Search Claude Code + Cursor + Codex conversation history",
     long_about = "Search Claude Code + Cursor + Codex conversation history.\n\n\
         With no command, lists sessions newest first; every row shows a short\n\
-        session ID usable with inspect/view/export/resume/find.",
+        session ID usable with inspect/view/export/find. resume works for\n\
+        claude, codex and Cursor Agent CLI chats (ids with a store under\n\
+        ~/.cursor/chats); other Cursor rows print how to open the chat in\n\
+        the Cursor sidebar instead.",
     version,
     after_help = "EXAMPLES:\n  \
         chat-history                                  list sessions, newest first\n  \
         chat-history --from yesterday --to yesterday  sessions from a specific day\n  \
         chat-history search \"auth error\" --deep --json\n  \
+        chat-history --source cursor-ide              IDE sidebar chats only\n  \
         chat-history inspect 6b1094cd                 summarize by short ID\n  \
         chat-history view 6b1094cd --plain | less\n\n\
         EXIT CODES:\n  \
@@ -40,7 +45,7 @@ struct Cli {
     #[arg(
         long,
         global = true,
-        value_parser = ["claude", "cursor", "codex"],
+        value_parser = ["claude", "cursor", "cursor-agent", "cursor-ide", "codex"],
         help = "Filter by source"
     )]
     source: Option<String>,
@@ -128,7 +133,7 @@ enum Commands {
         #[arg(short = 'o', long)]
         output: Option<String>,
     },
-    /// Resume a Claude Code or Codex session in its original tool
+    /// Resume Claude Code, Codex, or a Cursor Agent CLI chat (IDE chats print how to open them)
     Resume {
         /// Session ID or unique prefix
         session_id: String,
@@ -159,11 +164,38 @@ fn resolve_session_or_exit<'a>(
     sid: &str,
 ) -> &'a session::Session {
     match lookup_session(sessions, sid) {
-        SessionLookup::Found(s) => s,
+        SessionLookup::Found(s) => {
+            let copies = session_copies(sessions, s);
+            if copies.len() > 1 {
+                eprintln!(
+                    "Note: session {} is stored in {} project folders; using DIR: {}",
+                    s.id,
+                    copies.len(),
+                    display::abbreviate_home(&s.project)
+                );
+                for c in copies {
+                    if c.file == s.file {
+                        continue;
+                    }
+                    eprintln!(
+                        "  also: {}  {}",
+                        display::abbreviate_home(&c.project),
+                        display::abbreviate_home(&c.file)
+                    );
+                }
+            }
+            s
+        }
         SessionLookup::Ambiguous(candidates) => {
             eprintln!("Session ID \"{sid}\" is ambiguous — it matches:");
             for s in &candidates {
-                eprintln!("  {}  {}  {}", s.id, s.date, s.source);
+                eprintln!(
+                    "  {}  {}  {}  DIR: {}",
+                    s.id,
+                    s.date,
+                    s.source,
+                    display::abbreviate_home(&s.project)
+                );
             }
             eprintln!("Use a longer prefix.");
             std::process::exit(2);
@@ -222,7 +254,24 @@ fn main() {
     // upgrades). Never overwrites user-edited skills.
     ensure_skills();
 
-    let mut sessions = load_all_sessions();
+    let id_lookup = matches!(
+        &cli.command,
+        Some(Commands::Inspect {
+            session_id: Some(_),
+            last: false
+        }) | Some(Commands::View {
+            session_id: Some(_),
+            last: false,
+            ..
+        }) | Some(Commands::Export { .. })
+            | Some(Commands::Resume { .. })
+            | Some(Commands::Find { .. })
+    );
+    let mut sessions = if id_lookup {
+        load_sessions(None)
+    } else {
+        load_sessions(cli.source.as_deref())
+    };
     if !cli.sidechains {
         sessions.retain(|s| !s.is_sidechain);
     }
@@ -347,10 +396,34 @@ fn main() {
         }
         Some(Commands::Resume { session_id }) => {
             let session = resolve_session_or_exit(&sessions, &session_id);
-            if session.source != "claude" && session.source != "codex" {
-                eprintln!("Resume is only supported for Claude Code and Codex sessions.");
+            if session.is_ide_ui() {
+                print!("{}", display::cursor_ide_resume_hint(session));
                 std::process::exit(1);
             }
+            let action = match session::resume_command(session) {
+                Some(a) => a,
+                None if session.source == "cursor" => {
+                    eprintln!(
+                        "No Agent CLI chat store for this id under ~/.cursor/chats, so \
+                         `agent --resume` cannot load it (it would start a blank chat)."
+                    );
+                    print!("{}", display::cursor_ide_resume_hint(session));
+                    std::process::exit(1);
+                }
+                None => {
+                    eprintln!("Resume is not supported for {} sessions.", session.source);
+                    std::process::exit(1);
+                }
+            };
+            if let ResumeAction::Print { cmdline } = action {
+                eprintln!(
+                    "Not running `cursor agent` (it can install the Agent CLI). Run:\n  {cmdline}"
+                );
+                std::process::exit(1);
+            }
+            let ResumeAction::Exec { bin, args } = action else {
+                unreachable!();
+            };
             println!(
                 "Resuming: {}",
                 if session.summary.is_empty() {
@@ -359,13 +432,9 @@ fn main() {
                     &session.summary
                 }
             );
-            if !session.project.is_empty() {
-                let project = std::path::Path::new(&session.project);
-                if project.is_dir() {
-                    if let Err(e) = std::env::set_current_dir(project) {
-                        eprintln!("Warning: could not cd to {}: {e}", session.project);
-                    }
-                } else if session.source == "claude" {
+            let workdir = session::resume_working_dir(session);
+            if workdir.is_none() && !session.project.is_empty() {
+                if session.source == "claude" {
                     eprintln!(
                         "Project dir {} no longer exists, copying session to current directory...",
                         session.project
@@ -384,15 +453,21 @@ fn main() {
                             );
                         }
                     }
+                } else {
+                    eprintln!(
+                        "Warning: session directory {} no longer exists; resuming from the current directory",
+                        display::abbreviate_home(&session.project)
+                    );
                 }
             }
             use std::os::unix::process::CommandExt;
-            let (bin, args) = if session.source == "codex" {
-                ("codex", ["resume", session.id.as_str()])
-            } else {
-                ("claude", ["--resume", session.id.as_str()])
-            };
-            let err = std::process::Command::new(bin).args(args).exec();
+            let mut cmd = std::process::Command::new(&bin);
+            cmd.args(&args);
+            if let Some(dir) = &workdir {
+                println!("cd {}", display::abbreviate_home(&dir.to_string_lossy()));
+                cmd.current_dir(dir);
+            }
+            let err = cmd.exec();
             eprintln!("Failed to exec {bin}: {err}");
             std::process::exit(1);
         }

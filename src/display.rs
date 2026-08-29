@@ -1,7 +1,7 @@
 use crate::inspect::InspectInfo;
 use crate::parser::{clean_prompt, display_title, snippet_around_match};
 use crate::search::{IndexResult, SearchResult};
-use crate::session::{Message, Session};
+use crate::session::{self, Message, Session};
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
 
@@ -27,6 +27,7 @@ macro_rules! c {
                 "bg_blue" => "\x1b[44m",
                 "bg_magenta" => "\x1b[45m",
                 "bg_cyan" => "\x1b[46m",
+                "bg_yellow" => "\x1b[43m",
                 _ => "",
             }
         } else {
@@ -35,18 +36,98 @@ macro_rules! c {
     };
 }
 
-fn src_tag(source: &str) -> String {
-    match source {
-        "claude" => format!("{}{} CC {}", c!("bg_cyan"), c!("bold"), c!("reset")),
-        "codex" => format!("{}{} CX {}", c!("bg_magenta"), c!("bold"), c!("reset")),
-        _ => format!("{}{} CR {}", c!("bg_blue"), c!("bold"), c!("reset")),
+fn src_tag(source: &str, also_ide: bool) -> String {
+    // IDE Agent chats write SQLite *and* an agent-transcripts jsonl with the
+    // same composer id. Prefer the IDE label — that's the UI the user used.
+    let label = match source {
+        "claude" => "claude",
+        "codex" => "codex",
+        "cursor-ide" => "cursor-ide",
+        "cursor" if also_ide => "cursor-ide",
+        _ => "cursor-agent",
+    };
+    let color = match source {
+        "claude" => "bg_cyan",
+        "codex" => "bg_magenta",
+        "cursor-ide" => "bg_yellow",
+        "cursor" if also_ide => "bg_yellow",
+        _ => "bg_blue",
+    };
+    format!("{}{} {:<12} {}", c!(color), c!("bold"), label, c!("reset"))
+}
+
+fn labeled(label: &str, value: &str) -> String {
+    if value.is_empty() {
+        String::new()
+    } else {
+        format!(" {}{}:{} {}", c!("dim"), label, c!("reset"), value)
     }
 }
 
-/// Dim 8-char session-id chip. Every prefix resolves via `inspect`/`view`/
-/// `resume`/`find`, so each row carries its own address.
-fn id_chip(id: &str) -> String {
-    let short: String = id.chars().take(8).collect();
+/// Replace the user home directory with `~` for display (`/home/you/x` or
+/// `/Users/you/x` → `~/x`). Uses `$HOME` (Linux/macOS) or `%USERPROFILE%`.
+pub fn abbreviate_home(path: &str) -> String {
+    let home = session::user_home();
+    abbreviate_home_with(path, home.as_deref().and_then(|p| p.to_str()))
+}
+
+fn abbreviate_home_with(path: &str, home: Option<&str>) -> String {
+    let Some(home) = home.filter(|h| !h.is_empty()) else {
+        return path.to_string();
+    };
+    let home = home.trim_end_matches(['/', '\\']);
+    if path == home || path.trim_end_matches(['/', '\\']) == home {
+        return "~".into();
+    }
+    for sep in ['/', '\\'] {
+        let prefix = format!("{home}{sep}");
+        if let Some(rest) = path.strip_prefix(&prefix) {
+            return format!("~/{}", rest.replace('\\', "/"));
+        }
+    }
+    path.to_string()
+}
+
+fn dir_label(project: &str) -> String {
+    labeled("DIR", &abbreviate_home(project))
+}
+
+fn copies_label(
+    counts: &std::collections::HashMap<(String, String), usize>,
+    s: &Session,
+) -> String {
+    let n = counts
+        .get(&(s.source.clone(), s.id.to_ascii_lowercase()))
+        .copied()
+        .unwrap_or(0);
+    if n > 1 {
+        labeled("COPIES", &n.to_string())
+    } else {
+        String::new()
+    }
+}
+
+fn copy_counts(sessions: &[Session]) -> std::collections::HashMap<(String, String), usize> {
+    let mut m = std::collections::HashMap::new();
+    for s in sessions {
+        if s.source != "cursor" {
+            continue;
+        }
+        *m.entry((s.source.clone(), s.id.to_ascii_lowercase()))
+            .or_insert(0) += 1;
+    }
+    m
+}
+
+fn print_title_line(title: &str) {
+    println!("        {}{}{}", c!("bold"), title, c!("reset"));
+}
+
+/// Dim 8-char session-id chip. Every row shows it: the prefix resolves via
+/// inspect/view/export/find for all sources, and via resume for everything
+/// except `cursor-ide` rows (those print a sidebar hint instead).
+fn id_chip(session: &Session) -> String {
+    let short: String = session.id.chars().take(8).collect();
     format!("{}{:8}{}", c!("dim"), short, c!("reset"))
 }
 
@@ -74,14 +155,11 @@ pub fn print_list(sessions: &[Session], verbose: bool) {
         sessions.len(),
         c!("reset")
     );
+    let counts = copy_counts(sessions);
     for (i, s) in sessions.iter().enumerate() {
-        let tag = src_tag(&s.source);
-        let title = title_of(&s.summary, &s.first_prompt, 72);
-        let branch = if s.branch.is_empty() {
-            String::new()
-        } else {
-            format!(" {}({}){}", c!("magenta"), s.branch, c!("reset"))
-        };
+        let tag = src_tag(&s.source, s.also_ide);
+        let title = title_of(&s.summary, &s.first_prompt, 100);
+        let branch = labeled("BRANCH", &s.branch);
         let sidechain = if s.is_sidechain {
             format!(" {}[subagent]{}", c!("dim"), c!("reset"))
         } else {
@@ -93,7 +171,7 @@ pub fn print_list(sessions: &[Session], verbose: bool) {
             String::new()
         };
         println!(
-            "  {}{:3}.{} {} {}{}{}  {}  {}{}{}{}{}{}",
+            "  {}{:3}.{} {} {}{}{}  {}{}{}{}{}{}",
             c!("dim"),
             i + 1,
             c!("reset"),
@@ -101,17 +179,22 @@ pub fn print_list(sessions: &[Session], verbose: bool) {
             c!("cyan"),
             s.date,
             c!("reset"),
-            id_chip(&s.id),
-            c!("bold"),
-            title,
-            c!("reset"),
+            id_chip(s),
+            dir_label(&s.project),
+            copies_label(&counts, s),
             sidechain,
             branch,
             msgs
         );
+        print_title_line(&title);
         if verbose {
             println!("       {}id: {}{}", c!("dim"), s.id, c!("reset"));
-            println!("       {}file: {}{}", c!("dim"), s.file, c!("reset"));
+            println!(
+                "       {}file: {}{}",
+                c!("dim"),
+                abbreviate_home(&s.file),
+                c!("reset")
+            );
         }
     }
     println!();
@@ -122,6 +205,7 @@ pub fn print_summarized(sessions: &[Session]) {
         println!("{}No sessions found.{}", c!("dim"), c!("reset"));
         return;
     }
+    let counts = copy_counts(sessions);
     let mut by_day: BTreeMap<&str, Vec<&Session>> = BTreeMap::new();
     for s in sessions {
         by_day.entry(&s.date).or_default().push(s);
@@ -145,19 +229,16 @@ pub fn print_summarized(sessions: &[Session]) {
             c!("reset")
         );
         for s in ds {
-            let title = title_of(&s.summary, &s.first_prompt, 72);
-            let branch = if s.branch.is_empty() {
-                String::new()
-            } else {
-                format!(" {}({}){}", c!("magenta"), s.branch, c!("reset"))
-            };
+            let title = title_of(&s.summary, &s.first_prompt, 100);
             println!(
-                "    {} {}  {}{}",
-                src_tag(&s.source),
-                id_chip(&s.id),
-                title,
-                branch
+                "    {} {}{}{}{}",
+                src_tag(&s.source, s.also_ide),
+                id_chip(s),
+                dir_label(&s.project),
+                copies_label(&counts, s),
+                labeled("BRANCH", &s.branch)
             );
+            print_title_line(&title);
         }
         println!();
     }
@@ -178,17 +259,11 @@ pub fn print_index_results(results: &[IndexResult], query: &str) {
         c!("reset")
     );
     for (i, r) in results.iter().enumerate() {
-        let tag = src_tag(&r.session.source);
+        let tag = src_tag(&r.session.source, r.session.also_ide);
         let score = format!("{}★ {:.1}{}", c!("yellow"), r.score, c!("reset"));
-        let field = format!("{} [{}]{}", c!("dim"), r.matched_field, c!("reset"));
-        let title = title_of(&r.session.summary, &r.display, 72);
-        let branch = if r.session.branch.is_empty() {
-            String::new()
-        } else {
-            format!(" {}({}){}", c!("magenta"), r.session.branch, c!("reset"))
-        };
+        let title = title_of(&r.session.summary, &r.display, 100);
         println!(
-            "  {}{:3}.{} {} {}{}{} {} {}{} {}{}{}{}",
+            "  {}{:3}.{} {} {}{}{} {} {}{}{}",
             c!("dim"),
             i + 1,
             c!("reset"),
@@ -196,14 +271,12 @@ pub fn print_index_results(results: &[IndexResult], query: &str) {
             c!("cyan"),
             r.session.date,
             c!("reset"),
-            id_chip(&r.session.id),
+            id_chip(&r.session),
             score,
-            field,
-            c!("bold"),
-            title,
-            c!("reset"),
-            branch
+            dir_label(&r.session.project),
+            labeled("INDEX_FIELD", &r.matched_field)
         );
+        print_title_line(&title);
     }
     println!();
 }
@@ -221,7 +294,7 @@ pub fn print_search_results(results: &[SearchResult], query: &str) {
         c!("reset")
     );
     for (i, r) in results.iter().enumerate() {
-        let tag = src_tag(&r.session.source);
+        let tag = src_tag(&r.session.source, r.session.also_ide);
         let score = format!(
             "{}★ {:.1}{}",
             c!("yellow"),
@@ -233,9 +306,9 @@ pub fn print_search_results(results: &[SearchResult], query: &str) {
         } else {
             format!("{}Assistant{}", c!("blue"), c!("reset"))
         };
-        let title = title_of(&r.session.summary, &r.session.first_prompt, 72);
+        let title = title_of(&r.session.summary, &r.session.first_prompt, 100);
         println!(
-            "  {}{:3}.{} {} {}{}{} {} {}  {}{}{}",
+            "  {}{:3}.{} {} {}{}{} {} {}{}",
             c!("dim"),
             i + 1,
             c!("reset"),
@@ -243,14 +316,13 @@ pub fn print_search_results(results: &[SearchResult], query: &str) {
             c!("cyan"),
             r.session.date,
             c!("reset"),
-            id_chip(&r.session.id),
+            id_chip(&r.session),
             score,
-            c!("bold"),
-            title,
-            c!("reset")
+            dir_label(&r.session.project)
         );
+        print_title_line(&title);
         let snippet = snippet_around_match(&r.message.content, query, 200);
-        println!("       {}: {}", role_str, snippet);
+        println!("        {}: {}", role_str, snippet);
         if !r.message.tool_uses.is_empty() {
             let tools: String = r
                 .message
@@ -268,7 +340,7 @@ pub fn print_search_results(results: &[SearchResult], query: &str) {
                 .files_referenced
                 .iter()
                 .take(3)
-                .cloned()
+                .map(|f| abbreviate_home(f))
                 .collect::<Vec<_>>()
                 .join(", ");
             println!("       {}files: {}{}", c!("dim"), files, c!("reset"));
@@ -284,6 +356,7 @@ pub fn print_search_results_json(results: &[SearchResult], query: &str) {
             serde_json::json!({
                 "session_id": r.session.id,
                 "source": r.session.source,
+                "also_ide": r.session.also_ide,
                 "date": r.session.date,
                 "summary": r.session.summary,
                 "project": r.session.project,
@@ -306,6 +379,7 @@ pub fn print_index_results_json(results: &[IndexResult], query: &str) {
             serde_json::json!({
                 "session_id": r.session.id,
                 "source": r.session.source,
+                "also_ide": r.session.also_ide,
                 "date": r.session.date,
                 "summary": r.session.summary,
                 "project": r.session.project,
@@ -320,7 +394,7 @@ pub fn print_index_results_json(results: &[IndexResult], query: &str) {
 }
 
 pub fn print_inspect(info: &InspectInfo) {
-    let tag = src_tag(&info.source);
+    let tag = src_tag(&info.source, info.also_ide);
     let cleaned = display_title(&info.summary, 120);
     let summary = if cleaned.is_empty() {
         "(no summary)"
@@ -329,12 +403,17 @@ pub fn print_inspect(info: &InspectInfo) {
     };
     println!("\n{}", "─".repeat(80));
     println!("  {}  {}{}{}", tag, c!("bold"), summary, c!("reset"));
+    let cwd = if info.project.is_empty() {
+        "-".to_string()
+    } else {
+        abbreviate_home(&info.project)
+    };
     println!("  {}id: {}{}", c!("dim"), info.session_id, c!("reset"));
     println!(
-        "  {}date: {}  project: {}  branch: {}{}",
+        "  {}date: {}  cwd: {}  branch: {}{}",
         c!("dim"),
         info.date,
-        info.project,
+        cwd,
         if info.branch.is_empty() {
             "-"
         } else {
@@ -380,7 +459,7 @@ pub fn print_inspect(info: &InspectInfo) {
             c!("reset")
         );
         for f in &info.files_modified {
-            println!("    • {f}");
+            println!("    • {}", abbreviate_home(f));
         }
         println!();
     }
@@ -424,7 +503,7 @@ pub fn print_inspect(info: &InspectInfo) {
 }
 
 pub fn print_transcript(messages: &[Message], session: &Session, show_tools: bool) {
-    let tag = src_tag(&session.source);
+    let tag = src_tag(&session.source, session.also_ide);
     let cleaned = title_of(&session.summary, &session.first_prompt, 120);
     let summary = if cleaned == "(untitled)" {
         "(no summary)"
@@ -433,8 +512,13 @@ pub fn print_transcript(messages: &[Message], session: &Session, show_tools: boo
     };
     println!("\n{}", "─".repeat(80));
     println!("  {}  {}{}{}", tag, c!("bold"), summary, c!("reset"));
+    let cwd = if session.project.is_empty() {
+        "-".to_string()
+    } else {
+        abbreviate_home(&session.project)
+    };
     println!(
-        "  {}id: {}  date: {}  branch: {}  project: {}{}",
+        "  {}id: {}  date: {}  branch: {}  cwd: {}{}",
         c!("dim"),
         session.id,
         session.date,
@@ -443,11 +527,7 @@ pub fn print_transcript(messages: &[Message], session: &Session, show_tools: boo
         } else {
             &session.branch
         },
-        if session.project.is_empty() {
-            "-"
-        } else {
-            &session.project
-        },
+        cwd,
         c!("reset")
     );
     println!("{}\n", "─".repeat(80));
@@ -499,6 +579,31 @@ pub fn print_plain(messages: &[Message]) {
     }
 }
 
+/// IDE Composer chats have no CLI resume. Tell the user how to open it.
+pub fn cursor_ide_resume_hint(session: &Session) -> String {
+    let title = title_of(&session.summary, &session.first_prompt, 100);
+    if session.project.is_empty() {
+        return format!(
+            "You need to use the Cursor IDE UI to find this session.\n\
+             This chat has no recorded workspace directory.\n\
+             IDE chats cannot be resumed from the CLI.\n\
+             \n\
+             Title: {title}\n\
+             Look for it in the Cursor sidebar after opening a related project.\n"
+        );
+    }
+    let dir = abbreviate_home(&session.project);
+    format!(
+        "You need to use the Cursor IDE UI in the directory {dir} to find this session.\n\
+         IDE chats cannot be resumed from the CLI.\n\
+         \n\
+         Title: {title}\n\
+         Session ID: {}\n\
+         Open that folder in Cursor and look for the chat in the sidebar.\n",
+        session.id
+    )
+}
+
 pub fn export_transcript(messages: &[Message], session: &Session, out_path: Option<&str>) -> bool {
     let summary = if session.summary.is_empty() {
         "(no summary)"
@@ -518,7 +623,7 @@ pub fn export_transcript(messages: &[Message], session: &Session, out_path: Opti
         }
     ));
     lines.push(format!(
-        "- **Project:** {}",
+        "- **Directory:** {}",
         if session.project.is_empty() {
             "-"
         } else {
@@ -557,5 +662,145 @@ pub fn export_transcript(messages: &[Message], session: &Session, out_path: Opti
             eprintln!("Error writing {path}: {e}");
             false
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::abbreviate_home_with;
+    use super::cursor_ide_resume_hint;
+    use crate::session::Session;
+
+    #[test]
+    fn ide_resume_hint_includes_directory() {
+        let session = Session {
+            source: "cursor-ide".into(),
+            id: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".into(),
+            summary: "git branch analysis".into(),
+            first_prompt: String::new(),
+            created: String::new(),
+            modified: String::new(),
+            date: "2026-08-26".into(),
+            messages: 0,
+            branch: String::new(),
+            project: "/home/alice/src/myapp".into(),
+            file: String::new(),
+            is_sidechain: false,
+            also_ide: false,
+        };
+        let hint = cursor_ide_resume_hint(&session);
+        assert!(hint.contains("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"));
+        assert!(hint.contains("Cursor IDE UI"));
+        assert!(hint.contains("/home/alice/src/myapp") || hint.contains("myapp"));
+        assert!(hint.contains("git branch analysis"));
+        assert!(hint.contains("sidebar"));
+    }
+
+    #[test]
+    fn ide_resume_hint_omits_unknown_directory() {
+        let session = Session {
+            source: "cursor-ide".into(),
+            id: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".into(),
+            summary: "untitled".into(),
+            first_prompt: String::new(),
+            created: String::new(),
+            modified: String::new(),
+            date: "2026-08-26".into(),
+            messages: 1,
+            branch: String::new(),
+            project: String::new(),
+            file: String::new(),
+            is_sidechain: false,
+            also_ide: false,
+        };
+        let hint = cursor_ide_resume_hint(&session);
+        assert!(!hint.contains("(unknown directory)"));
+        assert!(hint.contains("no recorded workspace"));
+    }
+
+    #[test]
+    fn src_tag_labels_agent_as_cursor_agent() {
+        assert!(super::src_tag("cursor", false).contains("cursor-agent"));
+        assert!(super::src_tag("cursor-ide", false).contains("cursor-ide"));
+        assert!(super::src_tag("cursor", true).contains("cursor-ide"));
+        assert!(!super::src_tag("cursor", false).contains("cursor-ide"));
+    }
+
+    #[test]
+    fn id_chip_shows_prefix_for_ide_rows_too() {
+        let ide = Session {
+            source: "cursor-ide".into(),
+            id: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".into(),
+            summary: "sidebar title".into(),
+            first_prompt: String::new(),
+            created: String::new(),
+            modified: String::new(),
+            date: "2026-08-26".into(),
+            messages: 2,
+            branch: String::new(),
+            project: "/tmp".into(),
+            file: String::new(),
+            is_sidechain: false,
+            also_ide: false,
+        };
+        let mut agent = Session {
+            source: "cursor".into(),
+            id: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".into(),
+            ..ide.clone()
+        };
+        assert!(super::id_chip(&ide).contains("aaaaaaaa"));
+        assert!(super::id_chip(&agent).contains("aaaaaaaa"));
+        agent.also_ide = true;
+        assert!(super::src_tag("cursor", true).contains("cursor-ide"));
+        assert!(super::id_chip(&agent).contains("aaaaaaaa"));
+        assert!(!super::id_chip(&agent).contains("--------"));
+    }
+
+    #[test]
+    fn abbreviates_linux_home() {
+        assert_eq!(
+            abbreviate_home_with("/home/alice/src/app", Some("/home/alice")),
+            "~/src/app"
+        );
+    }
+
+    #[test]
+    fn abbreviates_macos_home() {
+        assert_eq!(
+            abbreviate_home_with("/Users/alex/src/app", Some("/Users/alex")),
+            "~/src/app"
+        );
+    }
+
+    #[test]
+    fn abbreviates_home_itself() {
+        assert_eq!(
+            abbreviate_home_with("/home/alice", Some("/home/alice")),
+            "~"
+        );
+        assert_eq!(
+            abbreviate_home_with("/home/alice/", Some("/home/alice")),
+            "~"
+        );
+    }
+
+    #[test]
+    fn leaves_unrelated_paths_alone() {
+        assert_eq!(
+            abbreviate_home_with("/opt/tools", Some("/home/alice")),
+            "/opt/tools"
+        );
+        assert_eq!(
+            abbreviate_home_with("/home/alice-other/x", Some("/home/alice")),
+            "/home/alice-other/x"
+        );
+    }
+
+    #[test]
+    fn abbreviates_windows_home() {
+        assert_eq!(
+            abbreviate_home_with(r"C:\Users\alex\proj", Some(r"C:\Users\alex")),
+            "~/proj"
+        );
     }
 }

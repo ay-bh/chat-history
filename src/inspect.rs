@@ -17,6 +17,7 @@ pub struct InspectInfo {
     pub decisions: Vec<String>,
     pub errors: Vec<String>,
     pub source: String,
+    pub also_ide: bool,
     pub model: String,
     pub total_tokens: u64,
 }
@@ -203,6 +204,7 @@ pub fn inspect_session(session: &Session) -> Option<InspectInfo> {
         decisions,
         errors: errors_seen,
         source: session.source.clone(),
+        also_ide: session.also_ide,
         model: meta.model.unwrap_or_default(),
         total_tokens: meta.total_tokens,
     })

@@ -83,6 +83,15 @@ fn find_missing_session() {
 }
 
 #[test]
+fn resume_placeholder_id_points_at_ide_ui() {
+    let (mut cmd, _tmp) = isolated_cmd();
+    cmd.args(["resume", "00000000"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Session not found"));
+}
+
+#[test]
 fn install_skill_creates_files() {
     let tmp = TempDir::new().unwrap();
     Command::cargo_bin("chat-history")
@@ -311,6 +320,7 @@ fn list_title_is_single_line_without_preamble() {
         .assert()
         .success()
         .stdout(predicate::str::contains("fix the flaky test suite"))
+        .stdout(predicate::str::contains("/Users/test/noisy"))
         .stdout(predicate::str::contains("manually_attached_skills").not());
 }
 
@@ -322,7 +332,8 @@ fn invalid_source_fails_with_usage_error() {
         .failure()
         .code(2)
         .stderr(predicate::str::contains("possible values"))
-        .stderr(predicate::str::contains("claude"));
+        .stderr(predicate::str::contains("claude"))
+        .stderr(predicate::str::contains("cursor-ide"));
 }
 
 #[test]
@@ -567,7 +578,7 @@ fn claude_jsonl_only_session_lists_ai_title_and_branch() {
         .assert()
         .success()
         .stdout(predicate::str::contains("Login form validation"))
-        .stdout(predicate::str::contains("(feat-login)"));
+        .stdout(predicate::str::contains("BRANCH: feat-login"));
 }
 
 #[test]
@@ -626,7 +637,9 @@ fn search_index_finds_session() {
         .env("HOME", tmp.path())
         .assert()
         .success()
-        .stdout(predicate::str::contains("docker deployment pipeline"));
+        .stdout(predicate::str::contains("docker deployment pipeline"))
+        .stdout(predicate::str::contains("DIR:"))
+        .stdout(predicate::str::contains("INDEX_FIELD:"));
 }
 
 #[test]
@@ -664,12 +677,29 @@ fn filter_by_source_flag() {
     // All fixture sessions are claude source
     Command::cargo_bin("chat-history")
         .unwrap()
-        .args(["--source", "cursor"])
+        .args(["--source", "cursor-agent"])
         .env("CLAUDE_CONFIG_DIR", tmp.path())
         .env("HOME", tmp.path())
         .assert()
         .success()
         .stdout(predicate::str::contains("No sessions found"));
+}
+
+#[test]
+fn source_cursor_and_alias_list_agent_transcripts() {
+    let tmp = TempDir::new().unwrap();
+    setup_cursor_fixture(&tmp);
+    for src in ["cursor", "cursor-agent"] {
+        Command::cargo_bin("chat-history")
+            .unwrap()
+            .args(["--source", src])
+            .env("HOME", tmp.path())
+            .env("CLAUDE_CONFIG_DIR", tmp.path())
+            .env("NO_COLOR", "1")
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("refactor the database module"));
+    }
 }
 
 #[test]
@@ -1804,6 +1834,73 @@ fn cursor_sessions_listed() {
         stdout.contains("refactor the database module"),
         "should show cursor session's first prompt"
     );
+    assert!(
+        stdout.contains("cursor"),
+        "should show agent tag for cursor sessions"
+    );
+    assert!(
+        stdout.contains("Users-test-myapp"),
+        "should show the cursor workspace directory slug"
+    );
+}
+
+fn setup_cursor_duplicate_id_fixture(tmp: &TempDir) {
+    let session_id = "bbbbbbbb-cccc-dddd-eeee-ffffffffffff";
+    for (slug, prompt) in [
+        ("tmp-scratch", "old copy from tmp workspace"),
+        ("Users-test-myapp", "continued copy in myapp"),
+    ] {
+        let dir = tmp
+            .path()
+            .join(".cursor")
+            .join("projects")
+            .join(slug)
+            .join("agent-transcripts")
+            .join(session_id);
+        fs::create_dir_all(&dir).unwrap();
+        let line = serde_json::json!({
+            "role": "user",
+            "message": {"content": [{"type": "text", "text": prompt}]}
+        });
+        fs::write(
+            dir.join(format!("{session_id}.jsonl")),
+            serde_json::to_string(&line).unwrap(),
+        )
+        .unwrap();
+    }
+}
+
+#[test]
+fn duplicate_cursor_session_id_lists_copies_and_resolves() {
+    let tmp = TempDir::new().unwrap();
+    setup_cursor_duplicate_id_fixture(&tmp);
+
+    let list = Command::cargo_bin("chat-history")
+        .unwrap()
+        .env("HOME", tmp.path())
+        .env("CLAUDE_CONFIG_DIR", tmp.path())
+        .env("NO_COLOR", "1")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(list.stdout).unwrap();
+    assert!(list.status.success());
+    assert!(
+        stdout.contains("COPIES: 2"),
+        "duplicate ids should be labeled: {stdout}"
+    );
+
+    Command::cargo_bin("chat-history")
+        .unwrap()
+        .args(["find", "bbbbbbbb"])
+        .env("HOME", tmp.path())
+        .env("CLAUDE_CONFIG_DIR", tmp.path())
+        .env("NO_COLOR", "1")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("stored in 2"))
+        .stdout(predicate::str::contains(
+            "bbbbbbbb-cccc-dddd-eeee-ffffffffffff",
+        ));
 }
 
 #[test]
@@ -1852,7 +1949,7 @@ fn cursor_subagent_sessions_hidden_by_default() {
 
     Command::cargo_bin("chat-history")
         .unwrap()
-        .args(["--source", "cursor"])
+        .args(["--source", "cursor-agent"])
         .env("HOME", tmp.path())
         .env("CLAUDE_CONFIG_DIR", tmp.path())
         .env("NO_COLOR", "1")
@@ -1866,7 +1963,7 @@ fn cursor_subagent_sessions_hidden_by_default() {
             "search",
             "subagent analysis",
             "--source",
-            "cursor",
+            "cursor-agent",
             "--deep",
         ])
         .env("HOME", tmp.path())
@@ -1885,7 +1982,7 @@ fn cursor_subagent_sessions_listed_and_searchable_with_flag() {
 
     Command::cargo_bin("chat-history")
         .unwrap()
-        .args(["--source", "cursor", "--sidechains"])
+        .args(["--source", "cursor-agent", "--sidechains"])
         .env("HOME", tmp.path())
         .env("CLAUDE_CONFIG_DIR", tmp.path())
         .env("NO_COLOR", "1")
@@ -1900,7 +1997,7 @@ fn cursor_subagent_sessions_listed_and_searchable_with_flag() {
             "search",
             "subagent analysis",
             "--source",
-            "cursor",
+            "cursor-agent",
             "--deep",
             "--sidechains",
         ])
@@ -2062,12 +2159,12 @@ fn mixed_sources_both_listed() {
         .unwrap();
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(
-        stdout.contains("CC"),
-        "should show Claude sessions with CC tag"
+        stdout.contains("claude"),
+        "should show Claude sessions with claude tag"
     );
     assert!(
-        stdout.contains("CR"),
-        "should show Cursor sessions with CR tag"
+        stdout.contains("cursor"),
+        "should show Cursor sessions with agent tag"
     );
     assert!(
         stdout.contains("3 sessions"),
@@ -2230,4 +2327,201 @@ fn empty_and_whitespace_messages_still_filtered() {
         count, 0,
         "Empty strings and noise patterns should still be filtered, got {count} results"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Cursor IDE (state.vscdb) source
+// ---------------------------------------------------------------------------
+
+/// Minimal `state.vscdb` with one sidebar chat: a header plus one user bubble.
+/// Returns the directory to pass as `CURSOR_USER_DIR`.
+fn setup_cursor_ide_fixture(tmp: &TempDir) -> std::path::PathBuf {
+    let user = tmp.path().join("cursor-user");
+    let dir = user.join("globalStorage");
+    fs::create_dir_all(&dir).unwrap();
+    let conn = rusqlite::Connection::open(dir.join("state.vscdb")).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE composerHeaders (
+            composerId TEXT PRIMARY KEY, workspaceId TEXT, createdAt INTEGER,
+            lastUpdatedAt INTEGER, isArchived INTEGER, isSubagent INTEGER,
+            recency INTEGER, checkpointAt INTEGER, value TEXT);
+         CREATE TABLE cursorDiskKV (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB);",
+    )
+    .unwrap();
+    let id = "abcd1234-0000-4000-8000-000000000001";
+    let header = serde_json::json!({
+        "name": "Explain the cache layer",
+        "unifiedMode": "agent",
+        "workspaceIdentifier": {"uri": {"fsPath": "/home/alice/src/myapp", "path": "/home/alice/src/myapp"}}
+    });
+    conn.execute(
+        "INSERT INTO composerHeaders (composerId, createdAt, lastUpdatedAt, isSubagent, value)
+         VALUES (?1, 1782941109570, 1782941109570, 0, ?2)",
+        rusqlite::params![id, header.to_string()],
+    )
+    .unwrap();
+    let bubble = serde_json::json!({
+        "type": 1,
+        "text": "why does the cache layer miss on warm keys",
+        "bubbleId": "b1",
+        "createdAt": "2026-07-01T10:00:00.000Z"
+    });
+    conn.execute(
+        "INSERT INTO cursorDiskKV (key, value) VALUES (?1, ?2)",
+        rusqlite::params![format!("bubbleId:{id}:b1"), bubble.to_string()],
+    )
+    .unwrap();
+    user
+}
+
+fn cursor_ide_cmd(tmp: &TempDir, user: &std::path::Path) -> Command {
+    let mut cmd = Command::cargo_bin("chat-history").unwrap();
+    cmd.env("CLAUDE_CONFIG_DIR", tmp.path());
+    cmd.env("HOME", tmp.path());
+    cmd.env_remove("CODEX_HOME");
+    cmd.env("CURSOR_USER_DIR", user);
+    cmd.env("NO_COLOR", "1");
+    cmd
+}
+
+#[test]
+fn cursor_ide_source_lists_chat_with_usable_id() {
+    let tmp = TempDir::new().unwrap();
+    let user = setup_cursor_ide_fixture(&tmp);
+    cursor_ide_cmd(&tmp, &user)
+        .args(["--source", "cursor-ide"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("cursor-ide"))
+        .stdout(predicate::str::contains("Explain the cache layer"))
+        .stdout(predicate::str::contains("abcd1234"))
+        .stdout(predicate::str::contains("/home/alice/src/myapp"));
+    // The listed prefix resolves like any other id.
+    cursor_ide_cmd(&tmp, &user)
+        .args(["view", "abcd1234", "--plain"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("warm keys"));
+    cursor_ide_cmd(&tmp, &user)
+        .args(["find", "abcd1234"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("state.vscdb"));
+}
+
+#[test]
+fn cursor_ide_resume_prints_sidebar_hint_instead_of_launching() {
+    let tmp = TempDir::new().unwrap();
+    let user = setup_cursor_ide_fixture(&tmp);
+    cursor_ide_cmd(&tmp, &user)
+        .args(["resume", "abcd1234"])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("Cursor IDE UI"))
+        .stdout(predicate::str::contains("/home/alice/src/myapp"))
+        .stdout(predicate::str::contains("Explain the cache layer"))
+        .stdout(predicate::str::contains(
+            "abcd1234-0000-4000-8000-000000000001",
+        ));
+}
+
+#[test]
+fn cursor_ide_search_json_reports_source_and_also_ide() {
+    let tmp = TempDir::new().unwrap();
+    let user = setup_cursor_ide_fixture(&tmp);
+    let out = cursor_ide_cmd(&tmp, &user)
+        .args(["search", "cache", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let json: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    let first = &json["results"][0];
+    assert_eq!(first["source"], "cursor-ide");
+    assert_eq!(first["also_ide"], false);
+    assert_eq!(first["session_id"], "abcd1234-0000-4000-8000-000000000001");
+}
+
+// ---------------------------------------------------------------------------
+// Cursor Agent transcripts: resume only through the CLI's own chat store
+// ---------------------------------------------------------------------------
+
+fn setup_cursor_agent_jsonl(tmp: &TempDir, slug: &str, id: &str) {
+    let dir = tmp
+        .path()
+        .join(".cursor")
+        .join("projects")
+        .join(slug)
+        .join("agent-transcripts")
+        .join(id);
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join(format!("{id}.jsonl")),
+        r#"{"role":"user","message":{"content":[{"type":"text","text":"probe question about caching"}]}}"#,
+    )
+    .unwrap();
+}
+
+#[test]
+fn cursor_transcript_without_cli_store_prints_sidebar_hint() {
+    let (mut cmd, tmp) = isolated_cmd();
+    let id = "dddd1111-2222-4333-8444-555555555555";
+    setup_cursor_agent_jsonl(&tmp, "Users-test-myapp", id);
+    cmd.env("NO_COLOR", "1")
+        .args(["resume", "dddd1111"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("chat store"))
+        .stdout(predicate::str::contains("Cursor IDE UI"))
+        .stdout(predicate::str::contains(id));
+}
+
+#[cfg(unix)]
+#[test]
+fn cursor_transcript_with_cli_store_resumes_in_its_workspace() {
+    use std::os::unix::fs::PermissionsExt;
+    let (mut cmd, tmp) = isolated_cmd();
+    let id = "dddd2222-2222-4333-8444-555555555555";
+    setup_cursor_agent_jsonl(&tmp, "Users-test-myapp", id);
+    let ws = tmp.path().join("ws");
+    fs::create_dir_all(&ws).unwrap();
+    let store = tmp
+        .path()
+        .join(".cursor")
+        .join("chats")
+        .join("0123abcd")
+        .join(id);
+    fs::create_dir_all(&store).unwrap();
+    fs::write(
+        store.join("meta.json"),
+        format!(
+            r#"{{"schemaVersion":1,"cwd":{:?},"updatedAtMs":1}}"#,
+            ws.to_str().unwrap()
+        ),
+    )
+    .unwrap();
+    // A shim `agent` that only echoes how it was invoked.
+    let bin = tmp.path().join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let shim = bin.join("agent");
+    fs::write(
+        &shim,
+        "#!/bin/sh\necho \"SHIM agent $*\"\necho \"SHIM cwd $(pwd -P)\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).unwrap();
+    cmd.env("NO_COLOR", "1")
+        .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+        .args(["resume", "dddd2222"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!(
+            "SHIM agent --resume {id} --workspace {}",
+            ws.display()
+        )))
+        .stdout(predicate::str::contains(format!(
+            "SHIM cwd {}",
+            ws.canonicalize().unwrap().display()
+        )));
 }

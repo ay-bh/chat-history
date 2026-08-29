@@ -1,3 +1,4 @@
+pub mod cursor_ide;
 pub mod dates;
 pub mod display;
 pub mod inspect;
