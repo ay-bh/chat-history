@@ -1,3 +1,5 @@
+pub mod cursor_cli;
+pub mod cursor_hooks;
 pub mod cursor_ide;
 pub mod dates;
 pub mod display;

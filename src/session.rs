@@ -29,6 +29,14 @@ pub struct Session {
 }
 
 impl Session {
+    /// A CLI chat whose metadata is available, but whose transcript is not.
+    pub fn is_cursor_store_only(&self) -> bool {
+        self.source == "cursor"
+            && Path::new(&self.file)
+                .file_name()
+                .is_some_and(|n| n == "store.db")
+    }
+
     /// Listed as `cursor-ide`: SQLite-only composers, or IDE Agent chats that
     /// also have an `agent-transcripts` jsonl with the same id.
     pub fn is_ide_ui(&self) -> bool {
@@ -364,12 +372,18 @@ fn cursor_cli_chat_cwd_in(chats_dir: &Path, chat_id: &str) -> Option<PathBuf> {
     let mut best: Option<(i64, PathBuf)> = None;
     for entry in fs::read_dir(chats_dir).ok()?.flatten() {
         let meta_path = entry.path().join(chat_id).join("meta.json");
+        if !crate::cursor_cli::has_store(&entry.path().join(chat_id)) {
+            continue;
+        }
         let Ok(raw) = fs::read_to_string(&meta_path) else {
             continue;
         };
         let Ok(meta) = serde_json::from_str::<serde_json::Value>(&raw) else {
             continue;
         };
+        if meta.get("hasConversation").and_then(Value::as_bool) == Some(false) {
+            continue;
+        }
         let Some(cwd) = meta.get("cwd").and_then(|v| v.as_str()) else {
             continue;
         };
@@ -423,7 +437,7 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-fn mtime_iso(path: &Path) -> Option<String> {
+pub(crate) fn mtime_iso(path: &Path) -> Option<String> {
     let meta = fs::metadata(path).ok()?;
     let mtime = meta.modified().ok()?;
     let dur = mtime.duration_since(SystemTime::UNIX_EPOCH).ok()?;
@@ -437,6 +451,36 @@ pub fn parse_any_timestamp(s: &str) -> Option<DateTime<FixedOffset>> {
         .or_else(|_| DateTime::parse_from_str(&s, "%Y-%m-%dT%H:%M:%S%.f%:z"))
         .ok()
         .or_else(|| s.parse::<DateTime<Utc>>().ok().map(|t| t.fixed_offset()))
+}
+
+/// Cursor uses ISO strings in transcripts and milliseconds in SQLite metadata.
+/// Never substitute a file or session time for an unknown message time.
+pub(crate) fn cursor_timestamp(value: &Value) -> String {
+    if let Some(s) = value.as_str() {
+        return parse_any_timestamp(s)
+            .map(|_| s.to_owned())
+            .unwrap_or_default();
+    }
+    value
+        .as_i64()
+        .filter(|ms| *ms > 0)
+        .and_then(chrono::DateTime::<Utc>::from_timestamp_millis)
+        .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+        .unwrap_or_default()
+}
+
+pub(crate) fn cursor_entry_timestamp(entry: &Value) -> String {
+    [
+        "/timestamp",
+        "/createdAt",
+        "/message/timestamp",
+        "/message/createdAt",
+    ]
+    .iter()
+    .filter_map(|p| entry.pointer(p))
+    .map(cursor_timestamp)
+    .find(|ts| !ts.is_empty())
+    .unwrap_or_default()
 }
 
 fn mtime_date(path: &Path) -> Option<String> {
@@ -483,7 +527,7 @@ fn claude_first_prompt(path: &Path) -> String {
     String::new()
 }
 
-fn cursor_first_prompt_jsonl(path: &Path) -> String {
+pub(crate) fn cursor_first_prompt_jsonl(path: &Path) -> String {
     let file = match fs::File::open(path) {
         Ok(f) => f,
         Err(_) => return String::new(),
@@ -518,7 +562,7 @@ fn cursor_first_prompt_jsonl(path: &Path) -> String {
     String::new()
 }
 
-fn cursor_first_prompt_txt(path: &Path) -> String {
+pub(crate) fn cursor_first_prompt_txt(path: &Path) -> String {
     let content = match fs::read_to_string(path) {
         Ok(c) => c,
         Err(_) => return String::new(),
@@ -719,6 +763,13 @@ fn existing_slug_paths(root: &Path, rest: &str) -> Vec<PathBuf> {
 }
 
 pub fn load_cursor_sessions() -> Vec<Session> {
+    let mut sessions = load_cursor_transcripts();
+    crate::cursor_hooks::merge_registered_transcripts(&mut sessions);
+    crate::cursor_cli::merge_cli_sessions(&mut sessions);
+    sessions
+}
+
+fn load_cursor_transcripts() -> Vec<Session> {
     let base = cursor_projects_dir();
     if !base.exists() {
         return Vec::new();
@@ -745,14 +796,14 @@ pub fn load_cursor_sessions() -> Vec<Session> {
                             .to_string();
                         txt_ids.insert(sid.clone());
                         let jsonl_alt = transcripts.join(&sid).join(format!("{sid}.jsonl"));
-                        let iso = mtime_iso(&path).unwrap_or_default();
-                        let date = mtime_date(&path).unwrap_or_default();
                         let first = cursor_first_prompt_txt(&path);
                         let file = if jsonl_alt.exists() {
                             jsonl_alt.to_string_lossy().to_string()
                         } else {
                             path.to_string_lossy().to_string()
                         };
+                        let iso = mtime_iso(Path::new(&file)).unwrap_or_default();
+                        let date = mtime_date(Path::new(&file)).unwrap_or_default();
                         sessions.push(Session {
                             source: "cursor".into(),
                             id: sid,
@@ -1038,6 +1089,13 @@ pub fn load_sessions(source: Option<&str>) -> Vec<Session> {
 /// Matching pairs are one Agent row (`also_ide`) so search does not duplicate.
 pub fn merge_cursor_sessions(agents: Vec<Session>, ide: Vec<Session>) -> Vec<Session> {
     let mut agents = agents;
+    // A readable IDE transcript takes precedence over CLI metadata alone.
+    agents.retain(|s| {
+        !s.is_cursor_store_only()
+            || !ide
+                .iter()
+                .any(|i| i.id.eq_ignore_ascii_case(&s.id) && i.messages > 0)
+    });
     let mut agent_indexes: HashMap<String, Vec<usize>> = HashMap::new();
     for (index, session) in agents.iter().enumerate() {
         agent_indexes
@@ -1057,6 +1115,18 @@ pub fn merge_cursor_sessions(agents: Vec<Session>, ide: Vec<Session>) -> Vec<Ses
                 if !ide_session.project.is_empty() {
                     agents[index].project = ide_session.project.clone();
                 }
+                if !ide_session.created.is_empty() {
+                    agents[index].created = ide_session.created.clone();
+                }
+                // Listing remains ordered by latest activity, including a
+                // transcript that has advanced ahead of the SQLite snapshot.
+                if parse_any_timestamp(&ide_session.modified)
+                    > parse_any_timestamp(&agents[index].modified)
+                {
+                    agents[index].modified = ide_session.modified.clone();
+                    agents[index].date = ide_session.date.clone();
+                }
+                agents[index].messages = agents[index].messages.max(ide_session.messages);
             }
         } else if ide_session.messages > 0 {
             ide_only.push(ide_session);
@@ -1422,8 +1492,13 @@ pub fn parse_cursor_jsonl(filepath: &str) -> Vec<Message> {
         let ctx = crate::parser::extract_context(&content_raw);
         if !role.is_empty() && !text.trim().is_empty() {
             messages.push(Message {
-                uuid: String::new(),
-                timestamp: String::new(),
+                uuid: ["/uuid", "/bubbleId", "/id", "/message/id"]
+                    .iter()
+                    .filter_map(|p| entry.pointer(p).and_then(Value::as_str))
+                    .find(|s| !s.is_empty())
+                    .unwrap_or("")
+                    .to_owned(),
+                timestamp: cursor_entry_timestamp(&entry),
                 role,
                 content: text,
                 session_id: String::new(),
@@ -1517,6 +1592,14 @@ pub fn parse_cursor_txt(filepath: &str) -> Vec<Message> {
 }
 
 pub fn parse_session(session: &Session, extract_meta: bool) -> (Vec<Message>, Option<SessionMeta>) {
+    parse_session_with_cursor_timestamps(session, extract_meta, true)
+}
+
+pub(crate) fn parse_session_with_cursor_timestamps(
+    session: &Session,
+    extract_meta: bool,
+    recover_timestamps: bool,
+) -> (Vec<Message>, Option<SessionMeta>) {
     if session.source == "claude" {
         return parse_claude_jsonl(&session.file, extract_meta);
     }
@@ -1547,11 +1630,16 @@ pub fn parse_session(session: &Session, extract_meta: bool) -> (Vec<Message>, Op
         return (messages, None);
     }
     if session.source == "cursor" {
-        let messages = if session.file.ends_with(".txt") {
+        let mut messages = if session.is_cursor_store_only() {
+            Vec::new()
+        } else if session.file.ends_with(".txt") {
             parse_cursor_txt(&session.file)
         } else {
             parse_cursor_jsonl(&session.file)
         };
+        if recover_timestamps && !session.is_cursor_store_only() {
+            crate::cursor_ide::enrich_transcript_timestamps(session, &mut messages);
+        }
         if extract_meta {
             return (
                 messages,
@@ -1562,7 +1650,7 @@ pub fn parse_session(session: &Session, extract_meta: bool) -> (Vec<Message>, Op
                         Some(session.summary.clone())
                     },
                     custom_title: None,
-                    model: None,
+                    model: crate::cursor_hooks::registered_model(session),
                     total_tokens: 0,
                 }),
             );
@@ -1890,10 +1978,15 @@ mod tests {
                 format!(r#"{{"schemaVersion":1,"cwd":{cwd:?},"updatedAtMs":{updated}}}"#),
             )
             .unwrap();
+            let conn = rusqlite::Connection::open(dir.join("store.db")).unwrap();
+            conn.execute_batch("CREATE TABLE blobs (id TEXT PRIMARY KEY, data BLOB);")
+                .unwrap();
         };
         write("aaaa", ws_old.to_str().unwrap(), 1);
         write("bbbb", ws_new.to_str().unwrap(), 2);
         write("cccc", "/no/such/workspace", 3); // newest, but the workspace is gone
+        write("dddd", ws_old.to_str().unwrap(), 4);
+        fs::remove_file(chats.join("dddd").join(id).join("store.db")).unwrap();
         assert_eq!(cursor_cli_chat_cwd_in(&chats, id), Some(ws_new));
         assert_eq!(cursor_cli_chat_cwd_in(&chats, "other-id"), None);
         assert_eq!(
@@ -2603,6 +2696,25 @@ mod tests {
         );
         std::fs::write(tmp.path(), data).unwrap();
         assert_eq!(cursor_first_prompt_jsonl(tmp.path()), "fix the login bug");
+    }
+
+    #[test]
+    fn cursor_jsonl_preserves_native_timestamps_without_inventing_missing_ones() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        fs::write(tmp.path(), concat!(
+            "{\"role\":\"user\",\"id\":\"u1\",\"timestamp\":\"2026-09-01T10:00:00Z\",\"message\":{\"content\":\"user prompt\"}}\n",
+            "{\"role\":\"assistant\",\"timestamp\":\"invalid\",\"message\":{\"id\":\"a1\",\"createdAt\":1788307200000,\"content\":\"assistant reply\"}}\n",
+            "{\"role\":\"user\",\"message\":{\"content\":\"no timestamp\"}}\n"
+        )).unwrap();
+        let messages = parse_cursor_jsonl(tmp.path().to_str().unwrap());
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].uuid, "u1");
+        assert_eq!(messages[0].timestamp, "2026-09-01T10:00:00Z");
+        assert_eq!(messages[1].uuid, "a1");
+        assert_eq!(messages[1].timestamp, "2026-09-02T00:00:00.000Z");
+        assert!(messages[2].timestamp.is_empty());
+        assert!(cursor_timestamp(&serde_json::json!(0)).is_empty());
+        assert!(cursor_timestamp(&serde_json::json!(i64::MAX)).is_empty());
     }
 
     #[test]

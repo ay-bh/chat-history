@@ -119,8 +119,19 @@ fn copy_counts(sessions: &[Session]) -> std::collections::HashMap<(String, Strin
     m
 }
 
-fn print_title_line(title: &str) {
-    println!("        {}{}{}", c!("bold"), title, c!("reset"));
+fn print_title_line(title: &str, session: &Session) {
+    let availability = if session.is_cursor_store_only() {
+        " [metadata only]"
+    } else {
+        ""
+    };
+    println!(
+        "        {}{}{}{}",
+        c!("bold"),
+        title,
+        c!("reset"),
+        availability
+    );
 }
 
 /// Dim 8-char session-id chip. Every row shows it: the prefix resolves via
@@ -186,7 +197,7 @@ pub fn print_list(sessions: &[Session], verbose: bool) {
             branch,
             msgs
         );
-        print_title_line(&title);
+        print_title_line(&title, s);
         if verbose {
             println!("       {}id: {}{}", c!("dim"), s.id, c!("reset"));
             println!(
@@ -238,7 +249,7 @@ pub fn print_summarized(sessions: &[Session]) {
                 copies_label(&counts, s),
                 labeled("BRANCH", &s.branch)
             );
-            print_title_line(&title);
+            print_title_line(&title, s);
         }
         println!();
     }
@@ -276,7 +287,7 @@ pub fn print_index_results(results: &[IndexResult], query: &str) {
             dir_label(&r.session.project),
             labeled("INDEX_FIELD", &r.matched_field)
         );
-        print_title_line(&title);
+        print_title_line(&title, &r.session);
     }
     println!();
 }
@@ -320,7 +331,7 @@ pub fn print_search_results(results: &[SearchResult], query: &str) {
             score,
             dir_label(&r.session.project)
         );
-        print_title_line(&title);
+        print_title_line(&title, &r.session);
         let snippet = snippet_around_match(&r.message.content, query, 200);
         println!("        {}: {}", role_str, snippet);
         if !r.message.tool_uses.is_empty() {
@@ -353,7 +364,7 @@ pub fn print_search_results_json(results: &[SearchResult], query: &str) {
     let items: Vec<serde_json::Value> = results
         .iter()
         .map(|r| {
-            serde_json::json!({
+            let mut item = serde_json::json!({
                 "session_id": r.session.id,
                 "source": r.session.source,
                 "also_ide": r.session.also_ide,
@@ -365,7 +376,11 @@ pub fn print_search_results_json(results: &[SearchResult], query: &str) {
                 "snippet": snippet_around_match(&r.message.content, query, 300),
                 "tools": r.message.tool_uses,
                 "files": r.message.files_referenced,
-            })
+            });
+            if r.session.is_cursor_store_only() {
+                item["metadata_only"] = serde_json::json!(true);
+            }
+            item
         })
         .collect();
     let out = serde_json::json!({ "query": query, "count": items.len(), "results": items });
@@ -376,7 +391,7 @@ pub fn print_index_results_json(results: &[IndexResult], query: &str) {
     let items: Vec<serde_json::Value> = results
         .iter()
         .map(|r| {
-            serde_json::json!({
+            let mut item = serde_json::json!({
                 "session_id": r.session.id,
                 "source": r.session.source,
                 "also_ide": r.session.also_ide,
@@ -386,7 +401,11 @@ pub fn print_index_results_json(results: &[IndexResult], query: &str) {
                 "score": (r.score * 10.0).round() / 10.0,
                 "matched_field": r.matched_field,
                 "snippet": clean_prompt(&r.display).chars().take(200).collect::<String>(),
-            })
+            });
+            if r.session.is_cursor_store_only() {
+                item["metadata_only"] = serde_json::json!(true);
+            }
+            item
         })
         .collect();
     let out = serde_json::json!({ "query": query, "count": items.len(), "results": items, "search_type": "index" });

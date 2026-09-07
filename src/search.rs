@@ -246,7 +246,10 @@ pub fn scored_search(
         .par_iter()
         .filter(|s| !s.file.is_empty() && std::path::Path::new(&s.file).exists())
         .flat_map(|s| {
-            let (mut messages, _) = parse_session(s, false);
+            // Ordinary keyword search retains its existing fast transcript
+            // path. SQLite recovery is needed only for message-time filters.
+            let (mut messages, _) =
+                parse_session_with_cursor_timestamps(s, false, timeframe.is_some());
             let title = s.summary.clone();
             if !title.is_empty() && !messages.iter().any(|m| m.content == title) {
                 messages.insert(

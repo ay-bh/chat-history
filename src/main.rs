@@ -143,6 +143,11 @@ enum Commands {
         /// Session ID or unique prefix
         session_id: String,
     },
+    /// Record a Cursor stop-hook payload from stdin (optional local discovery)
+    #[command(
+        after_help = "EXAMPLES:\n  Configure a Cursor stop hook with command: chat-history cursor-hook\n  Replay a saved event: chat-history cursor-hook < event.json\n\nRecords only transcript paths and selected metadata in ~/.chat-history/cursor-hooks.db.\nDoes not install hooks. Outputs {} and never blocks Cursor on a recording error."
+    )]
+    CursorHook,
     /// Install the agent skill for Claude Code, Cursor, and Codex
     #[command(name = "install-skill")]
     InstallSkill {
@@ -219,6 +224,16 @@ fn parse_date_arg(val: &Option<String>) -> Option<chrono::NaiveDate> {
     })
 }
 
+fn require_readable_transcript(session: &session::Session) {
+    if session.is_cursor_store_only() {
+        eprintln!(
+            "Only metadata is available for Cursor CLI session {}. Its store.db format is not a readable transcript. Use `chat-history resume {}` to reopen it in Cursor Agent; enable the optional cursor-hook for future transcript discovery.",
+            session.id, session.id
+        );
+        std::process::exit(1);
+    }
+}
+
 fn main() {
     // Rust ignores SIGPIPE by default, turning writes to a closed pipe
     // (e.g. `chat-history ... | head`) into println! panics. Restore the
@@ -229,6 +244,22 @@ fn main() {
     }
 
     let cli = Cli::parse();
+
+    if matches!(&cli.command, Some(Commands::CursorHook)) {
+        use std::io::IsTerminal;
+        let result = if std::io::stdin().is_terminal() {
+            Err("cursor-hook expects a Cursor JSON payload on stdin".to_owned())
+        } else {
+            chat_history::cursor_hooks::record_hook(std::io::stdin().lock())
+        };
+        if let Err(error) = result {
+            eprintln!("Warning: {error}");
+        }
+        // Observational hook: no follow-up prompt, permission decision, skill
+        // installation, or history scan, including when recording fails.
+        println!("{{}}");
+        return;
+    }
 
     if let Some(Commands::Completions { shell }) = &cli.command {
         use clap::CommandFactory;
@@ -346,7 +377,11 @@ fn main() {
         }
         Some(Commands::Inspect { session_id, last }) => {
             let session = if last {
-                let Some(s) = filtered.iter().max_by_key(|s| session::recency_key(s)) else {
+                let Some(s) = filtered
+                    .iter()
+                    .filter(|s| !s.is_cursor_store_only())
+                    .max_by_key(|s| session::recency_key(s))
+                else {
                     eprintln!("Session not found");
                     std::process::exit(1);
                 };
@@ -357,6 +392,7 @@ fn main() {
                 eprintln!("Provide a session ID or use --last");
                 std::process::exit(2);
             };
+            require_readable_transcript(session);
             match inspect::inspect_session(session) {
                 Some(info) => display::print_inspect(&info),
                 None => eprintln!("Could not inspect session (transcript may be expired)."),
@@ -369,7 +405,11 @@ fn main() {
             plain,
         }) => {
             let session = if last {
-                let Some(s) = filtered.iter().max_by_key(|s| session::recency_key(s)) else {
+                let Some(s) = filtered
+                    .iter()
+                    .filter(|s| !s.is_cursor_store_only())
+                    .max_by_key(|s| session::recency_key(s))
+                else {
                     eprintln!("Session not found");
                     std::process::exit(1);
                 };
@@ -380,6 +420,7 @@ fn main() {
                 eprintln!("Provide a session ID or use --last");
                 std::process::exit(2);
             };
+            require_readable_transcript(session);
             let (messages, _) = parse_session(session, false);
             if plain {
                 display::print_plain(&messages);
@@ -389,6 +430,7 @@ fn main() {
         }
         Some(Commands::Export { session_id, output }) => {
             let session = resolve_session_or_exit(&sessions, &session_id);
+            require_readable_transcript(session);
             let (messages, _) = parse_session(session, false);
             if !display::export_transcript(&messages, session, output.as_deref()) {
                 std::process::exit(1);
@@ -475,7 +517,9 @@ fn main() {
             let session = resolve_session_or_exit(&sessions, &session_id);
             println!("{}", session.file);
         }
-        Some(Commands::InstallSkill { .. }) | Some(Commands::Completions { .. }) => unreachable!(),
+        Some(Commands::InstallSkill { .. })
+        | Some(Commands::Completions { .. })
+        | Some(Commands::CursorHook) => unreachable!(),
         None => {
             if cli.summarize {
                 display::print_summarized(&filtered);
