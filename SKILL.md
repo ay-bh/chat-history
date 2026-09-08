@@ -43,7 +43,7 @@ Search, inspect, and export Claude Code, Cursor, and Codex conversation history.
 - Cursor CLI rows labeled `[metadata only]` support `find`, `resume`, and title search when Cursor recorded a title (print-mode chats usually have none); their internal `store.db` cannot be viewed or exported as a transcript. Do not claim that metadata-only search covers message content.
 - Cursor message timestamps may be unavailable. `search --timeframe` excludes unknown message times; use session `--from` / `--to` filters for activity-date questions. File modification times are not message timestamps.
 - Don't dump raw JSON or full transcripts at the user — summarize, cite the session ID and date (or title + directory for `cursor-ide`).
-- Do not `resume` a session whose human tag is `cursor-ide`. `--json` may still report `"source": "cursor"` for IDE Agent chats that also have a jsonl; `resume` will print a sidebar hint instead of launching the Agent CLI.
+- `cursor-ide` rows (and `--json` items with `"also_ide": true`) resume only when the Agent CLI has a `~/.cursor/chats` store for the id; otherwise `resume` prints a sidebar hint instead of launching the Agent CLI. Run `resume` and follow its output rather than assuming.
 - Some Cursor sessions have thin metadata (`(no summary)`, `duration: 0min`, raw first-message titles). If `inspect` is thin, fall back to `chat-history view <id> --plain`.
 
 ## Commands

@@ -163,19 +163,31 @@ pub fn scored_search(
     // conversation is still findable.
     // With --timeframe the stub has no message time to filter on, so the
     // query goes through content search like everything else.
+    let tf_cutoff: Option<DateTime<FixedOffset>> = timeframe.map(|tf| {
+        let dur = parse_timeframe_duration(tf);
+        (Utc::now() - dur).fixed_offset()
+    });
+    // The direct lookup still honors --timeframe: it returns the first
+    // message inside the window, and never the untimestamped stub.
     if is_uuid(query)
-        && timeframe.is_none()
         && let Some(s) = sessions
             .iter()
             .find(|s| s.id.eq_ignore_ascii_case(query.trim()))
     {
         let (messages, _) = parse_session_recovering_timestamps(s, false);
-        if let Some(mut msg) = messages.into_iter().next() {
+        let within = |m: &Message| match tf_cutoff {
+            None => true,
+            Some(cutoff) => parse_any_timestamp(&m.timestamp).is_some_and(|t| t >= cutoff),
+        };
+        if let Some(mut msg) = messages.into_iter().find(within) {
             msg.final_score = 100.0;
             return vec![SearchResult {
                 session: s.clone(),
                 message: msg,
             }];
+        }
+        if tf_cutoff.is_some() {
+            return Vec::new();
         }
         let stub = Message {
             uuid: String::new(),
@@ -199,11 +211,6 @@ pub fn scored_search(
             message: stub,
         }];
     }
-
-    let tf_cutoff: Option<DateTime<FixedOffset>> = timeframe.map(|tf| {
-        let dur = parse_timeframe_duration(tf);
-        (Utc::now() - dur).fixed_offset()
-    });
 
     let boosts = semantic_boosts(query);
     let raw_words: Vec<String> = {

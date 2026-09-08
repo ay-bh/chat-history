@@ -31,13 +31,14 @@ pub(crate) struct CliChat {
     title: String,
     created: String,
     is_subagent: bool,
+    /// meta.json schemaVersion label when it is not the supported 1.
+    unsupported_schema: Option<String>,
 }
 
 /// Why a `~/.cursor/chats/<hash>/<id>` directory is not a usable copy.
 enum Skip {
     NoStore,
     BadMeta,
-    Schema(Option<u64>),
     Empty,
 }
 
@@ -52,10 +53,11 @@ fn read_copy(dir: &Path) -> Result<CliChat, Skip> {
         .ok()
         .and_then(|raw| serde_json::from_str(&raw).ok())
         .ok_or(Skip::BadMeta)?;
+    // An unknown schema is not listed (its fields may mean something else),
+    // but resume only needs `cwd`, which existing_absolute_dir still guards.
     let schema = meta.get("schemaVersion").and_then(Value::as_u64);
-    if schema != Some(1) {
-        return Err(Skip::Schema(schema));
-    }
+    let unsupported_schema =
+        (schema != Some(1)).then(|| schema.map_or("missing".to_owned(), |v| v.to_string()));
     if meta.get("hasConversation").and_then(Value::as_bool) == Some(false) {
         return Err(Skip::Empty);
     }
@@ -79,6 +81,7 @@ fn read_copy(dir: &Path) -> Result<CliChat, Skip> {
             .and_then(Value::as_bool)
             .unwrap_or(false),
         project,
+        unsupported_schema,
     })
 }
 
@@ -89,7 +92,7 @@ pub fn unresumable_reason(session: &Session) -> Option<String> {
 }
 
 fn unresumable_reason_in(chats_dir: &Path, session: &Session) -> Option<String> {
-    let (mut gone, mut schemas, mut blank, mut empty) = (Vec::new(), Vec::new(), false, false);
+    let (mut gone, mut blank, mut empty) = (Vec::new(), false, false);
     let note = |list: &mut Vec<String>, v: String| {
         if !list.contains(&v) {
             list.push(v);
@@ -100,10 +103,6 @@ fn unresumable_reason_in(chats_dir: &Path, session: &Session) -> Option<String> 
             Ok(copy) if copy.workspace_exists => return None,
             Ok(copy) if copy.project.is_empty() => blank = true,
             Ok(copy) => note(&mut gone, copy.project),
-            Err(Skip::Schema(v)) => note(
-                &mut schemas,
-                v.map_or("missing".to_owned(), |v| v.to_string()),
-            ),
             Err(Skip::Empty) => empty = true,
             Err(_) => {}
         }
@@ -112,12 +111,6 @@ fn unresumable_reason_in(chats_dir: &Path, session: &Session) -> Option<String> 
         return Some(format!(
             "its workspace {} no longer exists. Cursor keys the chat by workspace and id, so recreate that directory to resume it.",
             gone.join(", ")
-        ));
-    }
-    if !schemas.is_empty() {
-        return Some(format!(
-            "its meta.json uses schemaVersion {} and this version of chat-history supports 1; update chat-history.",
-            schemas.join(", ")
         ));
     }
     if blank {
@@ -166,11 +159,16 @@ pub(crate) fn resume_workspace_in(chats_dir: &Path, session: &Session) -> Option
         .filter(|copy| copy.workspace_exists)
         .collect();
     rank(&mut copies);
-    copies
+    let chosen = copies
         .iter()
         .find(|copy| same_workspace(&copy.project, &session.project))
-        .or(copies.first())
-        .map(|copy| PathBuf::from(&copy.project))
+        .or(copies.first())?;
+    if let Some(v) = &chosen.unsupported_schema {
+        eprintln!(
+            "Warning: this chat's meta.json has schemaVersion {v} (this version supports 1); resuming from its recorded workspace anyway. Update chat-history."
+        );
+    }
+    Some(PathBuf::from(&chosen.project))
 }
 
 fn merge_cli_sessions_from(sessions: &mut Vec<Session>, root: &Path) {
@@ -185,16 +183,16 @@ fn merge_cli_sessions_from(sessions: &mut Vec<Session>, root: &Path) {
         };
         for chat in chats.flatten() {
             match read_copy(&chat.path()) {
-                Ok(copy) => copies
-                    .entry(chat.file_name().to_string_lossy().into_owned())
-                    .or_default()
-                    .push(copy),
-                Err(Skip::Schema(v)) => {
-                    let v = v.map_or("missing".to_owned(), |v| v.to_string());
+                Ok(copy) if copy.unsupported_schema.is_some() => {
+                    let v = copy.unsupported_schema.unwrap_or_default();
                     if !unsupported.contains(&v) {
                         unsupported.push(v);
                     }
                 }
+                Ok(copy) => copies
+                    .entry(chat.file_name().to_string_lossy().into_owned())
+                    .or_default()
+                    .push(copy),
                 Err(_) => {}
             }
         }

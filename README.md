@@ -124,7 +124,7 @@ Example (index search, not `--json`):
         Please read over the setup guide…
 ```
 
-`--json` still includes `session_id`. For IDE Agent chats the JSON `source` is `cursor` (the jsonl store) even though the human tag is `cursor-ide`; those items carry `"also_ide": true`, and `resume` refuses them.
+`--json` still includes `session_id`. For IDE Agent chats the JSON `source` is `cursor` (the jsonl store) even though the human tag is `cursor-ide`; those items carry `"also_ide": true`; `resume` launches the Agent CLI when a `~/.cursor/chats` store exists for the id and prints the sidebar hint otherwise.
 
 ### Interpreting output
 

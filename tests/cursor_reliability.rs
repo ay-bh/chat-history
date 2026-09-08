@@ -153,28 +153,32 @@ fn resume_explains_a_missing_workspace_instead_of_the_sidebar_hint() {
 }
 
 #[test]
-fn unsupported_meta_schema_is_reported_not_mistaken_for_a_missing_store() {
+fn unsupported_meta_schema_is_skipped_in_listing_but_still_resumes() {
     let tmp = TempDir::new().unwrap();
     transcript(&tmp, false);
     cli_store_with(
         &tmp,
         "h",
-        json!({"schemaVersion":2, "cwd":tmp.path(),
+        json!({"schemaVersion":2, "cwd":tmp.path(), "title":"schema two",
         "createdAtMs":1788220800000i64, "updatedAtMs":1788307200000i64, "hasConversation":true}),
     );
-    // Listing warns once that a store was skipped, and still lists the transcript.
+    // Listing warns once and does not use the store's metadata...
     command(&tmp)
         .args(["--source", "cursor"])
         .assert()
         .success()
         .stdout(predicate::str::contains("investigate uniquecache failure"))
+        .stdout(predicate::str::contains("schema two").not())
         .stderr(predicate::str::contains("schemaVersion 2"));
+    // ...but resume only needs the recorded workspace, which still exists.
+    let path = agent_shim(&tmp);
     command(&tmp)
         .args(["resume", ID])
+        .env("PATH", &path)
         .assert()
-        .failure()
-        .stderr(predicate::str::contains("schemaVersion 2"))
-        .stderr(predicate::str::contains("No Agent CLI chat store").not());
+        .success()
+        .stdout(predicate::str::contains("SHIM workspace:"))
+        .stderr(predicate::str::contains("schemaVersion 2"));
 }
 
 #[test]
@@ -374,12 +378,24 @@ fn ide_indexed_transcript_with_an_unusable_store_gets_the_reason() {
 
 #[test]
 fn uuid_lookup_respects_timeframe() {
-    // A transcript with no message times: found by id, but not once a
-    // message-time filter is requested. (The JSON envelope echoes the query,
-    // so assert on the result's session_id field.)
+    // (The JSON envelope echoes the query, so assert on the session_id field.)
+    let hit = format!("\"session_id\": \"{ID}\"");
+    // Timestamped today: found by id with and without the window.
+    let tmp = TempDir::new().unwrap();
+    transcript(&tmp, true);
+    for args in [
+        vec!["search", ID, "--deep", "--json"],
+        vec!["search", ID, "--deep", "--json", "--timeframe", "today"],
+    ] {
+        command(&tmp)
+            .args(args)
+            .assert()
+            .success()
+            .stdout(predicate::str::contains(hit.as_str()));
+    }
+    // No message times: found by id, but not once a window is requested.
     let tmp = TempDir::new().unwrap();
     transcript(&tmp, false);
-    let hit = format!("\"session_id\": \"{ID}\"");
     command(&tmp)
         .args(["search", ID, "--deep", "--json"])
         .assert()

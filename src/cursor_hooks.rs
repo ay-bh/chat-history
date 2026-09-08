@@ -164,7 +164,9 @@ fn merge_records(sessions: &mut Vec<Session>, records: Vec<HookRecord>) {
         if let Some(session) = sessions.iter_mut().find(|s| {
             s.id.eq_ignore_ascii_case(&record.conversation_id) && same_transcript(&s.file, &path)
         }) {
-            if !project.is_empty() {
+            // Fill a workspace the scan could not decode; never replace one
+            // it did (or the CLI store pinned).
+            if !project.is_empty() && !Path::new(&session.project).is_absolute() {
                 session.project = project;
             }
             continue;
@@ -272,6 +274,29 @@ mod tests {
             id: "hook-id".into(),
             file: file.to_string_lossy().into_owned(),
             ..Session::default()
+        }
+    }
+
+    #[test]
+    fn hook_workspace_fills_only_an_unpinned_project() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = tmp.path().join("hooks.db");
+        let file = tmp.path().join("t.jsonl");
+        std::fs::write(
+            &file,
+            "{\"role\":\"user\",\"message\":{\"content\":\"q\"}}\n",
+        )
+        .unwrap();
+        let event = serde_json::json!({"conversation_id":"hook-id", "transcript_path":file,
+            "workspace_roots":["/multi/root0"]});
+        record_hook_at(event.to_string().as_bytes(), &db).unwrap();
+        for (before, after) in [("/repo/sub", "/repo/sub"), ("repo-sub", "/multi/root0")] {
+            let mut session = listed(&file);
+            session.project = before.into();
+            let mut sessions = vec![session];
+            merge_records(&mut sessions, read_records(&db, true));
+            assert_eq!(sessions.len(), 1);
+            assert_eq!(sessions[0].project, after);
         }
     }
 

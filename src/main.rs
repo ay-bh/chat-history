@@ -494,7 +494,7 @@ fn main() {
                     &session.summary
                 }
             );
-            if session.source == "cursor"
+            if session.source.starts_with("cursor")
                 && let Some(dir) = &workdir
                 && !session.project.is_empty()
                 && !chat_history::cursor_cli::same_workspace(
