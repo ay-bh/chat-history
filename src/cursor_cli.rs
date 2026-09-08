@@ -127,7 +127,7 @@ fn unresumable_reason_in(chats_dir: &Path, session: &Session) -> Option<String> 
 }
 
 /// Two spellings of one directory (symlinks, `/private/tmp` vs `/tmp`).
-fn same_workspace(a: &str, b: &str) -> bool {
+pub fn same_workspace(a: &str, b: &str) -> bool {
     a == b
         || (!a.is_empty()
             && !b.is_empty()
@@ -252,11 +252,11 @@ fn merge_cli_sessions_from(sessions: &mut Vec<Session>, root: &Path) {
 
 fn push_store_only(sessions: &mut Vec<Session>, id: String, chat: CliChat) {
     let store = chat.dir.join("store.db");
-    let mut modified = cursor_timestamp(&serde_json::json!(chat.updated));
+    let (mut modified, mut date) = crate::cursor_ide::ms_iso_date(chat.updated);
     if modified.is_empty() {
         modified = mtime_iso(&store).unwrap_or_default();
+        date = modified.get(..10).unwrap_or("").to_owned();
     }
-    let date = modified.get(..10).unwrap_or("").to_owned();
     sessions.push(Session {
         source: "cursor".into(),
         id,

@@ -308,7 +308,9 @@ pub fn resume_command(session: &Session) -> Option<ResumeAction> {
             args: vec!["--resume".into(), session.id.clone()],
             workdir: existing_absolute_dir(&session.project),
         }),
-        "cursor" => {
+        // A cursor-ide row can still be a CLI chat the IDE indexes (or a
+        // CLI chat whose transcript is gone): the store decides, not the tag.
+        "cursor" | "cursor-ide" => {
             // Only chats the Agent CLI itself stored can be resumed, and only
             // from their own workspace; anything else would start a blank chat.
             let cwd = crate::cursor_cli::resume_workspace(session)?;
@@ -1099,7 +1101,11 @@ pub fn merge_cursor_sessions(agents: Vec<Session>, ide: Vec<Session>) -> Vec<Ses
                 if !ide_session.summary.is_empty() {
                     agents[index].summary = ide_session.summary.clone();
                 }
-                if !ide_session.project.is_empty() {
+                // The CLI store already pinned an absolute workspace when it
+                // exists; resume prefers that copy, so keep it.
+                if !ide_session.project.is_empty()
+                    && !Path::new(&agents[index].project).is_absolute()
+                {
                     agents[index].project = ide_session.project.clone();
                 }
                 if !ide_session.created.is_empty() {
@@ -2117,6 +2123,23 @@ mod tests {
             lookup_session(&sessions, "abc-1"),
             SessionLookup::Found(s) if s.id == "abc-123"
         ));
+    }
+
+    #[test]
+    fn merge_cursor_keeps_a_pinned_workspace_and_fills_an_empty_one() {
+        let mut pinned = make_session("id", "2026-01-01", "cursor", "/repo/sub", "", "");
+        pinned.file = "/t/id.jsonl".into();
+        let mut blank = pinned.clone();
+        blank.project.clear();
+        let ide = make_session("id", "2026-01-01", "cursor-ide", "/repo", "", "IDE title");
+        let merged = merge_cursor_sessions(vec![pinned, blank], vec![ide]);
+        assert_eq!(merged[0].project, "/repo/sub", "CLI copy's workspace stays");
+        assert_eq!(merged[1].project, "/repo", "empty project takes the IDE's");
+        assert!(
+            merged
+                .iter()
+                .all(|s| s.also_ide && s.summary == "IDE title")
+        );
     }
 
     #[test]

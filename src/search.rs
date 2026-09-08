@@ -161,12 +161,15 @@ pub fn scored_search(
     // On a UUID-shaped query try a direct session-id lookup first; on miss,
     // fall through to content search so a UUID that was discussed inside a
     // conversation is still findable.
+    // With --timeframe the stub has no message time to filter on, so the
+    // query goes through content search like everything else.
     if is_uuid(query)
+        && timeframe.is_none()
         && let Some(s) = sessions
             .iter()
             .find(|s| s.id.eq_ignore_ascii_case(query.trim()))
     {
-        let (messages, _) = parse_session(s, false);
+        let (messages, _) = parse_session_recovering_timestamps(s, false);
         if let Some(mut msg) = messages.into_iter().next() {
             msg.final_score = 100.0;
             return vec![SearchResult {

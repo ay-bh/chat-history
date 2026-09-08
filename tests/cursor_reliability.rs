@@ -315,6 +315,83 @@ fn metadata_only_message_names_the_resume_blocker() {
         .stderr(predicate::str::contains("Use `chat-history resume").not());
 }
 
+fn ide_db_with_bubble(tmp: &TempDir, with_bubble: bool) {
+    let db = tmp.path().join("cursor-user/globalStorage/state.vscdb");
+    fs::create_dir_all(db.parent().unwrap()).unwrap();
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute_batch("CREATE TABLE composerHeaders (composerId TEXT PRIMARY KEY, createdAt INTEGER, lastUpdatedAt INTEGER, isSubagent INTEGER, value TEXT);
+        CREATE TABLE cursorDiskKV (key TEXT PRIMARY KEY, value BLOB);").unwrap();
+    conn.execute(
+        "INSERT INTO composerHeaders VALUES (?1, 1, 1, 0, '{}')",
+        [ID],
+    )
+    .unwrap();
+    if with_bubble {
+        conn.execute("INSERT INTO cursorDiskKV VALUES (?1, ?2)", rusqlite::params![format!("bubbleId:{ID}:b"),
+            json!({"type":1, "bubbleId":"b", "text":"investigate uniquecache failure", "createdAt":"2026-09-01T00:00:00Z"}).to_string()]).unwrap();
+    }
+}
+
+#[test]
+fn store_only_chat_with_ide_bubbles_still_resumes() {
+    // No transcript, but a CLI store and IDE bubbles: the row lists as
+    // cursor-ide, and the store still wins for resume.
+    let tmp = TempDir::new().unwrap();
+    cli_store(&tmp, true);
+    ide_db_with_bubble(&tmp, true);
+    command(&tmp)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("cursor-ide"));
+    let path = agent_shim(&tmp);
+    command(&tmp)
+        .args(["resume", ID])
+        .env("PATH", &path)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("SHIM workspace:"));
+}
+
+#[test]
+fn ide_indexed_transcript_with_an_unusable_store_gets_the_reason() {
+    let tmp = TempDir::new().unwrap();
+    transcript(&tmp, false);
+    ide_db_with_bubble(&tmp, false);
+    let gone = tmp.path().join("deleted-workspace");
+    cli_store_with(
+        &tmp,
+        "h",
+        json!({"schemaVersion":1, "cwd":gone,
+        "createdAtMs":1788220800000i64, "updatedAtMs":1788307200000i64, "hasConversation":true}),
+    );
+    command(&tmp)
+        .args(["resume", ID])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("no longer exists"))
+        .stdout(predicate::str::contains("IDE chats cannot be resumed").not());
+}
+
+#[test]
+fn uuid_lookup_respects_timeframe() {
+    // A transcript with no message times: found by id, but not once a
+    // message-time filter is requested. (The JSON envelope echoes the query,
+    // so assert on the result's session_id field.)
+    let tmp = TempDir::new().unwrap();
+    transcript(&tmp, false);
+    let hit = format!("\"session_id\": \"{ID}\"");
+    command(&tmp)
+        .args(["search", ID, "--deep", "--json"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(hit.as_str()));
+    command(&tmp)
+        .args(["search", ID, "--deep", "--json", "--timeframe", "today"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(hit.as_str()).not());
+}
+
 #[test]
 fn native_cursor_timestamps_enable_timeframe_search() {
     let tmp = TempDir::new().unwrap();
