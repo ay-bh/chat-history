@@ -10,7 +10,7 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Session {
     pub source: String,
     pub id: String,
@@ -415,11 +415,10 @@ pub(crate) fn cursor_timestamp(value: &Value) -> String {
             .map(|_| s.to_owned())
             .unwrap_or_default();
     }
+    // Same second-precision shape every other source uses.
     value
         .as_i64()
-        .filter(|ms| *ms > 0)
-        .and_then(chrono::DateTime::<Utc>::from_timestamp_millis)
-        .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+        .map(|ms| crate::cursor_ide::ms_iso_date(ms).0)
         .unwrap_or_default()
 }
 
@@ -671,6 +670,23 @@ pub enum WorkspaceResolution {
 /// (`a-b/c` vs `a/b-c`), so only a single existing path is trusted.
 pub fn decode_cursor_project_slug(slug: &str) -> WorkspaceResolution {
     decode_from_root(Path::new("/"), slug)
+}
+
+/// The encode direction of the slug above: Cursor names
+/// `~/.cursor/projects/<slug>` by replacing every run of non-alphanumeric
+/// characters in the workspace path with one hyphen (matched all 204
+/// resolved transcripts on a real install). The decoder only reverses `/`,
+/// so a workspace containing other punctuation encodes but never decodes.
+pub(crate) fn cursor_project_slug(workspace: &str) -> String {
+    let mut slug = String::with_capacity(workspace.len());
+    for c in workspace.chars() {
+        if c.is_ascii_alphanumeric() {
+            slug.push(c);
+        } else if !slug.ends_with('-') && !slug.is_empty() {
+            slug.push('-');
+        }
+    }
+    slug.trim_end_matches('-').to_owned()
 }
 
 fn decode_from_root(root: &Path, slug: &str) -> WorkspaceResolution {
@@ -1976,6 +1992,19 @@ mod tests {
     }
 
     #[test]
+    fn cursor_project_slug_matches_cursor_naming() {
+        assert_eq!(
+            cursor_project_slug("/Users/me/Documents/GitHub/chat-history"),
+            "Users-me-Documents-GitHub-chat-history"
+        );
+        // Runs of punctuation collapse to one hyphen; nothing leads or trails.
+        assert_eq!(
+            cursor_project_slug("/private/tmp/claude-501/-Users-me/x y/"),
+            "private-tmp-claude-501-Users-me-x-y"
+        );
+    }
+
+    #[test]
     fn cursor_slug_keeps_hyphenated_dir_names() {
         let root = tempfile::TempDir::new().unwrap();
         let ws = root.path().join("devops").join("chat-history");
@@ -2631,7 +2660,7 @@ mod tests {
         assert_eq!(messages[0].uuid, "u1");
         assert_eq!(messages[0].timestamp, "2026-09-01T10:00:00Z");
         assert_eq!(messages[1].uuid, "a1");
-        assert_eq!(messages[1].timestamp, "2026-09-02T00:00:00.000Z");
+        assert_eq!(messages[1].timestamp, "2026-09-02T00:00:00Z");
         assert!(messages[2].timestamp.is_empty());
         assert!(cursor_timestamp(&serde_json::json!(0)).is_empty());
         assert!(cursor_timestamp(&serde_json::json!(i64::MAX)).is_empty());

@@ -224,7 +224,37 @@ fn parse_date_arg(val: &Option<String>) -> Option<chrono::NaiveDate> {
     })
 }
 
-fn require_readable_transcript(session: &session::Session) {
+/// The session a transcript-reading command (inspect, view, export) works
+/// on: by id, or with `--last` the newest readable one. Exits with an
+/// explanation when only Cursor CLI metadata exists for it.
+fn transcript_or_exit<'a>(
+    sessions: &'a [session::Session],
+    filtered: &'a [session::Session],
+    session_id: Option<&str>,
+    last: bool,
+) -> &'a session::Session {
+    let session = if last {
+        let newest = |readable_only: bool| {
+            filtered
+                .iter()
+                .filter(|s| !readable_only || !s.is_cursor_store_only())
+                .max_by_key(|s| session::recency_key(s))
+        };
+        // Fall back to a metadata-only row so the message below explains
+        // it, instead of claiming nothing matched what the listing showed.
+        match newest(true).or_else(|| newest(false)) {
+            Some(s) => s,
+            None => {
+                eprintln!("Session not found");
+                std::process::exit(1);
+            }
+        }
+    } else if let Some(sid) = session_id {
+        resolve_session_or_exit(sessions, sid)
+    } else {
+        eprintln!("Provide a session ID or use --last");
+        std::process::exit(2);
+    };
     if session.is_cursor_store_only() {
         eprintln!(
             "Only metadata is available for Cursor CLI session {}. Its store.db format is not a readable transcript. Use `chat-history resume {}` to reopen it in Cursor Agent; enable the optional cursor-hook for future transcript discovery.",
@@ -232,24 +262,7 @@ fn require_readable_transcript(session: &session::Session) {
         );
         std::process::exit(1);
     }
-}
-
-/// `--last` target: the most recent session with a readable transcript.
-fn latest_readable_or_exit(filtered: &[session::Session]) -> &session::Session {
-    if let Some(s) = filtered
-        .iter()
-        .filter(|s| !s.is_cursor_store_only())
-        .max_by_key(|s| session::recency_key(s))
-    {
-        return s;
-    }
-    if let Some(s) = filtered.iter().max_by_key(|s| session::recency_key(s)) {
-        // Every match is a Cursor CLI chat without a transcript. Say so
-        // instead of claiming nothing matched what the listing just showed.
-        require_readable_transcript(s);
-    }
-    eprintln!("Session not found");
-    std::process::exit(1);
+    session
 }
 
 fn main() {
@@ -394,15 +407,7 @@ fn main() {
             }
         }
         Some(Commands::Inspect { session_id, last }) => {
-            let session = if last {
-                latest_readable_or_exit(&filtered)
-            } else if let Some(sid) = &session_id {
-                resolve_session_or_exit(&sessions, sid)
-            } else {
-                eprintln!("Provide a session ID or use --last");
-                std::process::exit(2);
-            };
-            require_readable_transcript(session);
+            let session = transcript_or_exit(&sessions, &filtered, session_id.as_deref(), last);
             match inspect::inspect_session(session) {
                 Some(info) => display::print_inspect(&info),
                 None => eprintln!("Could not inspect session (transcript may be expired)."),
@@ -414,15 +419,7 @@ fn main() {
             tools,
             plain,
         }) => {
-            let session = if last {
-                latest_readable_or_exit(&filtered)
-            } else if let Some(sid) = &session_id {
-                resolve_session_or_exit(&sessions, sid)
-            } else {
-                eprintln!("Provide a session ID or use --last");
-                std::process::exit(2);
-            };
-            require_readable_transcript(session);
+            let session = transcript_or_exit(&sessions, &filtered, session_id.as_deref(), last);
             let (messages, _) = parse_session(session, false);
             if plain {
                 display::print_plain(&messages);
@@ -431,8 +428,7 @@ fn main() {
             }
         }
         Some(Commands::Export { session_id, output }) => {
-            let session = resolve_session_or_exit(&sessions, &session_id);
-            require_readable_transcript(session);
+            let session = transcript_or_exit(&sessions, &filtered, Some(&session_id), false);
             let (messages, _) = parse_session(session, false);
             if !display::export_transcript(&messages, session, output.as_deref()) {
                 std::process::exit(1);

@@ -2,7 +2,7 @@
 //! only locations and selected metadata, never prompts, tool output, or email.
 
 use crate::session::{Session, mtime_iso, user_home};
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use std::{
     io::Read,
@@ -15,11 +15,8 @@ struct HookRecord {
     transcript_path: Option<String>,
     #[serde(default)]
     workspace_roots: Vec<String>,
-    #[serde(default)]
     model: Option<String>,
-    #[serde(default)]
     model_id: Option<String>,
-    #[serde(default)]
     cursor_version: Option<String>,
 }
 
@@ -90,8 +87,7 @@ fn read_records(db: &Path) -> Vec<HookRecord> {
         return Vec::new();
     }
     let read = || -> rusqlite::Result<Vec<HookRecord>> {
-        let conn = Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-        conn.busy_timeout(std::time::Duration::from_secs(2))?;
+        let conn = crate::cursor_ide::open_ro(db).ok_or(rusqlite::Error::InvalidQuery)?;
         let mut stmt =
             conn.prepare("SELECT metadata FROM transcripts ORDER BY conversation_id, path")?;
         let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
@@ -121,8 +117,10 @@ fn merge_records(sessions: &mut Vec<Session>, records: Vec<HookRecord>) {
         let Some(file) = record.transcript_path else {
             continue;
         };
+        // Only this module writes the registry, after validation; a path
+        // registered before Cursor flushed the file simply waits.
         let path = Path::new(&file);
-        if !transcript_path_supported(path) || !path.is_file() {
+        if !path.is_file() {
             continue;
         }
         let project = record
@@ -168,20 +166,9 @@ fn merge_records(sessions: &mut Vec<Session>, records: Vec<HookRecord>) {
 }
 
 pub(crate) fn registered_model(session: &Session) -> Option<String> {
-    let db = registry_path()?;
-    if !db.is_file() {
-        return None;
-    }
-    let conn = Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
-    conn.busy_timeout(std::time::Duration::from_secs(2)).ok()?;
-    let raw: String = conn
-        .query_row(
-            "SELECT metadata FROM transcripts WHERE conversation_id = ?1 AND path = ?2",
-            [&session.id, &session.file],
-            |row| row.get(0),
-        )
-        .ok()?;
-    let record: HookRecord = serde_json::from_str(&raw).ok()?;
+    let record = read_records(&registry_path()?).into_iter().find(|r| {
+        r.conversation_id == session.id && r.transcript_path.as_deref() == Some(&session.file)
+    })?;
     record
         .model_id
         .filter(|s| !s.is_empty())

@@ -7,7 +7,7 @@ use chrono::{TimeZone, Utc};
 use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 pub fn cursor_user_dir() -> PathBuf {
@@ -33,11 +33,15 @@ fn global_vscdb() -> PathBuf {
     cursor_user_dir().join("globalStorage/state.vscdb")
 }
 
-fn open_ro(path: &Path) -> Option<Connection> {
-    Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).ok()
+/// Read-only SQLite handle that waits briefly on a writer's lock instead of
+/// failing the whole listing while Cursor (or a hook) is mid-write.
+pub(crate) fn open_ro(path: &Path) -> Option<Connection> {
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
+    conn.busy_timeout(std::time::Duration::from_secs(2)).ok()?;
+    Some(conn)
 }
 
-fn ms_iso_date(ms: i64) -> (String, String) {
+pub(crate) fn ms_iso_date(ms: i64) -> (String, String) {
     if ms <= 0 {
         return (String::new(), String::new());
     }
@@ -206,15 +210,10 @@ fn load_bubble_entries(conn: &Connection, composer_id: &str) -> Vec<Value> {
         }
     }
     let mut entries = load_bubbles_range(conn, composer_id);
-    entries.sort_by(|a, b| {
-        let ta = cursor_entry_timestamp(a);
-        let tb = cursor_entry_timestamp(b);
-        match (parse_any_timestamp(&ta), parse_any_timestamp(&tb)) {
-            (Some(a), Some(b)) => a.cmp(&b),
-            (Some(_), None) => std::cmp::Ordering::Less,
-            (None, Some(_)) => std::cmp::Ordering::Greater,
-            (None, None) => std::cmp::Ordering::Equal,
-        }
+    // Timestamped first, in order; untimestamped keep their scan order.
+    entries.sort_by_cached_key(|entry| {
+        let ts = parse_any_timestamp(&cursor_entry_timestamp(entry));
+        (ts.is_none(), ts)
     });
     entries
 }
@@ -330,8 +329,15 @@ fn load_cursor_ide_sessions_from(db: &Path) -> Vec<Session> {
         return Vec::new();
     };
     let mut sessions = Vec::new();
-    let sql = match header_query(&conn) {
-        Ok(sql) => sql,
+    // Required columns identify the supported storage family; the message
+    // table is checked too so header-only rows never masquerade as readable
+    // conversations. Optional header columns vary between Cursor versions and
+    // are read by name below, defaulting when absent.
+    let supported = conn
+        .prepare("SELECT composerId, value FROM composerHeaders LIMIT 0")
+        .and(conn.prepare("SELECT key, value FROM cursorDiskKV LIMIT 0"));
+    let mut stmt = match supported.and(conn.prepare("SELECT * FROM composerHeaders")) {
+        Ok(s) => s,
         Err(reason) => {
             eprintln!(
                 "Warning: unsupported Cursor history database {}: {reason}. Agent transcript files are still searched; check CURSOR_USER_DIR or update chat-history.",
@@ -340,23 +346,16 @@ fn load_cursor_ide_sessions_from(db: &Path) -> Vec<Session> {
             return sessions;
         }
     };
-    let mut stmt = match conn.prepare(&sql) {
-        Ok(s) => s,
-        Err(error) => {
-            eprintln!(
-                "Warning: could not query Cursor history database {}: {error}",
-                db.display()
-            );
-            return sessions;
-        }
+    let optional_int = |row: &rusqlite::Row, name: &str| {
+        row.get::<_, Option<i64>>(name).ok().flatten().unwrap_or(0)
     };
     let rows = stmt.query_map([], |row| {
         Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, Option<i64>>(1)?.unwrap_or(0),
-            row.get::<_, Option<i64>>(2)?.unwrap_or(0),
-            row.get::<_, i64>(3).unwrap_or(0) != 0,
-            blob_text(row.get_ref(4)?),
+            row.get::<_, String>("composerId")?,
+            optional_int(row, "createdAt"),
+            optional_int(row, "lastUpdatedAt"),
+            optional_int(row, "isSubagent") != 0,
+            blob_text(row.get_ref("value")?),
         ))
     });
     let Ok(rows) = rows else {
@@ -431,43 +430,6 @@ fn load_cursor_ide_sessions_from(db: &Path) -> Vec<Session> {
     sessions
 }
 
-/// Required fields identify the supported storage family. Optional header
-/// columns vary between versions; tolerate their absence without guessing at
-/// another transcript schema.
-fn header_query(conn: &Connection) -> Result<String, String> {
-    let mut stmt = conn
-        .prepare("PRAGMA table_info(composerHeaders)")
-        .map_err(|e| e.to_string())?;
-    let columns = stmt
-        .query_map([], |row| row.get::<_, String>(1))
-        .map_err(|e| e.to_string())?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| e.to_string())?;
-    if !["composerId", "value"]
-        .iter()
-        .all(|c| columns.iter().any(|v| v == c))
-    {
-        return Err("composerHeaders must contain composerId and value".into());
-    }
-    // Also verify the message table so header-only rows do not silently
-    // masquerade as readable conversations.
-    conn.prepare("SELECT key, value FROM cursorDiskKV LIMIT 0")
-        .map_err(|e| e.to_string())?;
-    let optional = |name: &str| {
-        if columns.iter().any(|c| c == name) {
-            name.to_owned()
-        } else {
-            "NULL".into()
-        }
-    };
-    Ok(format!(
-        "SELECT composerId, {}, {}, {}, value FROM composerHeaders",
-        optional("createdAt"),
-        optional("lastUpdatedAt"),
-        optional("isSubagent")
-    ))
-}
-
 /// Enrich only unambiguous matches. Do not reorder, replace, or drop transcript
 /// content, and never turn a session timestamp into a message timestamp.
 pub fn enrich_transcript_timestamps(session: &Session, messages: &mut [Message]) {
@@ -478,70 +440,25 @@ pub fn enrich_transcript_timestamps(session: &Session, messages: &mut [Message])
     if !db.is_file() {
         return;
     }
-    // Deep search enriches many sessions from a rayon pool. Keep one
+    // Deep search enriches many sessions from a rayon pool: keep one
     // read-only connection per worker thread instead of reopening the
-    // (multi-GB) database for every transcript, and skip composers the
-    // database has never heard of without touching cursorDiskKV.
+    // (multi-GB) database for every transcript. The bubbles come from the
+    // same loader the IDE reader uses, so every bubble the sidebar shows is
+    // a candidate here too, including ones whose `type` only the
+    // conversation headers carry.
     ENRICH_SOURCE.with(|cell| {
         let mut slot = cell.borrow_mut();
-        if slot.as_ref().is_none_or(|source| source.path != db) {
-            let Some(conn) = open_ro(&db) else {
-                return;
-            };
-            let _ = conn.busy_timeout(std::time::Duration::from_secs(2));
-            let composers = known_composer_ids(&conn);
-            *slot = Some(EnrichSource {
-                path: db.clone(),
-                conn,
-                composers,
-            });
+        if slot.as_ref().is_none_or(|(path, _)| *path != db) {
+            *slot = open_ro(&db).map(|conn| (db.clone(), conn));
         }
-        let Some(source) = slot.as_ref() else {
-            return;
-        };
-        if !source.composers.contains(&session.id.to_ascii_lowercase()) {
-            return;
+        if let Some((_, conn)) = slot.as_ref() {
+            merge_message_timestamps(messages, &load_bubbles_as_messages(conn, session));
         }
-        enrich_from(&source.conn, session, messages);
     });
 }
 
-fn enrich_from(conn: &Connection, session: &Session, messages: &mut [Message]) {
-    // The same loader the IDE reader uses, so every bubble the sidebar
-    // shows is a candidate here too (including ones whose `type` only the
-    // conversation headers carry). A range-only shortcut measured no
-    // faster and silently dropped those.
-    let bubbles = load_bubbles_as_messages(conn, session);
-    merge_message_timestamps(messages, &bubbles);
-}
-
-struct EnrichSource {
-    path: PathBuf,
-    conn: Connection,
-    composers: HashSet<String>,
-}
-
 thread_local! {
-    static ENRICH_SOURCE: RefCell<Option<EnrichSource>> = const { RefCell::new(None) };
-}
-
-/// Composer ids with a header or a `composerData:` record. Headers can be
-/// pruned while message data remains, so both sources count.
-fn known_composer_ids(conn: &Connection) -> HashSet<String> {
-    let mut ids = HashSet::new();
-    for sql in [
-        "SELECT composerId FROM composerHeaders",
-        "SELECT substr(key, 14) FROM cursorDiskKV WHERE key >= 'composerData:' AND key < 'composerData;'",
-    ] {
-        let Ok(mut stmt) = conn.prepare(sql) else {
-            continue;
-        };
-        let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(0)) else {
-            continue;
-        };
-        ids.extend(rows.flatten().map(|id| id.to_ascii_lowercase()));
-    }
-    ids
+    static ENRICH_SOURCE: RefCell<Option<(PathBuf, Connection)>> = const { RefCell::new(None) };
 }
 
 fn merge_message_timestamps(messages: &mut [Message], bubbles: &[Message]) {
@@ -932,7 +849,10 @@ mod tests {
             m.timestamp.clear();
             m.uuid.clear();
         }
-        enrich_from(&conn, &sessions[0], &mut messages);
+        merge_message_timestamps(
+            &mut messages,
+            &load_bubbles_as_messages(&conn, &sessions[0]),
+        );
         assert_eq!(messages[0].timestamp, "2026-07-01T21:25:09.594Z");
         assert_eq!(messages[1].timestamp, "2026-07-01T21:30:00.000Z");
     }

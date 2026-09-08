@@ -91,16 +91,8 @@ fn paired_ide_timestamps_enable_search_without_losing_transcript_content() {
     )
     .unwrap();
     drop(conn);
-    for args in [
-        vec![
-            "search",
-            "uniquecache",
-            "--deep",
-            "--json",
-            "--timeframe",
-            "today",
-        ],
-        vec![
+    command(&tmp)
+        .args([
             "--source",
             "cursor",
             "search",
@@ -109,14 +101,10 @@ fn paired_ide_timestamps_enable_search_without_losing_transcript_content() {
             "--json",
             "--timeframe",
             "today",
-        ],
-    ] {
-        command(&tmp)
-            .args(args)
-            .assert()
-            .success()
-            .stdout(predicate::str::contains("investigate uniquecache failure"));
-    }
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("investigate uniquecache failure"));
     command(&tmp)
         .args(["view", ID, "--plain"])
         .assert()

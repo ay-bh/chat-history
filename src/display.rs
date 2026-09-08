@@ -360,20 +360,15 @@ pub fn print_search_results(results: &[SearchResult], query: &str) {
     }
 }
 
-fn mark_metadata_only(item: &mut serde_json::Value, session: &Session) {
-    if session.is_cursor_store_only() {
-        item["metadata_only"] = serde_json::json!(true);
-    }
-}
-
 pub fn print_search_results_json(results: &[SearchResult], query: &str) {
     let items: Vec<serde_json::Value> = results
         .iter()
         .map(|r| {
-            let mut item = serde_json::json!({
+            serde_json::json!({
                 "session_id": r.session.id,
                 "source": r.session.source,
                 "also_ide": r.session.also_ide,
+                "metadata_only": r.session.is_cursor_store_only(),
                 "date": r.session.date,
                 "summary": r.session.summary,
                 "project": r.session.project,
@@ -382,9 +377,7 @@ pub fn print_search_results_json(results: &[SearchResult], query: &str) {
                 "snippet": snippet_around_match(&r.message.content, query, 300),
                 "tools": r.message.tool_uses,
                 "files": r.message.files_referenced,
-            });
-            mark_metadata_only(&mut item, &r.session);
-            item
+            })
         })
         .collect();
     let out = serde_json::json!({ "query": query, "count": items.len(), "results": items });
@@ -395,19 +388,18 @@ pub fn print_index_results_json(results: &[IndexResult], query: &str) {
     let items: Vec<serde_json::Value> = results
         .iter()
         .map(|r| {
-            let mut item = serde_json::json!({
+            serde_json::json!({
                 "session_id": r.session.id,
                 "source": r.session.source,
                 "also_ide": r.session.also_ide,
+                "metadata_only": r.session.is_cursor_store_only(),
                 "date": r.session.date,
                 "summary": r.session.summary,
                 "project": r.session.project,
                 "score": (r.score * 10.0).round() / 10.0,
                 "matched_field": r.matched_field,
                 "snippet": clean_prompt(&r.display).chars().take(200).collect::<String>(),
-            });
-            mark_metadata_only(&mut item, &r.session);
-            item
+            })
         })
         .collect();
     let out = serde_json::json!({ "query": query, "count": items.len(), "results": items, "search_type": "index" });

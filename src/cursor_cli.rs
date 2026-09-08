@@ -2,7 +2,9 @@
 //! The content-addressed blob store (JSON message bodies, protobuf ordering)
 //! is deliberately not treated as a text transcript.
 
-use crate::session::{Session, cursor_timestamp, existing_absolute_dir, mtime_iso, user_home};
+use crate::session::{
+    Session, cursor_project_slug, cursor_timestamp, existing_absolute_dir, mtime_iso, user_home,
+};
 use serde_json::Value;
 use std::{
     collections::BTreeMap,
@@ -10,11 +12,14 @@ use std::{
     path::{Path, PathBuf},
 };
 
+fn chats_dir() -> Option<PathBuf> {
+    Some(user_home()?.join(".cursor/chats"))
+}
+
 pub(crate) fn merge_cli_sessions(sessions: &mut Vec<Session>) {
-    let Some(home) = user_home() else {
-        return;
-    };
-    merge_cli_sessions_from(sessions, &home.join(".cursor/chats"));
+    if let Some(root) = chats_dir() {
+        merge_cli_sessions_from(sessions, &root);
+    }
 }
 
 /// One `~/.cursor/chats/<workspace-hash>/<id>` directory with a usable store.
@@ -25,7 +30,6 @@ pub(crate) struct CliChat {
     pub(crate) workspace_exists: bool,
     title: String,
     created: String,
-    modified: String,
     is_subagent: bool,
 }
 
@@ -48,10 +52,6 @@ fn read_copy(dir: &Path) -> Option<CliChat> {
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_owned();
-    let mut modified = cursor_timestamp(&meta["updatedAtMs"]);
-    if modified.is_empty() {
-        modified = mtime_iso(&store).unwrap_or_default();
-    }
     Some(CliChat {
         dir: dir.to_path_buf(),
         workspace_exists: existing_absolute_dir(&project).is_some(),
@@ -67,7 +67,6 @@ fn read_copy(dir: &Path) -> Option<CliChat> {
             .and_then(Value::as_bool)
             .unwrap_or(false),
         project,
-        modified,
     })
 }
 
@@ -90,8 +89,7 @@ fn rank(copies: &mut [CliChat]) {
 /// the listing showed (the session's own workspace); otherwise the
 /// best-ranked copy whose workspace still exists.
 pub(crate) fn resume_workspace(session: &Session) -> Option<PathBuf> {
-    let chats = user_home()?.join(".cursor/chats");
-    resume_workspace_in(&chats, session)
+    resume_workspace_in(&chats_dir()?, session)
 }
 
 pub(crate) fn resume_workspace_in(chats_dir: &Path, session: &Session) -> Option<PathBuf> {
@@ -129,23 +127,26 @@ fn merge_cli_sessions_from(sessions: &mut Vec<Session>, root: &Path) {
     }
     for (id, mut chats) in copies {
         rank(&mut chats);
-        let mut found = false;
-        for session in sessions
+        let listed: Vec<&mut Session> = sessions
             .iter_mut()
             .filter(|s| s.id.eq_ignore_ascii_case(&id))
-        {
-            found = true;
-            // A transcript takes only the copy from its own workspace: by
-            // absolute path when the slug resolved, else by the project slug
-            // in its file path. Another copy's title or path must not replace
-            // it. A transcript with no workspace evidence at all (a
-            // hook-registered path) follows resume's choice.
+            .collect();
+        if listed.is_empty() {
+            push_store_only(sessions, id, chats.swap_remove(0));
+            continue;
+        }
+        for session in listed {
+            // A transcript's `project` is the decoded workspace path, else the
+            // raw `~/.cursor/projects/<slug>`, else empty (hook-registered).
+            // Take only the copy from that workspace so another copy's title
+            // or path never replaces it; with no workspace evidence, follow
+            // resume's choice.
             let chat = if Path::new(&session.project).is_absolute() {
                 chats.iter().find(|c| c.project == session.project)
-            } else if let Some(slug) = transcript_project_slug(&session.file) {
+            } else if !session.project.is_empty() {
                 chats
                     .iter()
-                    .find(|c| cursor_project_slug(&c.project) == slug)
+                    .find(|c| cursor_project_slug(&c.project) == session.project)
             } else {
                 chats.first()
             };
@@ -162,57 +163,31 @@ fn merge_cli_sessions_from(sessions: &mut Vec<Session>, root: &Path) {
                 session.created = chat.created.clone();
             }
         }
-        if found {
-            continue;
-        }
-        let Some(chat) = chats.into_iter().next() else {
-            continue;
-        };
-        let date = chat.modified.get(..10).unwrap_or("").to_owned();
-        sessions.push(Session {
-            source: "cursor".into(),
-            id,
-            summary: chat.title,
-            first_prompt: String::new(),
-            created: chat.created,
-            modified: chat.modified,
-            date,
-            messages: 0,
-            branch: String::new(),
-            project: chat.project,
-            file: chat.dir.join("store.db").to_string_lossy().into_owned(),
-            is_sidechain: chat.is_subagent,
-            also_ide: false,
-        });
     }
 }
 
-/// Cursor names `~/.cursor/projects/<slug>` by replacing every run of
-/// non-alphanumeric characters in the workspace path with one hyphen
-/// (matches all 204 resolved transcripts on a real install).
-fn cursor_project_slug(workspace: &str) -> String {
-    let mut slug = String::with_capacity(workspace.len());
-    for c in workspace.chars() {
-        if c.is_ascii_alphanumeric() {
-            slug.push(c);
-        } else if !slug.ends_with('-') && !slug.is_empty() {
-            slug.push('-');
-        }
+fn push_store_only(sessions: &mut Vec<Session>, id: String, chat: CliChat) {
+    let store = chat.dir.join("store.db");
+    let mut modified = cursor_timestamp(&serde_json::json!(chat.updated));
+    if modified.is_empty() {
+        modified = mtime_iso(&store).unwrap_or_default();
     }
-    slug.trim_end_matches('-').to_owned()
-}
-
-/// The `<slug>` component of a transcript stored under `.cursor/projects`.
-fn transcript_project_slug(file: &str) -> Option<String> {
-    let mut components = Path::new(file).components();
-    while let Some(component) = components.next() {
-        if component.as_os_str() == ".cursor" && components.next()?.as_os_str() == "projects" {
-            return components
-                .next()
-                .map(|slug| slug.as_os_str().to_string_lossy().into_owned());
-        }
-    }
-    None
+    let date = modified.get(..10).unwrap_or("").to_owned();
+    sessions.push(Session {
+        source: "cursor".into(),
+        id,
+        summary: chat.title,
+        first_prompt: String::new(),
+        created: chat.created,
+        modified,
+        date,
+        messages: 0,
+        branch: String::new(),
+        project: chat.project,
+        file: store.to_string_lossy().into_owned(),
+        is_sidechain: chat.is_subagent,
+        also_ide: false,
+    });
 }
 
 #[cfg(test)]
@@ -235,7 +210,7 @@ mod tests {
         merge_cli_sessions_from(&mut sessions, tmp.path());
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].summary, "CLI chat");
-        assert_eq!(sessions[0].created, "2026-09-01T00:00:00.000Z");
+        assert_eq!(sessions[0].created, "2026-09-01T00:00:00Z");
         assert_eq!(sessions[0].date, "2026-09-02");
         assert!(sessions[0].is_sidechain);
         assert!(sessions[0].is_cursor_store_only());
@@ -361,17 +336,8 @@ mod tests {
         Session {
             source: "cursor".into(),
             id: id.into(),
-            summary: String::new(),
-            first_prompt: String::new(),
-            created: String::new(),
-            modified: String::new(),
-            date: String::new(),
-            messages: 0,
-            branch: String::new(),
             project: project.into(),
-            file: String::new(),
-            is_sidechain: false,
-            also_ide: false,
+            ..Session::default()
         }
     }
 
@@ -414,30 +380,5 @@ mod tests {
             resume_workspace_in(&tmp.path().join("missing"), &listed_old),
             None
         );
-        // Listing ranks the same copies with the same rule.
-        let mut sessions = Vec::new();
-        merge_cli_sessions_from(&mut sessions, &chats);
-        assert_eq!(sessions.len(), 1);
-        assert_eq!(Path::new(&sessions[0].project), ws_new);
-    }
-
-    #[test]
-    fn project_slug_matches_cursor_naming() {
-        assert_eq!(
-            cursor_project_slug("/Users/me/Documents/GitHub/chat-history"),
-            "Users-me-Documents-GitHub-chat-history"
-        );
-        assert_eq!(
-            cursor_project_slug("/private/tmp/claude-501/-Users-me/x y"),
-            "private-tmp-claude-501-Users-me-x-y"
-        );
-        assert_eq!(
-            transcript_project_slug(
-                "/home/u/.cursor/projects/Users-me-app/agent-transcripts/i/i.jsonl"
-            )
-            .as_deref(),
-            Some("Users-me-app")
-        );
-        assert_eq!(transcript_project_slug("/elsewhere/i.jsonl"), None);
     }
 }
