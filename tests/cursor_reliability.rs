@@ -153,32 +153,27 @@ fn resume_explains_a_missing_workspace_instead_of_the_sidebar_hint() {
 }
 
 #[test]
-fn unsupported_meta_schema_is_skipped_in_listing_but_still_resumes() {
+fn unsupported_meta_schema_warns_and_is_used_anyway() {
     let tmp = TempDir::new().unwrap();
-    transcript(&tmp, false);
     cli_store_with(
         &tmp,
         "h",
         json!({"schemaVersion":2, "cwd":tmp.path(), "title":"schema two",
         "createdAtMs":1788220800000i64, "updatedAtMs":1788307200000i64, "hasConversation":true}),
     );
-    // Listing warns once and does not use the store's metadata...
     command(&tmp)
         .args(["--source", "cursor"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("investigate uniquecache failure"))
-        .stdout(predicate::str::contains("schema two").not())
+        .stdout(predicate::str::contains("schema two"))
         .stderr(predicate::str::contains("schemaVersion 2"));
-    // ...but resume only needs the recorded workspace, which still exists.
     let path = agent_shim(&tmp);
     command(&tmp)
         .args(["resume", ID])
         .env("PATH", &path)
         .assert()
         .success()
-        .stdout(predicate::str::contains("SHIM workspace:"))
-        .stderr(predicate::str::contains("schemaVersion 2"));
+        .stdout(predicate::str::contains("SHIM workspace:"));
 }
 
 #[test]
@@ -270,7 +265,7 @@ fn cli_chat_indexed_by_the_ide_still_resumes() {
 }
 
 #[test]
-fn metadata_only_rows_never_match_a_timeframe_search() {
+fn metadata_only_rows_match_a_timeframe_search_by_activity_time() {
     let tmp = TempDir::new().unwrap();
     let now = chrono::Utc::now().timestamp_millis();
     cli_store_with(
@@ -279,13 +274,7 @@ fn metadata_only_rows_never_match_a_timeframe_search() {
         json!({"schemaVersion":1, "cwd":tmp.path(), "title":"discovery probe title",
         "createdAtMs":now - 1000, "updatedAtMs":now, "hasConversation":true}),
     );
-    // Findable by title without a message-time filter...
-    command(&tmp)
-        .args(["search", "discovery probe", "--deep", "--json"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains(ID));
-    // ...but a session/file time is never a message time.
+    // The title entry carries Cursor's own activity time, like every source.
     command(&tmp)
         .args([
             "search",
@@ -297,7 +286,8 @@ fn metadata_only_rows_never_match_a_timeframe_search() {
         ])
         .assert()
         .success()
-        .stdout(predicate::str::contains(ID).not());
+        .stdout(predicate::str::contains(ID))
+        .stdout(predicate::str::contains("\"metadata_only\": true"));
 }
 
 #[test]
@@ -393,7 +383,7 @@ fn uuid_lookup_respects_timeframe() {
             .success()
             .stdout(predicate::str::contains(hit.as_str()));
     }
-    // No message times: found by id, but not once a window is requested.
+    // No message times: found by id, but not once a window is requested...
     let tmp = TempDir::new().unwrap();
     transcript(&tmp, false);
     command(&tmp)
@@ -406,6 +396,27 @@ fn uuid_lookup_respects_timeframe() {
         .assert()
         .success()
         .stdout(predicate::str::contains(hit.as_str()).not());
+    // ...unless a recent conversation quotes the id: content search still runs.
+    let other = "11111111-2222-4000-8000-333333333333";
+    let recent = tmp.path().join(format!(
+        ".cursor/projects/w/agent-transcripts/{other}/{other}.jsonl"
+    ));
+    fs::create_dir_all(recent.parent().unwrap()).unwrap();
+    fs::write(
+        &recent,
+        json!({"role":"user", "timestamp": chrono::Utc::now().to_rfc3339(),
+        "message":{"content": format!("please look at session {ID}")}})
+        .to_string()
+            + "\n",
+    )
+    .unwrap();
+    command(&tmp)
+        .args(["search", ID, "--deep", "--json", "--timeframe", "today"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            format!("\"session_id\": \"{other}\"").as_str(),
+        ));
 }
 
 #[test]

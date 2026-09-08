@@ -186,30 +186,31 @@ pub fn scored_search(
                 message: msg,
             }];
         }
-        if tf_cutoff.is_some() {
-            return Vec::new();
+        if tf_cutoff.is_none() {
+            let stub = Message {
+                uuid: String::new(),
+                timestamp: String::new(),
+                role: "user".into(),
+                content: if !s.summary.is_empty() {
+                    s.summary.clone()
+                } else {
+                    s.first_prompt.clone()
+                },
+                session_id: s.id.clone(),
+                project_path: s.project.clone(),
+                tool_uses: Vec::new(),
+                files_referenced: Vec::new(),
+                error_patterns: Vec::new(),
+                relevance_score: 0.0,
+                final_score: 100.0,
+            };
+            return vec![SearchResult {
+                session: s.clone(),
+                message: stub,
+            }];
         }
-        let stub = Message {
-            uuid: String::new(),
-            timestamp: String::new(),
-            role: "user".into(),
-            content: if !s.summary.is_empty() {
-                s.summary.clone()
-            } else {
-                s.first_prompt.clone()
-            },
-            session_id: s.id.clone(),
-            project_path: s.project.clone(),
-            tool_uses: Vec::new(),
-            files_referenced: Vec::new(),
-            error_patterns: Vec::new(),
-            relevance_score: 0.0,
-            final_score: 100.0,
-        };
-        return vec![SearchResult {
-            session: s.clone(),
-            message: stub,
-        }];
+        // With a window and no in-window message, content search may still
+        // find the id quoted in another, recent conversation.
     }
 
     let boosts = semantic_boosts(query);
@@ -266,11 +267,10 @@ pub fn scored_search(
                     0,
                     Message {
                         uuid: "index-title".into(),
-                        // A store-only row has no message times; its session
-                        // time must not admit it to a --timeframe search.
-                        timestamp: if s.is_cursor_store_only() {
-                            String::new()
-                        } else if s.modified.is_empty() {
+                        // The title entry carries the session's activity time
+                        // for every source (Cursor's own updatedAtMs for CLI
+                        // stores); message times come from the transcript.
+                        timestamp: if s.modified.is_empty() {
                             s.created.clone()
                         } else {
                             s.modified.clone()

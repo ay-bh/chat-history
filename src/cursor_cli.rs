@@ -57,7 +57,7 @@ fn read_copy(dir: &Path) -> Result<CliChat, Skip> {
     // but resume only needs `cwd`, which existing_absolute_dir still guards.
     let schema = meta.get("schemaVersion").and_then(Value::as_u64);
     let unsupported_schema =
-        (schema != Some(1)).then(|| schema.map_or("missing".to_owned(), |v| v.to_string()));
+        (schema != Some(1)).then(|| schema.map_or("(none)".to_owned(), |v| v.to_string()));
     if meta.get("hasConversation").and_then(Value::as_bool) == Some(false) {
         return Err(Skip::Empty);
     }
@@ -121,9 +121,11 @@ fn unresumable_reason_in(chats_dir: &Path, session: &Session) -> Option<String> 
 
 /// Two spellings of one directory (symlinks, `/private/tmp` vs `/tmp`).
 pub fn same_workspace(a: &str, b: &str) -> bool {
+    // A relative value is an undecoded Cursor slug; it must never resolve
+    // against the current directory.
     a == b
-        || (!a.is_empty()
-            && !b.is_empty()
+        || (Path::new(a).is_absolute()
+            && Path::new(b).is_absolute()
             && fs::canonicalize(a)
                 .ok()
                 .is_some_and(|a| fs::canonicalize(b).ok() == Some(a)))
@@ -163,11 +165,6 @@ pub(crate) fn resume_workspace_in(chats_dir: &Path, session: &Session) -> Option
         .iter()
         .find(|copy| same_workspace(&copy.project, &session.project))
         .or(copies.first())?;
-    if let Some(v) = &chosen.unsupported_schema {
-        eprintln!(
-            "Warning: this chat's meta.json has schemaVersion {v} (this version supports 1); resuming from its recorded workspace anyway. Update chat-history."
-        );
-    }
     Some(PathBuf::from(&chosen.project))
 }
 
@@ -182,25 +179,24 @@ fn merge_cli_sessions_from(sessions: &mut Vec<Session>, root: &Path) {
             continue;
         };
         for chat in chats.flatten() {
-            match read_copy(&chat.path()) {
-                Ok(copy) if copy.unsupported_schema.is_some() => {
-                    let v = copy.unsupported_schema.unwrap_or_default();
-                    if !unsupported.contains(&v) {
-                        unsupported.push(v);
-                    }
+            if let Ok(copy) = read_copy(&chat.path()) {
+                if let Some(v) = &copy.unsupported_schema
+                    && !unsupported.contains(v)
+                {
+                    unsupported.push(v.clone());
                 }
-                Ok(copy) => copies
+                copies
                     .entry(chat.file_name().to_string_lossy().into_owned())
                     .or_default()
-                    .push(copy),
-                Err(_) => {}
+                    .push(copy);
             }
         }
     }
     if !unsupported.is_empty() {
-        // Distinguish "this version cannot read your chats" from "no chats".
+        // Every field is read defensively, so use the stores anyway; say so,
+        // since a newer Cursor may have changed what they mean.
         eprintln!(
-            "Warning: skipped Cursor CLI chat stores under {} with meta.json schemaVersion {} (this version supports 1); update chat-history.",
+            "Warning: Cursor CLI chat stores under {} have meta.json schemaVersion {} (this version was written for 1); using them anyway. Update chat-history if their titles or times look wrong.",
             root.display(),
             unsupported.join(", ")
         );
@@ -440,6 +436,17 @@ mod tests {
         );
         assert!(!reason.contains("workspace  no"), "{reason}");
         assert!(unresumable_reason_in(&chats, &session_for("other", "")).is_none());
+    }
+
+    #[test]
+    fn a_relative_slug_never_resolves_against_the_current_directory() {
+        // `src` exists relative to the package root where tests run.
+        let here = std::env::current_dir().unwrap().join("src");
+        assert!(!same_workspace("src", here.to_str().unwrap()));
+        assert!(same_workspace(
+            here.to_str().unwrap(),
+            here.to_str().unwrap()
+        ));
     }
 
     #[test]

@@ -244,7 +244,7 @@ fn transcript_or_exit<'a>(
         // it, instead of claiming nothing matched what the listing showed.
         let (readable, any) = (newest(true), newest(false));
         if let (Some(r), Some(a)) = (readable, any)
-            && !std::ptr::eq(r, a)
+            && session::recency_key(a) > session::recency_key(r)
         {
             eprintln!(
                 "Note: skipped newer Cursor CLI session {} (metadata only, no transcript)",
@@ -273,7 +273,7 @@ fn transcript_or_exit<'a>(
             ),
         };
         eprintln!(
-            "Only metadata is available for Cursor CLI session {}. Its store.db format is not a readable transcript. {reopen} Enable the optional cursor-hook for future transcript discovery.",
+            "Only metadata is available for Cursor CLI session {}. Its store.db format is not a readable transcript. {reopen}",
             session.id
         );
         std::process::exit(1);
