@@ -3,7 +3,6 @@
 
 use crate::parser::{clean_first_prompt, extract_text, is_clear_metadata, is_warmup_message};
 use crate::session::{Message, Session, cursor_entry_timestamp, parse_any_timestamp, user_home};
-use chrono::{TimeZone, Utc};
 use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
 use std::cell::RefCell;
@@ -42,16 +41,9 @@ pub(crate) fn open_ro(path: &Path) -> Option<Connection> {
 }
 
 pub(crate) fn ms_iso_date(ms: i64) -> (String, String) {
-    if ms <= 0 {
-        return (String::new(), String::new());
-    }
-    let Some(dt) = Utc.timestamp_millis_opt(ms).single() else {
-        return (String::new(), String::new());
-    };
-    (
-        dt.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
-        dt.format("%Y-%m-%d").to_string(),
-    )
+    let iso = crate::session::ms_to_iso(ms);
+    let date = iso.get(..10).unwrap_or("").to_owned();
+    (iso, date)
 }
 
 pub fn workspace_path(value: &Value) -> String {

@@ -82,25 +82,32 @@ fn transcript_path_supported(path: &Path) -> bool {
         )
 }
 
-fn read_records(db: &Path) -> Vec<HookRecord> {
+fn read_records(db: &Path, warn: bool) -> Vec<HookRecord> {
     if !db.is_file() {
         return Vec::new();
     }
-    let read = || -> rusqlite::Result<Vec<HookRecord>> {
-        let conn = crate::cursor_ide::open_ro(db).ok_or(rusqlite::Error::InvalidQuery)?;
-        let mut stmt =
-            conn.prepare("SELECT metadata FROM transcripts ORDER BY conversation_id, path")?;
-        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    let read = || -> Result<Vec<HookRecord>, String> {
+        let conn = crate::cursor_ide::open_ro(db)
+            .ok_or("cannot open it (permissions, or a lock held longer than 2s)")?;
+        let mut stmt = conn
+            .prepare("SELECT metadata FROM transcripts ORDER BY conversation_id, path")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| e.to_string())?;
         Ok(rows
             .filter_map(Result::ok)
             .filter_map(|raw| serde_json::from_str(&raw).ok())
             .collect())
     };
     read().unwrap_or_else(|error| {
-        eprintln!(
-            "Warning: cannot read Cursor hook registry {}: {error}",
-            db.display()
-        );
+        // The listing already warned; a later lookup stays quiet.
+        if warn {
+            eprintln!(
+                "Warning: cannot read Cursor hook registry {}: {error}",
+                db.display()
+            );
+        }
         Vec::new()
     })
 }
@@ -109,7 +116,7 @@ pub(crate) fn merge_registered_transcripts(sessions: &mut Vec<Session>) {
     let Some(db) = registry_path() else {
         return;
     };
-    merge_records(sessions, read_records(&db));
+    merge_records(sessions, read_records(&db, true));
 }
 
 /// The transcript a registration refers to, as the scanner would list it: a
@@ -192,13 +199,12 @@ pub(crate) fn registered_model(session: &Session) -> Option<String> {
 }
 
 fn registered_model_in(db: &Path, session: &Session) -> Option<String> {
-    let listed =
-        std::fs::canonicalize(&session.file).unwrap_or_else(|_| PathBuf::from(&session.file));
-    let record = read_records(db).into_iter().find(|r| {
-        r.conversation_id == session.id
+    // The same "this registration is the listed transcript" rule as merge.
+    let record = read_records(db, false).into_iter().find(|r| {
+        r.conversation_id.eq_ignore_ascii_case(&session.id)
             && r.transcript_path
                 .as_deref()
-                .is_some_and(|p| registered_file(Path::new(p)) == listed)
+                .is_some_and(|p| same_transcript(&session.file, &registered_file(Path::new(p))))
     })?;
     record
         .model_id
@@ -241,15 +247,15 @@ mod tests {
         record_hook_at(event.to_string().as_bytes(), &db).unwrap();
         record_hook_at(event.to_string().as_bytes(), &db).unwrap();
         let mut sessions = Vec::new();
-        merge_records(&mut sessions, read_records(&db));
+        merge_records(&mut sessions, read_records(&db, true));
         assert!(sessions.is_empty());
         std::fs::write(
             &file,
             "{\"role\":\"user\",\"message\":{\"content\":\"find my history\"}}\n",
         )
         .unwrap();
-        merge_records(&mut sessions, read_records(&db));
-        merge_records(&mut sessions, read_records(&db));
+        merge_records(&mut sessions, read_records(&db, true));
+        merge_records(&mut sessions, read_records(&db, true));
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].first_prompt, "find my history");
         let conn = Connection::open(&db).unwrap();
@@ -294,7 +300,7 @@ mod tests {
             record_hook_at(event.to_string().as_bytes(), &db).unwrap();
         }
         let mut sessions = vec![listed(&jsonl)];
-        merge_records(&mut sessions, read_records(&db));
+        merge_records(&mut sessions, read_records(&db, true));
         assert_eq!(
             sessions.len(),
             1,
@@ -324,11 +330,11 @@ mod tests {
             record_hook_at(event.to_string().as_bytes(), &db).unwrap();
         }
         let mut sessions = Vec::new();
-        merge_records(&mut sessions, read_records(&db));
+        merge_records(&mut sessions, read_records(&db, true));
         let prompts: Vec<&str> = sessions.iter().map(|s| s.first_prompt.as_str()).collect();
         assert!(prompts.contains(&"new question"), "{prompts:?}");
         assert!(prompts.contains(&"old question"), "{prompts:?}");
-        merge_records(&mut sessions, read_records(&db));
+        merge_records(&mut sessions, read_records(&db, true));
         assert_eq!(sessions.len(), 2, "re-merging must not duplicate");
     }
 }

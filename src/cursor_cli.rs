@@ -85,12 +85,25 @@ fn read_copy(dir: &Path) -> Result<CliChat, Skip> {
 /// Why `resume` cannot open this session's CLI chat even though a store for
 /// it exists; None when there is no store at all (or a usable one exists).
 pub fn unresumable_reason(session: &Session) -> Option<String> {
-    let (mut gone, mut schemas, mut empty) = (Vec::new(), Vec::new(), false);
-    for workspace in fs::read_dir(chats_dir()?).ok()?.flatten() {
+    unresumable_reason_in(&chats_dir()?, session)
+}
+
+fn unresumable_reason_in(chats_dir: &Path, session: &Session) -> Option<String> {
+    let (mut gone, mut schemas, mut blank, mut empty) = (Vec::new(), Vec::new(), false, false);
+    let note = |list: &mut Vec<String>, v: String| {
+        if !list.contains(&v) {
+            list.push(v);
+        }
+    };
+    for workspace in fs::read_dir(chats_dir).ok()?.flatten() {
         match read_copy(&workspace.path().join(&session.id)) {
-            Ok(copy) if !copy.workspace_exists => gone.push(copy.project),
-            Ok(_) => return None,
-            Err(Skip::Schema(v)) => schemas.push(v.map_or("missing".to_owned(), |v| v.to_string())),
+            Ok(copy) if copy.workspace_exists => return None,
+            Ok(copy) if copy.project.is_empty() => blank = true,
+            Ok(copy) => note(&mut gone, copy.project),
+            Err(Skip::Schema(v)) => note(
+                &mut schemas,
+                v.map_or("missing".to_owned(), |v| v.to_string()),
+            ),
             Err(Skip::Empty) => empty = true,
             Err(_) => {}
         }
@@ -107,7 +120,20 @@ pub fn unresumable_reason(session: &Session) -> Option<String> {
             schemas.join(", ")
         ));
     }
+    if blank {
+        return Some("its meta.json records no workspace directory.".to_owned());
+    }
     empty.then(|| "Cursor recorded it as an empty conversation.".to_owned())
+}
+
+/// Two spellings of one directory (symlinks, `/private/tmp` vs `/tmp`).
+fn same_workspace(a: &str, b: &str) -> bool {
+    a == b
+        || (!a.is_empty()
+            && !b.is_empty()
+            && fs::canonicalize(a)
+                .ok()
+                .is_some_and(|a| fs::canonicalize(b).ok() == Some(a)))
 }
 
 /// The same chat resumed from another directory gets a second copy. Rank
@@ -142,7 +168,7 @@ pub(crate) fn resume_workspace_in(chats_dir: &Path, session: &Session) -> Option
     rank(&mut copies);
     copies
         .iter()
-        .find(|copy| copy.project == session.project)
+        .find(|copy| same_workspace(&copy.project, &session.project))
         .or(copies.first())
         .map(|copy| PathBuf::from(&copy.project))
 }
@@ -198,7 +224,9 @@ fn merge_cli_sessions_from(sessions: &mut Vec<Session>, root: &Path) {
             // or path never replaces it; with no workspace evidence, follow
             // resume's choice.
             let chat = if Path::new(&session.project).is_absolute() {
-                chats.iter().find(|c| c.project == session.project)
+                chats
+                    .iter()
+                    .find(|c| same_workspace(&c.project, &session.project))
             } else if !session.project.is_empty() {
                 chats
                     .iter()
@@ -395,6 +423,42 @@ mod tests {
             project: project.into(),
             ..Session::default()
         }
+    }
+
+    #[test]
+    fn unresumable_reason_skips_blank_workspaces_and_repeats() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let chats = tmp.path().join("chats");
+        let id = "dup-id";
+        let gone = tmp.path().join("gone");
+        write_copy(&chats, "a", id, "", &gone, 1);
+        write_copy(&chats, "b", id, "", &gone, 2);
+        write_copy(&chats, "c", id, "", Path::new(""), 3);
+        let reason = unresumable_reason_in(&chats, &session_for(id, "")).unwrap();
+        assert_eq!(
+            reason.matches(gone.to_str().unwrap()).count(),
+            1,
+            "{reason}"
+        );
+        assert!(!reason.contains("workspace  no"), "{reason}");
+        assert!(unresumable_reason_in(&chats, &session_for("other", "")).is_none());
+    }
+
+    #[test]
+    fn workspace_paths_match_after_canonicalization() {
+        // macOS temp dirs live under /var -> /private/var; a listed project may
+        // carry either spelling and must still match the store's cwd.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let chats = tmp.path().join("chats");
+        let ws = tmp.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        let canonical = fs::canonicalize(&ws).unwrap();
+        write_copy(&chats, "h", "id", "Titled", &ws, 5);
+        let listed = session_for("id", canonical.to_str().unwrap());
+        assert_eq!(resume_workspace_in(&chats, &listed), Some(ws.clone()));
+        let mut sessions = vec![listed];
+        merge_cli_sessions_from(&mut sessions, &chats);
+        assert_eq!(sessions[0].summary, "Titled");
     }
 
     #[test]

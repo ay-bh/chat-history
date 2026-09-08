@@ -256,7 +256,11 @@ pub fn scored_search(
                     0,
                     Message {
                         uuid: "index-title".into(),
-                        timestamp: if s.modified.is_empty() {
+                        // A store-only row has no message times; its session
+                        // time must not admit it to a --timeframe search.
+                        timestamp: if s.is_cursor_store_only() {
+                            String::new()
+                        } else if s.modified.is_empty() {
                             s.created.clone()
                         } else {
                             s.modified.clone()

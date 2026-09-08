@@ -359,16 +359,6 @@ fn shell_quote(arg: &str) -> String {
     }
 }
 
-/// Directory the resumed tool should start in (the session's spawn cwd).
-/// For execution, use the directory captured by `resume_command` instead of
-/// performing this standalone lookup again after resolving the arguments.
-pub fn resume_working_dir(session: &Session) -> Option<PathBuf> {
-    if session.source == "cursor" {
-        return crate::cursor_cli::resume_workspace(session);
-    }
-    existing_absolute_dir(&session.project)
-}
-
 /// `project` as an existing, absolute directory. Cursor slugs that could not
 /// be decoded are kept verbatim (relative) for display; they must never be
 /// used as a cwd or `--workspace`, or a same-named subdirectory of the
@@ -429,9 +419,14 @@ pub(crate) fn cursor_timestamp(value: &Value) -> String {
             .map(|_| s.to_owned())
             .unwrap_or_default();
     }
-    // Preserve milliseconds; whole-second values retain their existing shape.
-    value
-        .as_i64()
+    value.as_i64().map(ms_to_iso).unwrap_or_default()
+}
+
+/// The one epoch-milliseconds formatter for Cursor data: preserves
+/// milliseconds when present, keeps whole seconds compact, and treats
+/// non-positive or out-of-range values as unknown.
+pub(crate) fn ms_to_iso(ms: i64) -> String {
+    Some(ms)
         .filter(|ms| *ms > 0)
         .and_then(DateTime::<Utc>::from_timestamp_millis)
         .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true))
@@ -1962,7 +1957,6 @@ mod tests {
             "",
         );
         assert!(resume_command(&s).is_none());
-        assert!(resume_working_dir(&s).is_none());
     }
 
     #[test]
@@ -2003,16 +1997,23 @@ mod tests {
         // `src` exists relative to the package root, where cargo runs tests.
         // An undecoded Cursor slug looks exactly like this.
         let s = make_session("id", "2026-01-01", "codex", "src", "", "");
-        assert!(resume_working_dir(&s).is_none());
+        assert!(exec_workdir(&s).is_none());
         let cwd = std::env::current_dir().unwrap();
         assert!(!project_matches_cwd(&cwd.join("src"), "src"));
         assert!(project_matches_cwd(&cwd, cwd.to_str().unwrap()));
     }
 
+    fn exec_workdir(session: &Session) -> Option<PathBuf> {
+        match resume_command(session) {
+            Some(ResumeAction::Exec { workdir, .. }) => workdir,
+            _ => None,
+        }
+    }
+
     #[test]
-    fn resume_working_dir_requires_existing_folder() {
+    fn resume_workdir_requires_existing_folder() {
         let missing = make_session("id", "2026-01-01", "codex", "/no/such/ws", "", "");
-        assert!(resume_working_dir(&missing).is_none());
+        assert!(exec_workdir(&missing).is_none());
         let dir = tempfile::TempDir::new().unwrap();
         let present = make_session(
             "id",
@@ -2022,7 +2023,7 @@ mod tests {
             "",
             "",
         );
-        assert_eq!(resume_working_dir(&present).as_deref(), Some(dir.path()));
+        assert_eq!(exec_workdir(&present).as_deref(), Some(dir.path()));
         for source in ["claude", "codex"] {
             for (mut session, expected) in [
                 (missing.clone(), None),

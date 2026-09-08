@@ -265,9 +265,16 @@ fn transcript_or_exit<'a>(
         std::process::exit(2);
     };
     if session.is_cursor_store_only() {
+        let reopen = match chat_history::cursor_cli::unresumable_reason(session) {
+            Some(reason) => format!("It cannot be resumed either: {reason}"),
+            None => format!(
+                "Use `chat-history resume {}` to reopen it in Cursor Agent.",
+                session.id
+            ),
+        };
         eprintln!(
-            "Only metadata is available for Cursor CLI session {}. Its store.db format is not a readable transcript. Use `chat-history resume {}` to reopen it in Cursor Agent; enable the optional cursor-hook for future transcript discovery.",
-            session.id, session.id
+            "Only metadata is available for Cursor CLI session {}. Its store.db format is not a readable transcript. {reopen} Enable the optional cursor-hook for future transcript discovery.",
+            session.id
         );
         std::process::exit(1);
     }
@@ -445,12 +452,14 @@ fn main() {
         }
         Some(Commands::Resume { session_id }) => {
             let session = resolve_session_or_exit(&sessions, &session_id);
-            if session.is_ide_ui() {
-                print!("{}", display::cursor_ide_resume_hint(session));
-                std::process::exit(1);
-            }
+            // A CLI store wins even when the IDE also indexes the chat; the
+            // sidebar hint is for chats no store can reopen.
             let action = match session::resume_command(session) {
                 Some(a) => a,
+                None if session.is_ide_ui() => {
+                    print!("{}", display::cursor_ide_resume_hint(session));
+                    std::process::exit(1);
+                }
                 None if session.source == "cursor" => {
                     // A store that exists but cannot be used gets its own
                     // reason; the sidebar hint is only for chats without one.
