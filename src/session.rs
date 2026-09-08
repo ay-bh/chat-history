@@ -303,7 +303,7 @@ pub fn resume_command(session: &Session) -> Option<ResumeAction> {
         "cursor" => {
             // Only chats the Agent CLI itself stored can be resumed, and only
             // from their own workspace; anything else would start a blank chat.
-            let cwd = cursor_cli_chat_cwd(&session.id)?;
+            let cwd = cursor_cli_chat_cwd(session)?;
             let mut args = Vec::new();
             let (bin, print_only): (String, bool) = if command_on_path("agent") {
                 ("agent".into(), false)
@@ -350,55 +350,21 @@ fn shell_quote(arg: &str) -> String {
 /// Directory the resumed tool should start in (the session's spawn cwd).
 pub fn resume_working_dir(session: &Session) -> Option<PathBuf> {
     if session.source == "cursor" {
-        return cursor_cli_chat_cwd(&session.id);
+        return cursor_cli_chat_cwd(session);
     }
     existing_absolute_dir(&session.project)
 }
 
-/// Workspace of the Cursor Agent CLI chat with this id, if the CLI has a
+/// Workspace of the Cursor Agent CLI chat for this session, if the CLI has a
 /// store for it. The CLI keeps its sessions under
 /// `~/.cursor/chats/<hash of cwd>/<chat id>/{store.db,meta.json}` and looks a
 /// chat up by (workspace, id): resuming from another `--workspace` silently
 /// starts a blank chat that reuses the id. IDE sidebar chats also write
 /// `agent-transcripts` but never have such a store, so they get the sidebar
-/// hint instead. Several stores for one id (different workspaces) resolve to
-/// the most recently updated one whose workspace still exists.
-pub fn cursor_cli_chat_cwd(chat_id: &str) -> Option<PathBuf> {
-    let chats = user_home()?.join(".cursor").join("chats");
-    cursor_cli_chat_cwd_in(&chats, chat_id)
-}
-
-fn cursor_cli_chat_cwd_in(chats_dir: &Path, chat_id: &str) -> Option<PathBuf> {
-    let mut best: Option<(i64, PathBuf)> = None;
-    for entry in fs::read_dir(chats_dir).ok()?.flatten() {
-        let meta_path = entry.path().join(chat_id).join("meta.json");
-        if !crate::cursor_cli::has_store(&entry.path().join(chat_id)) {
-            continue;
-        }
-        let Ok(raw) = fs::read_to_string(&meta_path) else {
-            continue;
-        };
-        let Ok(meta) = serde_json::from_str::<serde_json::Value>(&raw) else {
-            continue;
-        };
-        if meta.get("hasConversation").and_then(Value::as_bool) == Some(false) {
-            continue;
-        }
-        let Some(cwd) = meta.get("cwd").and_then(|v| v.as_str()) else {
-            continue;
-        };
-        let Some(dir) = existing_absolute_dir(cwd) else {
-            continue;
-        };
-        let updated = meta
-            .get("updatedAtMs")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0);
-        if best.as_ref().is_none_or(|(t, _)| updated > *t) {
-            best = Some((updated, dir));
-        }
-    }
-    best.map(|(_, dir)| dir)
+/// hint instead. Copy selection lives in `cursor_cli` so listing and resume
+/// share it.
+pub fn cursor_cli_chat_cwd(session: &Session) -> Option<PathBuf> {
+    crate::cursor_cli::resume_workspace(session)
 }
 
 /// `project` as an existing, absolute directory. Cursor slugs that could not
@@ -1959,40 +1925,6 @@ mod tests {
         );
         assert!(resume_command(&s).is_none());
         assert!(resume_working_dir(&s).is_none());
-    }
-
-    #[test]
-    fn cursor_cli_chat_cwd_picks_newest_existing_workspace() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let chats = tmp.path().join("chats");
-        let ws_old = tmp.path().join("ws-old");
-        let ws_new = tmp.path().join("ws-new");
-        fs::create_dir_all(&ws_old).unwrap();
-        fs::create_dir_all(&ws_new).unwrap();
-        let id = "cc9ae34e-117f-435c-9a83-f8958c7b09e1";
-        let write = |hash: &str, cwd: &str, updated: i64| {
-            let dir = chats.join(hash).join(id);
-            fs::create_dir_all(&dir).unwrap();
-            fs::write(
-                dir.join("meta.json"),
-                format!(r#"{{"schemaVersion":1,"cwd":{cwd:?},"updatedAtMs":{updated}}}"#),
-            )
-            .unwrap();
-            let conn = rusqlite::Connection::open(dir.join("store.db")).unwrap();
-            conn.execute_batch("CREATE TABLE blobs (id TEXT PRIMARY KEY, data BLOB);")
-                .unwrap();
-        };
-        write("aaaa", ws_old.to_str().unwrap(), 1);
-        write("bbbb", ws_new.to_str().unwrap(), 2);
-        write("cccc", "/no/such/workspace", 3); // newest, but the workspace is gone
-        write("dddd", ws_old.to_str().unwrap(), 4);
-        fs::remove_file(chats.join("dddd").join(id).join("store.db")).unwrap();
-        assert_eq!(cursor_cli_chat_cwd_in(&chats, id), Some(ws_new));
-        assert_eq!(cursor_cli_chat_cwd_in(&chats, "other-id"), None);
-        assert_eq!(
-            cursor_cli_chat_cwd_in(&tmp.path().join("missing"), id),
-            None
-        );
     }
 
     #[test]

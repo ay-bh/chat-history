@@ -22,12 +22,79 @@ pub(crate) fn merge_cli_sessions(sessions: &mut Vec<Session>) {
 }
 
 /// One `~/.cursor/chats/<workspace-hash>/<id>` directory with a usable store.
-struct CliChat {
+pub(crate) struct CliChat {
     dir: PathBuf,
     meta: Value,
-    project: String,
+    pub(crate) project: String,
     updated: i64,
-    workspace_exists: bool,
+    pub(crate) workspace_exists: bool,
+}
+
+/// The single rule for what counts as a resumable CLI chat copy. Listing
+/// and `resume` both go through here so they can never disagree.
+fn read_copy(dir: &Path) -> Option<CliChat> {
+    if !has_store(dir) {
+        return None;
+    }
+    let meta: Value =
+        serde_json::from_str(&fs::read_to_string(dir.join("meta.json")).ok()?).ok()?;
+    if meta.get("schemaVersion").and_then(Value::as_u64) != Some(1)
+        || meta.get("hasConversation").and_then(Value::as_bool) == Some(false)
+    {
+        return None;
+    }
+    let project = meta
+        .get("cwd")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_owned();
+    let workspace_exists = Path::new(&project).is_absolute() && Path::new(&project).is_dir();
+    let updated = meta.get("updatedAtMs").and_then(Value::as_i64).unwrap_or(0);
+    Some(CliChat {
+        dir: dir.to_path_buf(),
+        meta,
+        project,
+        updated,
+        workspace_exists,
+    })
+}
+
+/// The same chat resumed from another directory gets a second copy. Rank
+/// them so the copy that would actually reopen comes first: an existing
+/// workspace, then the newest, then the path so directory iteration order
+/// never decides.
+fn rank(copies: &mut [CliChat]) {
+    copies.sort_by(|a, b| {
+        b.workspace_exists
+            .cmp(&a.workspace_exists)
+            .then(b.updated.cmp(&a.updated))
+            .then(a.dir.cmp(&b.dir))
+    });
+}
+
+/// Workspace to pass to `agent --resume` for this session, if the CLI has a
+/// store for it. The CLI looks a chat up by (workspace, id), so resuming
+/// from any other directory silently starts a blank chat. Prefer the copy
+/// the listing showed (the session's own workspace); otherwise the
+/// best-ranked copy whose workspace still exists.
+pub(crate) fn resume_workspace(session: &Session) -> Option<PathBuf> {
+    let chats = user_home()?.join(".cursor/chats");
+    resume_workspace_in(&chats, session)
+}
+
+pub(crate) fn resume_workspace_in(chats_dir: &Path, session: &Session) -> Option<PathBuf> {
+    let mut copies: Vec<CliChat> = fs::read_dir(chats_dir)
+        .ok()?
+        .flatten()
+        .filter_map(|workspace| read_copy(&workspace.path().join(&session.id)))
+        .filter(|copy| copy.workspace_exists)
+        .collect();
+    rank(&mut copies);
+    copies
+        .iter()
+        .find(|copy| copy.project == session.project)
+        .or(copies.first())
+        .map(|copy| PathBuf::from(&copy.project))
 }
 
 fn merge_cli_sessions_from(sessions: &mut Vec<Session>, root: &Path) {
@@ -40,51 +107,16 @@ fn merge_cli_sessions_from(sessions: &mut Vec<Session>, root: &Path) {
             continue;
         };
         for chat in chats.flatten() {
-            let dir = chat.path();
-            if !has_store(&dir) {
-                continue;
+            if let Some(copy) = read_copy(&chat.path()) {
+                copies
+                    .entry(chat.file_name().to_string_lossy().into_owned())
+                    .or_default()
+                    .push(copy);
             }
-            let Ok(raw) = fs::read_to_string(dir.join("meta.json")) else {
-                continue;
-            };
-            let Ok(meta) = serde_json::from_str::<Value>(&raw) else {
-                continue;
-            };
-            if meta.get("schemaVersion").and_then(Value::as_u64) != Some(1)
-                || meta.get("hasConversation").and_then(Value::as_bool) == Some(false)
-            {
-                continue;
-            }
-            let project = meta
-                .get("cwd")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_owned();
-            let workspace_exists =
-                Path::new(&project).is_absolute() && Path::new(&project).is_dir();
-            let updated = meta.get("updatedAtMs").and_then(Value::as_i64).unwrap_or(0);
-            copies
-                .entry(chat.file_name().to_string_lossy().into_owned())
-                .or_default()
-                .push(CliChat {
-                    dir,
-                    meta,
-                    project,
-                    updated,
-                    workspace_exists,
-                });
         }
     }
     for (id, mut chats) in copies {
-        // The same chat resumed from another directory gets a second copy.
-        // Rank them the way `resume` does (an existing workspace, then the
-        // newest) so the listed copy is the one that would actually reopen.
-        // Directory iteration order must not decide.
-        chats.sort_by(|a, b| {
-            b.workspace_exists
-                .cmp(&a.workspace_exists)
-                .then(b.updated.cmp(&a.updated))
-        });
+        rank(&mut chats);
         let mut found = false;
         for session in sessions
             .iter_mut()
@@ -327,6 +359,70 @@ mod tests {
             assert_eq!(sessions[0].project, "some-Doc-6ac763d", "{old_hash}");
             assert!(sessions[0].summary.is_empty(), "{old_hash}");
         }
+    }
+
+    fn session_for(id: &str, project: &str) -> Session {
+        Session {
+            source: "cursor".into(),
+            id: id.into(),
+            summary: String::new(),
+            first_prompt: String::new(),
+            created: String::new(),
+            modified: String::new(),
+            date: String::new(),
+            messages: 0,
+            branch: String::new(),
+            project: project.into(),
+            file: String::new(),
+            is_sidechain: false,
+            also_ide: false,
+        }
+    }
+
+    #[test]
+    fn resume_prefers_the_listed_workspace_then_the_newest_existing_one() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let chats = tmp.path().join("chats");
+        let (ws_old, ws_new) = (tmp.path().join("ws-old"), tmp.path().join("ws-new"));
+        fs::create_dir_all(&ws_old).unwrap();
+        fs::create_dir_all(&ws_new).unwrap();
+        let id = "cc9ae34e-117f-435c-9a83-f8958c7b09e1";
+        write_copy(&chats, "aaaa", id, "", &ws_old, 1);
+        write_copy(&chats, "bbbb", id, "", &ws_new, 2);
+        write_copy(&chats, "cccc", id, "", Path::new("/no/such/workspace"), 3); // newest, gone
+        write_copy(&chats, "dddd", id, "", &ws_old, 4);
+        fs::remove_file(chats.join("dddd").join(id).join("store.db")).unwrap();
+
+        // The row the user is looking at wins, even though another copy is newer.
+        let listed_old = session_for(id, ws_old.to_str().unwrap());
+        assert_eq!(
+            resume_workspace_in(&chats, &listed_old),
+            Some(ws_old.clone())
+        );
+        // No usable copy for the listed workspace: the best existing one.
+        let listed_gone = session_for(id, "/no/such/workspace");
+        assert_eq!(
+            resume_workspace_in(&chats, &listed_gone),
+            Some(ws_new.clone())
+        );
+        let slug_only = session_for(id, "some-slug");
+        assert_eq!(
+            resume_workspace_in(&chats, &slug_only),
+            Some(ws_new.clone())
+        );
+        assert_eq!(
+            resume_workspace_in(&chats, &session_for("other-id", "")),
+            None
+        );
+        assert_eq!(
+            resume_workspace_in(&tmp.path().join("missing"), &listed_old),
+            None
+        );
+        // Listing ranks the same copies with the same rule.
+        let mut sessions = Vec::new();
+        merge_cli_sessions_from(&mut sessions, &chats);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(Path::new(&sessions[0].project), ws_new);
     }
 
     #[test]

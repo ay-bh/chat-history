@@ -477,6 +477,19 @@ fn main() {
                 }
             );
             let workdir = session::resume_working_dir(session);
+            if session.source == "cursor"
+                && let Some(dir) = &workdir
+                && std::path::Path::new(&session.project).is_absolute()
+                && std::path::Path::new(&session.project) != dir.as_path()
+            {
+                // The listed workspace has no resumable store any more (or
+                // never had one); say where the chat is being reopened.
+                eprintln!(
+                    "Note: no resumable Agent CLI store in {}; resuming in {}",
+                    display::abbreviate_home(&session.project),
+                    display::abbreviate_home(&dir.to_string_lossy())
+                );
+            }
             if workdir.is_none() && !session.project.is_empty() {
                 if session.source == "claude" {
                     eprintln!(
