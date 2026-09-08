@@ -479,11 +479,11 @@ fn main() {
             let workdir = session::resume_working_dir(session);
             if session.source == "cursor"
                 && let Some(dir) = &workdir
-                && std::path::Path::new(&session.project).is_absolute()
+                && !session.project.is_empty()
                 && std::path::Path::new(&session.project) != dir.as_path()
             {
-                // The listed workspace has no resumable store any more (or
-                // never had one); say where the chat is being reopened.
+                // The listed workspace (a path, or a slug no store matched)
+                // has no resumable store; say where the chat is reopened.
                 eprintln!(
                     "Note: no resumable Agent CLI store in {}; resuming in {}",
                     display::abbreviate_home(&session.project),
