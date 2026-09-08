@@ -112,6 +112,26 @@ pub(crate) fn merge_registered_transcripts(sessions: &mut Vec<Session>) {
     merge_records(sessions, read_records(&db));
 }
 
+/// The transcript a registration refers to, as the scanner would list it: a
+/// `.txt` beside `<id>/<id>.jsonl` means that jsonl (the scanner prefers it),
+/// and symlinked or `/private/tmp`-style spellings resolve to one path.
+fn registered_file(path: &Path) -> PathBuf {
+    let mut file = path.to_path_buf();
+    if path.extension().is_some_and(|e| e == "txt")
+        && let (Some(stem), Some(dir)) = (path.file_stem(), path.parent())
+    {
+        let sibling = dir.join(stem).join(stem).with_extension("jsonl");
+        if sibling.is_file() {
+            file = sibling;
+        }
+    }
+    std::fs::canonicalize(&file).unwrap_or(file)
+}
+
+fn same_transcript(listed: &str, registered: &Path) -> bool {
+    Path::new(listed) == registered || std::fs::canonicalize(listed).is_ok_and(|p| p == registered)
+}
+
 fn merge_records(sessions: &mut Vec<Session>, records: Vec<HookRecord>) {
     for record in records {
         let Some(file) = record.transcript_path else {
@@ -119,7 +139,7 @@ fn merge_records(sessions: &mut Vec<Session>, records: Vec<HookRecord>) {
         };
         // Only this module writes the registry, after validation; a path
         // registered before Cursor flushed the file simply waits.
-        let path = Path::new(&file);
+        let path = registered_file(Path::new(&file));
         if !path.is_file() {
             continue;
         }
@@ -134,18 +154,20 @@ fn merge_records(sessions: &mut Vec<Session>, records: Vec<HookRecord>) {
         // like scanned copies are; `inspect`/`resume`/`find` pick one copy.
         // Skipping by id here would hide a transcript written later at a
         // path that happens to sort after an older one.
-        if let Some(session) = sessions.iter_mut().find(|s| Path::new(&s.file) == path) {
-            if session.id == record.conversation_id && !project.is_empty() {
+        if let Some(session) = sessions.iter_mut().find(|s| {
+            s.id.eq_ignore_ascii_case(&record.conversation_id) && same_transcript(&s.file, &path)
+        }) {
+            if !project.is_empty() {
                 session.project = project;
             }
             continue;
         }
-        let modified = mtime_iso(path).unwrap_or_default();
+        let modified = mtime_iso(&path).unwrap_or_default();
         let date = modified.get(..10).unwrap_or("").to_owned();
         let first_prompt = if path.extension().is_some_and(|e| e == "txt") {
-            crate::session::cursor_first_prompt_txt(path)
+            crate::session::cursor_first_prompt_txt(&path)
         } else {
-            crate::session::cursor_first_prompt_jsonl(path)
+            crate::session::cursor_first_prompt_jsonl(&path)
         };
         sessions.push(Session {
             source: "cursor".into(),
@@ -159,15 +181,24 @@ fn merge_records(sessions: &mut Vec<Session>, records: Vec<HookRecord>) {
             branch: String::new(),
             project,
             is_sidechain: path.components().any(|c| c.as_os_str() == "subagents"),
-            file,
+            file: path.to_string_lossy().into_owned(),
             also_ide: false,
         });
     }
 }
 
 pub(crate) fn registered_model(session: &Session) -> Option<String> {
-    let record = read_records(&registry_path()?).into_iter().find(|r| {
-        r.conversation_id == session.id && r.transcript_path.as_deref() == Some(&session.file)
+    registered_model_in(&registry_path()?, session)
+}
+
+fn registered_model_in(db: &Path, session: &Session) -> Option<String> {
+    let listed =
+        std::fs::canonicalize(&session.file).unwrap_or_else(|_| PathBuf::from(&session.file));
+    let record = read_records(db).into_iter().find(|r| {
+        r.conversation_id == session.id
+            && r.transcript_path
+                .as_deref()
+                .is_some_and(|p| registered_file(Path::new(p)) == listed)
     })?;
     record
         .model_id
@@ -227,6 +258,53 @@ mod tests {
             .unwrap();
         assert!(!stored.contains("not-stored"));
         assert!(!stored.contains("prompt"));
+    }
+
+    fn listed(file: &Path) -> Session {
+        Session {
+            source: "cursor".into(),
+            id: "hook-id".into(),
+            file: file.to_string_lossy().into_owned(),
+            ..Session::default()
+        }
+    }
+
+    #[test]
+    fn txt_and_aliased_registrations_match_the_scanned_transcript() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = tmp.path().join("hooks.db");
+        // The scanner lists `<id>/<id>.jsonl` when both it and `<id>.txt` exist.
+        let real = tmp.path().join("real/agent-transcripts");
+        let jsonl = real.join("hook-id/hook-id.jsonl");
+        std::fs::create_dir_all(jsonl.parent().unwrap()).unwrap();
+        std::fs::write(
+            &jsonl,
+            "{\"role\":\"user\",\"message\":{\"content\":\"q\"}}\n",
+        )
+        .unwrap();
+        std::fs::write(real.join("hook-id.txt"), "user:\nq\n").unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("real"), tmp.path().join("alias")).unwrap();
+        for registered in [
+            real.join("hook-id.txt"),
+            tmp.path()
+                .join("alias/agent-transcripts/hook-id/hook-id.jsonl"),
+        ] {
+            let event = serde_json::json!({"conversation_id":"hook-id", "transcript_path":registered,
+                "workspace_roots":[tmp.path()], "model_id":"hook-model"});
+            record_hook_at(event.to_string().as_bytes(), &db).unwrap();
+        }
+        let mut sessions = vec![listed(&jsonl)];
+        merge_records(&mut sessions, read_records(&db));
+        assert_eq!(
+            sessions.len(),
+            1,
+            "no duplicate row for the same transcript"
+        );
+        assert_eq!(Path::new(&sessions[0].project), tmp.path());
+        assert_eq!(
+            registered_model_in(&db, &sessions[0]).as_deref(),
+            Some("hook-model")
+        );
     }
 
     #[test]

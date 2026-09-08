@@ -77,7 +77,7 @@ fn session_duration_minutes(timestamps: &[&str]) -> i64 {
 }
 
 pub fn inspect_session(session: &Session) -> Option<InspectInfo> {
-    let (messages, meta_opt) = parse_session(session, true);
+    let (messages, meta_opt) = parse_session_recovering_timestamps(session, true);
     if messages.is_empty() {
         return None;
     }

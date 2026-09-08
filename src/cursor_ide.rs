@@ -492,12 +492,19 @@ fn merge_message_timestamps(messages: &mut [Message], bubbles: &[Message]) {
             continue;
         }
         let key = content_key(message);
-        let matched = if !message.uuid.is_empty() {
-            by_id.get(&(message.role.as_str(), message.uuid.as_str()))
-        } else if occurrences.get(&key) == Some(&1) && !key.1.is_empty() {
-            by_text.get(&key)
+        let by_unique_text = || {
+            (occurrences.get(&key) == Some(&1) && !key.1.is_empty())
+                .then(|| by_text.get(&key))
+                .flatten()
+        };
+        // A transcript id the IDE never assigned must not block the text
+        // match; a real bubble id still wins when it resolves.
+        let matched = if message.uuid.is_empty() {
+            by_unique_text()
         } else {
-            None
+            by_id
+                .get(&(message.role.as_str(), message.uuid.as_str()))
+                .or_else(by_unique_text)
         };
         if let Some(matches) = matched
             && matches.len() == 1
@@ -855,6 +862,19 @@ mod tests {
         );
         assert_eq!(messages[0].timestamp, "2026-07-01T21:25:09.594Z");
         assert_eq!(messages[1].timestamp, "2026-07-01T21:30:00.000Z");
+    }
+
+    #[test]
+    fn unique_text_fallback_applies_when_uuid_is_not_a_bubble_id() {
+        let (_tmp, db) = fixture_db();
+        let sessions = load_cursor_ide_sessions_from(&db);
+        let original = parse_cursor_ide(&sessions[0]).remove(0);
+        let mut message = original.clone();
+        message.uuid = "msg_01X-not-a-bubble-id".into();
+        message.timestamp.clear();
+        let mut messages = vec![message];
+        merge_message_timestamps(&mut messages, std::slice::from_ref(&original));
+        assert_eq!(messages[0].timestamp, original.timestamp);
     }
 
     #[test]

@@ -242,7 +242,16 @@ fn transcript_or_exit<'a>(
         };
         // Fall back to a metadata-only row so the message below explains
         // it, instead of claiming nothing matched what the listing showed.
-        match newest(true).or_else(|| newest(false)) {
+        let (readable, any) = (newest(true), newest(false));
+        if let (Some(r), Some(a)) = (readable, any)
+            && !std::ptr::eq(r, a)
+        {
+            eprintln!(
+                "Note: skipped newer Cursor CLI session {} (metadata only, no transcript)",
+                a.id
+            );
+        }
+        match readable.or(any) {
             Some(s) => s,
             None => {
                 eprintln!("Session not found");
@@ -443,11 +452,17 @@ fn main() {
             let action = match session::resume_command(session) {
                 Some(a) => a,
                 None if session.source == "cursor" => {
-                    eprintln!(
-                        "No Agent CLI chat store for this id under ~/.cursor/chats, so \
-                         `agent --resume` cannot load it (it would start a blank chat)."
-                    );
-                    print!("{}", display::cursor_ide_resume_hint(session));
+                    // A store that exists but cannot be used gets its own
+                    // reason; the sidebar hint is only for chats without one.
+                    if let Some(reason) = chat_history::cursor_cli::unresumable_reason(session) {
+                        eprintln!("Cannot resume Agent CLI chat {}: {reason}", session.id);
+                    } else {
+                        eprintln!(
+                            "No Agent CLI chat store for this id under ~/.cursor/chats, so \
+                             `agent --resume` cannot load it (it would start a blank chat)."
+                        );
+                        print!("{}", display::cursor_ide_resume_hint(session));
+                    }
                     std::process::exit(1);
                 }
                 None => {

@@ -106,6 +106,131 @@ fn resume_keeps_the_resolved_workspace_when_stores_change() {
         .success();
 }
 
+fn cli_store_with(tmp: &TempDir, hash: &str, meta: serde_json::Value) -> std::path::PathBuf {
+    let dir = tmp.path().join(format!(".cursor/chats/{hash}/{ID}"));
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("meta.json"), meta.to_string()).unwrap();
+    let conn = rusqlite::Connection::open(dir.join("store.db")).unwrap();
+    conn.execute_batch("CREATE TABLE blobs (id TEXT PRIMARY KEY, data BLOB);")
+        .unwrap();
+    dir
+}
+
+/// A fake `agent` on PATH so resume can exec without launching Cursor.
+fn agent_shim(tmp: &TempDir) -> String {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = tmp.path().join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let shim = bin.join("agent");
+    fs::write(&shim, "#!/bin/sh\nprintf 'SHIM workspace: %s\\n' \"$4\"\n").unwrap();
+    fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).unwrap();
+    format!("{}:/usr/bin:/bin", bin.display())
+}
+
+#[test]
+fn resume_explains_a_missing_workspace_instead_of_the_sidebar_hint() {
+    let tmp = TempDir::new().unwrap();
+    let gone = tmp.path().join("deleted-workspace");
+    cli_store_with(
+        &tmp,
+        "h",
+        json!({"schemaVersion":1, "cwd":gone, "title":"Gone workspace chat",
+        "createdAtMs":1788220800000i64, "updatedAtMs":1788307200000i64, "hasConversation":true}),
+    );
+    command(&tmp)
+        .args(["--source", "cursor"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Gone workspace chat"));
+    command(&tmp)
+        .args(["resume", ID])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("no longer exists"))
+        .stderr(predicate::str::contains(gone.to_str().unwrap()))
+        .stderr(predicate::str::contains("No Agent CLI chat store").not())
+        .stdout(predicate::str::contains("Cursor IDE UI").not());
+}
+
+#[test]
+fn unsupported_meta_schema_is_reported_not_mistaken_for_a_missing_store() {
+    let tmp = TempDir::new().unwrap();
+    transcript(&tmp, false);
+    cli_store_with(
+        &tmp,
+        "h",
+        json!({"schemaVersion":2, "cwd":tmp.path(),
+        "createdAtMs":1788220800000i64, "updatedAtMs":1788307200000i64, "hasConversation":true}),
+    );
+    // Listing warns once that a store was skipped, and still lists the transcript.
+    command(&tmp)
+        .args(["--source", "cursor"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("investigate uniquecache failure"))
+        .stderr(predicate::str::contains("schemaVersion 2"));
+    command(&tmp)
+        .args(["resume", ID])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("schemaVersion 2"))
+        .stderr(predicate::str::contains("No Agent CLI chat store").not());
+}
+
+#[test]
+fn store_only_row_with_a_header_only_ide_composer_still_resumes() {
+    let tmp = TempDir::new().unwrap();
+    cli_store(&tmp, true);
+    let db = tmp.path().join("cursor-user/globalStorage/state.vscdb");
+    fs::create_dir_all(db.parent().unwrap()).unwrap();
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute_batch("CREATE TABLE composerHeaders (composerId TEXT PRIMARY KEY, createdAt INTEGER, lastUpdatedAt INTEGER, isSubagent INTEGER, value TEXT);
+        CREATE TABLE cursorDiskKV (key TEXT PRIMARY KEY, value BLOB);").unwrap();
+    conn.execute(
+        "INSERT INTO composerHeaders VALUES (?1, 1, 1, 0, '{}')",
+        [ID],
+    )
+    .unwrap();
+    drop(conn);
+    let path = agent_shim(&tmp);
+    command(&tmp)
+        .args(["resume", ID])
+        .env("PATH", &path)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("SHIM workspace:"))
+        .stdout(predicate::str::contains("IDE chats cannot be resumed").not());
+}
+
+#[test]
+fn last_notes_a_skipped_newer_metadata_only_session() {
+    let tmp = TempDir::new().unwrap();
+    let now = chrono::Utc::now().timestamp_millis();
+    cli_store_with(
+        &tmp,
+        "h",
+        json!({"schemaVersion":1, "cwd":tmp.path(), "title":"newest, metadata only",
+        "createdAtMs":now - 1000, "updatedAtMs":now, "hasConversation":true}),
+    );
+    let other = "11111111-2222-4000-8000-333333333333";
+    let old = tmp.path().join(format!(
+        ".cursor/projects/w/agent-transcripts/{other}/{other}.jsonl"
+    ));
+    fs::create_dir_all(old.parent().unwrap()).unwrap();
+    fs::write(
+        &old,
+        "{\"role\":\"user\",\"message\":{\"content\":\"older readable transcript\"}}\n",
+    )
+    .unwrap();
+    command(&tmp)
+        .args(["--source", "cursor", "view", "--last", "--plain"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("older readable transcript"))
+        .stderr(predicate::str::contains("metadata only"))
+        .stderr(predicate::str::contains(ID));
+}
+
 #[test]
 fn native_cursor_timestamps_enable_timeframe_search() {
     let tmp = TempDir::new().unwrap();
@@ -216,6 +341,34 @@ fn paired_ide_timestamps_enable_search_without_losing_transcript_content() {
         .assert()
         .success()
         .stdout(predicate::str::contains("investigate uniquecache failure"));
+    // The same hit must score the same with and without --timeframe: recovered
+    // timestamps feed recency scoring in both cases.
+    let score = |args: &[&str]| -> f64 {
+        let out = command(&tmp).args(args).output().unwrap().stdout;
+        serde_json::from_slice::<serde_json::Value>(&out).unwrap()["results"][0]["score"]
+            .as_f64()
+            .unwrap()
+    };
+    assert_eq!(
+        score(&[
+            "--source",
+            "cursor",
+            "search",
+            "uniquecache",
+            "--deep",
+            "--json"
+        ]),
+        score(&[
+            "--source",
+            "cursor",
+            "search",
+            "uniquecache",
+            "--deep",
+            "--json",
+            "--timeframe",
+            "today"
+        ])
+    );
     command(&tmp)
         .args(["view", ID, "--plain"])
         .assert()

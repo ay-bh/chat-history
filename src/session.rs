@@ -1094,6 +1094,12 @@ pub fn merge_cursor_sessions(agents: Vec<Session>, ide: Vec<Session>) -> Vec<Ses
         let key = ide_session.id.to_ascii_lowercase();
         if let Some(indexes) = agent_indexes.get(&key) {
             for &index in indexes {
+                // A CLI store proves a CLI chat; an IDE header alone (no
+                // bubbles, or the transcript is gone) must not turn it into
+                // a sidebar chat that resume refuses.
+                if agents[index].is_cursor_store_only() {
+                    continue;
+                }
                 agents[index].also_ide = true;
                 if !ide_session.summary.is_empty() {
                     agents[index].summary = ide_session.summary.clone();
@@ -1578,10 +1584,20 @@ pub fn parse_cursor_txt(filepath: &str) -> Vec<Message> {
 }
 
 pub fn parse_session(session: &Session, extract_meta: bool) -> (Vec<Message>, Option<SessionMeta>) {
-    parse_session_with_cursor_timestamps(session, extract_meta, true)
+    parse_session_inner(session, extract_meta, false)
 }
 
-pub(crate) fn parse_session_with_cursor_timestamps(
+/// Like `parse_session`, but also recovers missing Cursor message timestamps
+/// from the IDE database. Used where message times matter (inspect durations,
+/// deep-search recency and `--timeframe`); costs one IDE read per session.
+pub fn parse_session_recovering_timestamps(
+    session: &Session,
+    extract_meta: bool,
+) -> (Vec<Message>, Option<SessionMeta>) {
+    parse_session_inner(session, extract_meta, true)
+}
+
+fn parse_session_inner(
     session: &Session,
     extract_meta: bool,
     recover_timestamps: bool,

@@ -40,7 +40,7 @@ Search, inspect, and export Claude Code, Cursor, and Codex conversation history.
 
 - Only `search` accepts `--json`; the session list and `inspect` reject it.
 - The subcommands are `search`, `inspect`, `view`, `export`, `resume`, `find`, `install-skill`, `completions`, and the optional `cursor-hook` receiver. Do not guess others; run `chat-history --help` when unsure. `cursor-hook` is for configured Cursor hooks, not normal history queries.
-- Cursor CLI rows labeled `[metadata only]` support title search, `find`, and `resume`; their internal `store.db` cannot be viewed or exported as a transcript. Do not claim that metadata-only search covers message content.
+- Cursor CLI rows labeled `[metadata only]` support `find`, `resume`, and title search when Cursor recorded a title (print-mode chats usually have none); their internal `store.db` cannot be viewed or exported as a transcript. Do not claim that metadata-only search covers message content.
 - Cursor message timestamps may be unavailable. `search --timeframe` excludes unknown message times; use session `--from` / `--to` filters for activity-date questions. File modification times are not message timestamps.
 - Don't dump raw JSON or full transcripts at the user — summarize, cite the session ID and date (or title + directory for `cursor-ide`).
 - Do not `resume` a session whose human tag is `cursor-ide`. `--json` may still report `"source": "cursor"` for IDE Agent chats that also have a jsonl; `resume` will print a sidebar hint instead of launching the Agent CLI.
