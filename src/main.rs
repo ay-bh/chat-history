@@ -461,7 +461,7 @@ fn main() {
                 );
                 std::process::exit(1);
             }
-            let ResumeAction::Exec { bin, args } = action else {
+            let ResumeAction::Exec { bin, args, workdir } = action else {
                 unreachable!();
             };
             println!(
@@ -472,7 +472,6 @@ fn main() {
                     &session.summary
                 }
             );
-            let workdir = session::resume_working_dir(session);
             if session.source == "cursor"
                 && let Some(dir) = &workdir
                 && !session.project.is_empty()

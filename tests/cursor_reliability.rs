@@ -50,6 +50,62 @@ fn cli_store(tmp: &TempDir, with_db: bool) -> std::path::PathBuf {
     dir
 }
 
+fn alternate_cli_store(tmp: &TempDir, original: &Path) -> std::path::PathBuf {
+    let workspace = tmp.path().join("alternate workspace");
+    fs::create_dir(&workspace).unwrap();
+    let dir = tmp.path().join(format!(".cursor/chats/alternate/{ID}"));
+    fs::create_dir_all(&dir).unwrap();
+    fs::copy(original.join("store.db"), dir.join("store.db")).unwrap();
+    fs::write(
+        dir.join("meta.json"),
+        json!({"schemaVersion":1, "cwd":workspace, "updatedAtMs":1788393600000i64,
+            "hasConversation":true})
+        .to_string(),
+    )
+    .unwrap();
+    workspace
+}
+
+#[test]
+fn resume_keeps_the_resolved_workspace_when_stores_change() {
+    use chat_history::session::{ResumeAction, Session, resume_command};
+    const CHILD: &str = "CHAT_HISTORY_RESUME_SNAPSHOT_TEST";
+    if let Some(root) = std::env::var_os(CHILD) {
+        let root = std::path::PathBuf::from(root);
+        let session = Session {
+            source: "cursor".into(),
+            id: ID.into(),
+            project: root.to_str().unwrap().into(),
+            ..Session::default()
+        };
+        let action = resume_command(&session).unwrap();
+        // Deterministically simulate the original store disappearing after
+        // command resolution, before the working directory is consumed.
+        fs::remove_file(root.join(format!(".cursor/chats/workspace-hash/{ID}/store.db"))).unwrap();
+        let ResumeAction::Exec { args, workdir, .. } = action else {
+            panic!("expected exec")
+        };
+        assert_eq!(args.last().unwrap(), root.to_str().unwrap());
+        assert_eq!(workdir, Some(root));
+        return;
+    }
+    let tmp = TempDir::new().unwrap();
+    let original = cli_store(&tmp, true);
+    alternate_cli_store(&tmp, &original);
+    // Isolate HOME in a subprocess rather than mutate this test runner's
+    // environment while other tests run in parallel. No agent is executed.
+    Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "resume_keeps_the_resolved_workspace_when_stores_change",
+        ])
+        .env(CHILD, tmp.path())
+        .env("HOME", tmp.path())
+        .env("PATH", "")
+        .assert()
+        .success();
+}
+
 #[test]
 fn native_cursor_timestamps_enable_timeframe_search() {
     let tmp = TempDir::new().unwrap();
@@ -66,6 +122,61 @@ fn native_cursor_timestamps_enable_timeframe_search() {
         .assert()
         .success()
         .stdout(predicate::str::contains("investigate uniquecache failure"));
+}
+
+#[cfg(unix)]
+#[test]
+fn resume_arguments_cwd_and_fallback_note_use_the_same_workspace() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = TempDir::new().unwrap();
+    let original = cli_store(&tmp, true);
+    let alternate = alternate_cli_store(&tmp, &original);
+    let file = transcript(&tmp, false);
+    // Give the existing transcript its workspace through the public hook.
+    command(&tmp)
+        .arg("cursor-hook")
+        .write_stdin(
+            json!({"conversation_id":ID, "transcript_path":file,
+            "workspace_roots":[tmp.path()]})
+            .to_string(),
+        )
+        .assert()
+        .success();
+    let bin = tmp.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    let shim = bin.join("agent");
+    fs::write(&shim, "#!/bin/sh\nprintf 'SHIM workspace: %s\\n' \"$4\"\nprintf 'SHIM cwd: %s\\n' \"$(pwd -P)\"\n").unwrap();
+    fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).unwrap();
+    for fallback in [false, true] {
+        if fallback {
+            fs::remove_file(original.join("store.db")).unwrap();
+        }
+        let expected = if fallback {
+            alternate.as_path()
+        } else {
+            tmp.path()
+        };
+        let output = command(&tmp)
+            .args(["resume", ID])
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .assert()
+            .success()
+            .stdout(predicate::str::contains(format!(
+                "SHIM workspace: {}\n",
+                expected.display()
+            )))
+            .stdout(predicate::str::contains(format!(
+                "SHIM cwd: {}\n",
+                expected.canonicalize().unwrap().display()
+            )));
+        if fallback {
+            output.stderr(predicate::str::contains(
+                "Note: no resumable Agent CLI store in ~; resuming in ~/alternate workspace",
+            ));
+        } else {
+            output.stderr(predicate::str::contains("Note:").not());
+        }
+    }
 }
 
 #[test]

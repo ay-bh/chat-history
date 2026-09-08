@@ -283,11 +283,17 @@ pub fn copy_session_to_dir(session: &Session, target_dir: &Path) -> std::io::Res
 /// How to resume a session in its original tool.
 #[derive(Debug, PartialEq, Eq)]
 pub enum ResumeAction {
-    Exec { bin: String, args: Vec<String> },
-    Print { cmdline: String },
+    Exec {
+        bin: String,
+        args: Vec<String>,
+        workdir: Option<PathBuf>,
+    },
+    Print {
+        cmdline: String,
+    },
 }
 
-/// Binary + args to resume this session in its original tool.
+/// Resolve binary, args, and working directory once for this invocation.
 /// Cursor Agent: `agent`, then `cursor-agent`, never exec `cursor agent`
 /// (that launcher can download the CLI as a side effect).
 pub fn resume_command(session: &Session) -> Option<ResumeAction> {
@@ -295,10 +301,12 @@ pub fn resume_command(session: &Session) -> Option<ResumeAction> {
         "codex" => Some(ResumeAction::Exec {
             bin: "codex".into(),
             args: vec!["resume".into(), session.id.clone()],
+            workdir: existing_absolute_dir(&session.project),
         }),
         "claude" => Some(ResumeAction::Exec {
             bin: "claude".into(),
             args: vec!["--resume".into(), session.id.clone()],
+            workdir: existing_absolute_dir(&session.project),
         }),
         "cursor" => {
             // Only chats the Agent CLI itself stored can be resumed, and only
@@ -327,7 +335,11 @@ pub fn resume_command(session: &Session) -> Option<ResumeAction> {
                     .join(" ");
                 Some(ResumeAction::Print { cmdline })
             } else {
-                Some(ResumeAction::Exec { bin, args })
+                Some(ResumeAction::Exec {
+                    bin,
+                    args,
+                    workdir: Some(cwd),
+                })
             }
         }
         _ => None,
@@ -348,6 +360,8 @@ fn shell_quote(arg: &str) -> String {
 }
 
 /// Directory the resumed tool should start in (the session's spawn cwd).
+/// For execution, use the directory captured by `resume_command` instead of
+/// performing this standalone lookup again after resolving the arguments.
 pub fn resume_working_dir(session: &Session) -> Option<PathBuf> {
     if session.source == "cursor" {
         return crate::cursor_cli::resume_workspace(session);
@@ -415,10 +429,12 @@ pub(crate) fn cursor_timestamp(value: &Value) -> String {
             .map(|_| s.to_owned())
             .unwrap_or_default();
     }
-    // Same second-precision shape every other source uses.
+    // Preserve milliseconds; whole-second values retain their existing shape.
     value
         .as_i64()
-        .map(|ms| crate::cursor_ide::ms_iso_date(ms).0)
+        .filter(|ms| *ms > 0)
+        .and_then(DateTime::<Utc>::from_timestamp_millis)
+        .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true))
         .unwrap_or_default()
 }
 
@@ -1903,7 +1919,8 @@ mod tests {
             resume_command(&claude),
             Some(ResumeAction::Exec {
                 bin: "claude".into(),
-                args: vec!["--resume".into(), "c1".into()]
+                args: vec!["--resume".into(), "c1".into()],
+                workdir: existing_absolute_dir(&claude.project),
             })
         );
         let codex = make_session("x1", "2026-01-01", "codex", "/p", "", "");
@@ -1911,7 +1928,8 @@ mod tests {
             resume_command(&codex),
             Some(ResumeAction::Exec {
                 bin: "codex".into(),
-                args: vec!["resume".into(), "x1".into()]
+                args: vec!["resume".into(), "x1".into()],
+                workdir: existing_absolute_dir(&codex.project),
             })
         );
     }
@@ -1989,6 +2007,18 @@ mod tests {
             "",
         );
         assert_eq!(resume_working_dir(&present).as_deref(), Some(dir.path()));
+        for source in ["claude", "codex"] {
+            for (mut session, expected) in [
+                (missing.clone(), None),
+                (present.clone(), Some(dir.path().to_path_buf())),
+            ] {
+                session.source = source.into();
+                let Some(ResumeAction::Exec { workdir, .. }) = resume_command(&session) else {
+                    panic!("expected exec for {source}");
+                };
+                assert_eq!(workdir, expected);
+            }
+        }
     }
 
     #[test]
@@ -2652,7 +2682,7 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         fs::write(tmp.path(), concat!(
             "{\"role\":\"user\",\"id\":\"u1\",\"timestamp\":\"2026-09-01T10:00:00Z\",\"message\":{\"content\":\"user prompt\"}}\n",
-            "{\"role\":\"assistant\",\"timestamp\":\"invalid\",\"message\":{\"id\":\"a1\",\"createdAt\":1788307200000,\"content\":\"assistant reply\"}}\n",
+            "{\"role\":\"assistant\",\"timestamp\":\"invalid\",\"message\":{\"id\":\"a1\",\"createdAt\":1788307200123,\"content\":\"assistant reply\"}}\n",
             "{\"role\":\"user\",\"message\":{\"content\":\"no timestamp\"}}\n"
         )).unwrap();
         let messages = parse_cursor_jsonl(tmp.path().to_str().unwrap());
@@ -2660,10 +2690,42 @@ mod tests {
         assert_eq!(messages[0].uuid, "u1");
         assert_eq!(messages[0].timestamp, "2026-09-01T10:00:00Z");
         assert_eq!(messages[1].uuid, "a1");
-        assert_eq!(messages[1].timestamp, "2026-09-02T00:00:00Z");
+        assert_eq!(messages[1].timestamp, "2026-09-02T00:00:00.123Z");
         assert!(messages[2].timestamp.is_empty());
         assert!(cursor_timestamp(&serde_json::json!(0)).is_empty());
         assert!(cursor_timestamp(&serde_json::json!(i64::MAX)).is_empty());
+    }
+
+    #[test]
+    fn cursor_timestamps_round_trip_milliseconds_and_preserve_iso_strings() {
+        for ms in [
+            1,
+            1788307200000,
+            1788307200001,
+            1788307200123,
+            1788307200999,
+        ] {
+            let timestamp = cursor_timestamp(&serde_json::json!(ms));
+            assert_eq!(
+                parse_any_timestamp(&timestamp).unwrap().timestamp_millis(),
+                ms
+            );
+        }
+        assert_eq!(
+            cursor_timestamp(&serde_json::json!(1788307200000i64)),
+            "2026-09-02T00:00:00Z"
+        );
+        let iso = "2026-09-02T05:30:00.123456+05:30";
+        assert_eq!(cursor_timestamp(&serde_json::json!(iso)), iso);
+        for invalid in [
+            Value::Null,
+            serde_json::json!(-1),
+            serde_json::json!(0),
+            serde_json::json!(i64::MAX),
+            serde_json::json!("invalid"),
+        ] {
+            assert!(cursor_timestamp(&invalid).is_empty());
+        }
     }
 
     #[test]
