@@ -1,5 +1,6 @@
 //! CLI metadata, as written by Cursor Agent's chat-session-meta.ts (schema 1).
-//! The protobuf blob store is deliberately not treated as a text transcript.
+//! The content-addressed blob store (JSON message bodies, protobuf ordering)
+//! is deliberately not treated as a text transcript.
 
 use crate::session::{Session, cursor_timestamp, mtime_iso, user_home};
 use serde_json::Value;
@@ -90,10 +91,17 @@ fn merge_cli_sessions_from(sessions: &mut Vec<Session>, root: &Path) {
             .filter(|s| s.id.eq_ignore_ascii_case(&id))
         {
             found = true;
-            // A transcript that already knows its workspace takes that copy's
-            // metadata only; another copy's title or path must not replace it.
+            // A transcript takes only the copy from its own workspace: by
+            // absolute path when the slug resolved, else by the project slug
+            // in its file path. Another copy's title or path must not replace
+            // it. A transcript with no workspace evidence at all (a
+            // hook-registered path) follows resume's choice.
             let chat = if Path::new(&session.project).is_absolute() {
                 chats.iter().find(|c| c.project == session.project)
+            } else if let Some(slug) = transcript_project_slug(&session.file) {
+                chats
+                    .iter()
+                    .find(|c| cursor_project_slug(&c.project) == slug)
             } else {
                 chats.first()
             };
@@ -142,6 +150,34 @@ fn merge_cli_sessions_from(sessions: &mut Vec<Session>, root: &Path) {
             also_ide: false,
         });
     }
+}
+
+/// Cursor names `~/.cursor/projects/<slug>` by replacing every run of
+/// non-alphanumeric characters in the workspace path with one hyphen
+/// (matches all 204 resolved transcripts on a real install).
+fn cursor_project_slug(workspace: &str) -> String {
+    let mut slug = String::with_capacity(workspace.len());
+    for c in workspace.chars() {
+        if c.is_ascii_alphanumeric() {
+            slug.push(c);
+        } else if !slug.ends_with('-') && !slug.is_empty() {
+            slug.push('-');
+        }
+    }
+    slug.trim_end_matches('-').to_owned()
+}
+
+/// The `<slug>` component of a transcript stored under `.cursor/projects`.
+fn transcript_project_slug(file: &str) -> Option<String> {
+    let mut components = Path::new(file).components().peekable();
+    while let Some(component) = components.next() {
+        if component.as_os_str() == ".cursor" && components.next()?.as_os_str() == "projects" {
+            return components
+                .next()
+                .map(|slug| slug.as_os_str().to_string_lossy().into_owned());
+        }
+    }
+    None
 }
 
 fn title_of(meta: &Value) -> String {
@@ -258,6 +294,58 @@ mod tests {
             merge_cli_sessions_from(&mut sessions, &root);
             assert_eq!(sessions[0].summary, "New workspace copy", "{old_hash}");
             assert_eq!(Path::new(&sessions[0].project), ws_new, "{old_hash}");
+
+            // Cursor writes one transcript per workspace the chat ran in. When
+            // the slug did not resolve, each transcript keeps its own copy.
+            let transcript_in = |ws: &Path| {
+                let slug = cursor_project_slug(ws.to_str().unwrap());
+                let mut s = sessions[0].clone();
+                s.file =
+                    format!("/home/u/.cursor/projects/{slug}/agent-transcripts/{id}/{id}.jsonl");
+                s.project = slug;
+                s.summary.clear();
+                s
+            };
+            let mut sessions = vec![transcript_in(&ws_old), transcript_in(&ws_new)];
+            merge_cli_sessions_from(&mut sessions, &root);
+            assert_eq!(sessions.len(), 2, "{old_hash}");
+            assert_eq!(sessions[0].summary, "Old workspace copy", "{old_hash}");
+            assert_eq!(Path::new(&sessions[0].project), ws_old, "{old_hash}");
+            assert_eq!(sessions[1].summary, "New workspace copy", "{old_hash}");
+            assert_eq!(Path::new(&sessions[1].project), ws_new, "{old_hash}");
+
+            // An unresolvable slug with several copies is left alone rather
+            // than stamped with another workspace's path.
+            let mut stranger = sessions[0].clone();
+            stranger.file = format!(
+                "/home/u/.cursor/projects/some-Doc-6ac763d/agent-transcripts/{id}/{id}.jsonl"
+            );
+            stranger.project = "some-Doc-6ac763d".into();
+            stranger.summary.clear();
+            let mut sessions = vec![stranger];
+            merge_cli_sessions_from(&mut sessions, &root);
+            assert_eq!(sessions[0].project, "some-Doc-6ac763d", "{old_hash}");
+            assert!(sessions[0].summary.is_empty(), "{old_hash}");
         }
+    }
+
+    #[test]
+    fn project_slug_matches_cursor_naming() {
+        assert_eq!(
+            cursor_project_slug("/Users/me/Documents/GitHub/chat-history"),
+            "Users-me-Documents-GitHub-chat-history"
+        );
+        assert_eq!(
+            cursor_project_slug("/private/tmp/claude-501/-Users-me/x y"),
+            "private-tmp-claude-501-Users-me-x-y"
+        );
+        assert_eq!(
+            transcript_project_slug(
+                "/home/u/.cursor/projects/Users-me-app/agent-transcripts/i/i.jsonl"
+            )
+            .as_deref(),
+            Some("Users-me-app")
+        );
+        assert_eq!(transcript_project_slug("/elsewhere/i.jsonl"), None);
     }
 }
