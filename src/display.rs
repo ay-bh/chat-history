@@ -360,6 +360,12 @@ pub fn print_search_results(results: &[SearchResult], query: &str) {
     }
 }
 
+fn mark_metadata_only(item: &mut serde_json::Value, session: &Session) {
+    if session.is_cursor_store_only() {
+        item["metadata_only"] = serde_json::json!(true);
+    }
+}
+
 pub fn print_search_results_json(results: &[SearchResult], query: &str) {
     let items: Vec<serde_json::Value> = results
         .iter()
@@ -377,9 +383,7 @@ pub fn print_search_results_json(results: &[SearchResult], query: &str) {
                 "tools": r.message.tool_uses,
                 "files": r.message.files_referenced,
             });
-            if r.session.is_cursor_store_only() {
-                item["metadata_only"] = serde_json::json!(true);
-            }
+            mark_metadata_only(&mut item, &r.session);
             item
         })
         .collect();
@@ -402,9 +406,7 @@ pub fn print_index_results_json(results: &[IndexResult], query: &str) {
                 "matched_field": r.matched_field,
                 "snippet": clean_prompt(&r.display).chars().take(200).collect::<String>(),
             });
-            if r.session.is_cursor_store_only() {
-                item["metadata_only"] = serde_json::json!(true);
-            }
+            mark_metadata_only(&mut item, &r.session);
             item
         })
         .collect();

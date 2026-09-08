@@ -2,17 +2,13 @@
 //! The content-addressed blob store (JSON message bodies, protobuf ordering)
 //! is deliberately not treated as a text transcript.
 
-use crate::session::{Session, cursor_timestamp, mtime_iso, user_home};
+use crate::session::{Session, cursor_timestamp, existing_absolute_dir, mtime_iso, user_home};
 use serde_json::Value;
 use std::{
     collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
 };
-
-pub(crate) fn has_store(dir: &Path) -> bool {
-    fs::metadata(dir.join("store.db")).is_ok_and(|m| m.is_file() && m.len() > 0)
-}
 
 pub(crate) fn merge_cli_sessions(sessions: &mut Vec<Session>) {
     let Some(home) = user_home() else {
@@ -24,16 +20,20 @@ pub(crate) fn merge_cli_sessions(sessions: &mut Vec<Session>) {
 /// One `~/.cursor/chats/<workspace-hash>/<id>` directory with a usable store.
 pub(crate) struct CliChat {
     dir: PathBuf,
-    meta: Value,
     pub(crate) project: String,
     updated: i64,
     pub(crate) workspace_exists: bool,
+    title: String,
+    created: String,
+    modified: String,
+    is_subagent: bool,
 }
 
 /// The single rule for what counts as a resumable CLI chat copy. Listing
 /// and `resume` both go through here so they can never disagree.
 fn read_copy(dir: &Path) -> Option<CliChat> {
-    if !has_store(dir) {
+    let store = dir.join("store.db");
+    if !fs::metadata(&store).is_ok_and(|m| m.is_file() && m.len() > 0) {
         return None;
     }
     let meta: Value =
@@ -48,14 +48,26 @@ fn read_copy(dir: &Path) -> Option<CliChat> {
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_owned();
-    let workspace_exists = Path::new(&project).is_absolute() && Path::new(&project).is_dir();
-    let updated = meta.get("updatedAtMs").and_then(Value::as_i64).unwrap_or(0);
+    let mut modified = cursor_timestamp(&meta["updatedAtMs"]);
+    if modified.is_empty() {
+        modified = mtime_iso(&store).unwrap_or_default();
+    }
     Some(CliChat {
         dir: dir.to_path_buf(),
-        meta,
+        workspace_exists: existing_absolute_dir(&project).is_some(),
+        updated: meta.get("updatedAtMs").and_then(Value::as_i64).unwrap_or(0),
+        title: meta
+            .get("title")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned(),
+        created: cursor_timestamp(&meta["createdAtMs"]),
+        is_subagent: meta
+            .get("isSubagent")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
         project,
-        updated,
-        workspace_exists,
+        modified,
     })
 }
 
@@ -141,14 +153,13 @@ fn merge_cli_sessions_from(sessions: &mut Vec<Session>, root: &Path) {
                 continue;
             };
             if session.summary.is_empty() {
-                session.summary = title_of(&chat.meta);
+                session.summary = chat.title.clone();
             }
             if Path::new(&chat.project).is_absolute() {
                 session.project = chat.project.clone();
             }
-            let created = cursor_timestamp(&chat.meta["createdAtMs"]);
-            if !created.is_empty() {
-                session.created = created;
+            if !chat.created.is_empty() {
+                session.created = chat.created.clone();
             }
         }
         if found {
@@ -157,28 +168,20 @@ fn merge_cli_sessions_from(sessions: &mut Vec<Session>, root: &Path) {
         let Some(chat) = chats.into_iter().next() else {
             continue;
         };
-        let mut modified = cursor_timestamp(&chat.meta["updatedAtMs"]);
-        if modified.is_empty() {
-            modified = mtime_iso(&chat.dir.join("store.db")).unwrap_or_default();
-        }
-        let date = modified.get(..10).unwrap_or("").to_owned();
+        let date = chat.modified.get(..10).unwrap_or("").to_owned();
         sessions.push(Session {
             source: "cursor".into(),
             id,
-            summary: title_of(&chat.meta),
+            summary: chat.title,
             first_prompt: String::new(),
-            created: cursor_timestamp(&chat.meta["createdAtMs"]),
-            modified,
+            created: chat.created,
+            modified: chat.modified,
             date,
             messages: 0,
             branch: String::new(),
             project: chat.project,
             file: chat.dir.join("store.db").to_string_lossy().into_owned(),
-            is_sidechain: chat
-                .meta
-                .get("isSubagent")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
+            is_sidechain: chat.is_subagent,
             also_ide: false,
         });
     }
@@ -201,7 +204,7 @@ fn cursor_project_slug(workspace: &str) -> String {
 
 /// The `<slug>` component of a transcript stored under `.cursor/projects`.
 fn transcript_project_slug(file: &str) -> Option<String> {
-    let mut components = Path::new(file).components().peekable();
+    let mut components = Path::new(file).components();
     while let Some(component) = components.next() {
         if component.as_os_str() == ".cursor" && components.next()?.as_os_str() == "projects" {
             return components
@@ -210,13 +213,6 @@ fn transcript_project_slug(file: &str) -> Option<String> {
         }
     }
     None
-}
-
-fn title_of(meta: &Value) -> String {
-    meta.get("title")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_owned()
 }
 
 #[cfg(test)]

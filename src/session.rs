@@ -303,7 +303,7 @@ pub fn resume_command(session: &Session) -> Option<ResumeAction> {
         "cursor" => {
             // Only chats the Agent CLI itself stored can be resumed, and only
             // from their own workspace; anything else would start a blank chat.
-            let cwd = cursor_cli_chat_cwd(session)?;
+            let cwd = crate::cursor_cli::resume_workspace(session)?;
             let mut args = Vec::new();
             let (bin, print_only): (String, bool) = if command_on_path("agent") {
                 ("agent".into(), false)
@@ -350,28 +350,16 @@ fn shell_quote(arg: &str) -> String {
 /// Directory the resumed tool should start in (the session's spawn cwd).
 pub fn resume_working_dir(session: &Session) -> Option<PathBuf> {
     if session.source == "cursor" {
-        return cursor_cli_chat_cwd(session);
+        return crate::cursor_cli::resume_workspace(session);
     }
     existing_absolute_dir(&session.project)
-}
-
-/// Workspace of the Cursor Agent CLI chat for this session, if the CLI has a
-/// store for it. The CLI keeps its sessions under
-/// `~/.cursor/chats/<hash of cwd>/<chat id>/{store.db,meta.json}` and looks a
-/// chat up by (workspace, id): resuming from another `--workspace` silently
-/// starts a blank chat that reuses the id. IDE sidebar chats also write
-/// `agent-transcripts` but never have such a store, so they get the sidebar
-/// hint instead. Copy selection lives in `cursor_cli` so listing and resume
-/// share it.
-pub fn cursor_cli_chat_cwd(session: &Session) -> Option<PathBuf> {
-    crate::cursor_cli::resume_workspace(session)
 }
 
 /// `project` as an existing, absolute directory. Cursor slugs that could not
 /// be decoded are kept verbatim (relative) for display; they must never be
 /// used as a cwd or `--workspace`, or a same-named subdirectory of the
 /// current directory would be picked up silently.
-fn existing_absolute_dir(project: &str) -> Option<PathBuf> {
+pub(crate) fn existing_absolute_dir(project: &str) -> Option<PathBuf> {
     if project.is_empty() {
         return None;
     }
@@ -1603,7 +1591,7 @@ pub(crate) fn parse_session_with_cursor_timestamps(
         } else {
             parse_cursor_jsonl(&session.file)
         };
-        if recover_timestamps && !session.is_cursor_store_only() {
+        if recover_timestamps {
             crate::cursor_ide::enrich_transcript_timestamps(session, &mut messages);
         }
         if extract_meta {
