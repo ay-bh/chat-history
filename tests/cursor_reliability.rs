@@ -163,6 +163,13 @@ fn metadata_only_cursor_sessions_are_visible_and_cannot_export_an_empty_transcri
             .assert()
             .failure()
             .stderr(predicate::str::contains("Only metadata is available"));
+        // `--last` over a list that is entirely metadata-only must not
+        // claim "Session not found" for rows the listing just showed.
+        command(&tmp)
+            .args(["--source", "cursor", verb, "--last"])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("Only metadata is available"));
     }
     let output = tmp.path().join("existing.md");
     fs::write(&output, "existing user export").unwrap();

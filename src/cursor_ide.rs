@@ -6,7 +6,8 @@ use crate::session::{Message, Session, cursor_entry_timestamp, parse_any_timesta
 use chrono::{TimeZone, Utc};
 use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 pub fn cursor_user_dir() -> PathBuf {
@@ -477,11 +478,68 @@ pub fn enrich_transcript_timestamps(session: &Session, messages: &mut [Message])
     if !db.is_file() {
         return;
     }
-    let Some(conn) = open_ro(&db) else {
-        return;
-    };
-    let bubbles = load_bubbles_as_messages(&conn, session);
-    merge_message_timestamps(messages, &bubbles);
+    // Deep search enriches many sessions from a rayon pool. Keep one
+    // read-only connection per worker thread instead of reopening the
+    // (multi-GB) database for every transcript, and skip composers the
+    // database has never heard of without touching cursorDiskKV.
+    ENRICH_SOURCE.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        if slot.as_ref().is_none_or(|source| source.path != db) {
+            let Some(conn) = open_ro(&db) else {
+                return;
+            };
+            let _ = conn.busy_timeout(std::time::Duration::from_secs(2));
+            let composers = known_composer_ids(&conn);
+            *slot = Some(EnrichSource {
+                path: db.clone(),
+                conn,
+                composers,
+            });
+        }
+        let Some(source) = slot.as_ref() else {
+            return;
+        };
+        if !source.composers.contains(&session.id.to_ascii_lowercase()) {
+            return;
+        }
+        // Matching is by id or text, never by position, so the bubbles can
+        // stay unordered. That avoids reading the composer's `composerData`
+        // record (its full context payload) just to learn the order.
+        let bubbles: Vec<Message> = load_bubbles_range(&source.conn, &session.id)
+            .iter()
+            .filter_map(|entry| message_from_bubble(session, entry))
+            .collect();
+        merge_message_timestamps(messages, &bubbles);
+    });
+}
+
+struct EnrichSource {
+    path: PathBuf,
+    conn: Connection,
+    composers: HashSet<String>,
+}
+
+thread_local! {
+    static ENRICH_SOURCE: RefCell<Option<EnrichSource>> = const { RefCell::new(None) };
+}
+
+/// Composer ids with a header or a `composerData:` record. Headers can be
+/// pruned while message data remains, so both sources count.
+fn known_composer_ids(conn: &Connection) -> HashSet<String> {
+    let mut ids = HashSet::new();
+    for sql in [
+        "SELECT composerId FROM composerHeaders",
+        "SELECT substr(key, 14) FROM cursorDiskKV WHERE key >= 'composerData:' AND key < 'composerData;'",
+    ] {
+        let Ok(mut stmt) = conn.prepare(sql) else {
+            continue;
+        };
+        let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(0)) else {
+            continue;
+        };
+        ids.extend(rows.flatten().map(|id| id.to_ascii_lowercase()));
+    }
+    ids
 }
 
 fn merge_message_timestamps(messages: &mut [Message], bubbles: &[Message]) {

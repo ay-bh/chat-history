@@ -234,6 +234,24 @@ fn require_readable_transcript(session: &session::Session) {
     }
 }
 
+/// `--last` target: the most recent session with a readable transcript.
+fn latest_readable_or_exit(filtered: &[session::Session]) -> &session::Session {
+    if let Some(s) = filtered
+        .iter()
+        .filter(|s| !s.is_cursor_store_only())
+        .max_by_key(|s| session::recency_key(s))
+    {
+        return s;
+    }
+    if let Some(s) = filtered.iter().max_by_key(|s| session::recency_key(s)) {
+        // Every match is a Cursor CLI chat without a transcript. Say so
+        // instead of claiming nothing matched what the listing just showed.
+        require_readable_transcript(s);
+    }
+    eprintln!("Session not found");
+    std::process::exit(1);
+}
+
 fn main() {
     // Rust ignores SIGPIPE by default, turning writes to a closed pipe
     // (e.g. `chat-history ... | head`) into println! panics. Restore the
@@ -377,15 +395,7 @@ fn main() {
         }
         Some(Commands::Inspect { session_id, last }) => {
             let session = if last {
-                let Some(s) = filtered
-                    .iter()
-                    .filter(|s| !s.is_cursor_store_only())
-                    .max_by_key(|s| session::recency_key(s))
-                else {
-                    eprintln!("Session not found");
-                    std::process::exit(1);
-                };
-                s
+                latest_readable_or_exit(&filtered)
             } else if let Some(sid) = &session_id {
                 resolve_session_or_exit(&sessions, sid)
             } else {
@@ -405,15 +415,7 @@ fn main() {
             plain,
         }) => {
             let session = if last {
-                let Some(s) = filtered
-                    .iter()
-                    .filter(|s| !s.is_cursor_store_only())
-                    .max_by_key(|s| session::recency_key(s))
-                else {
-                    eprintln!("Session not found");
-                    std::process::exit(1);
-                };
-                s
+                latest_readable_or_exit(&filtered)
             } else if let Some(sid) = &session_id {
                 resolve_session_or_exit(&sessions, sid)
             } else {

@@ -91,6 +91,7 @@ fn read_records(db: &Path) -> Vec<HookRecord> {
     }
     let read = || -> rusqlite::Result<Vec<HookRecord>> {
         let conn = Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        conn.busy_timeout(std::time::Duration::from_secs(2))?;
         let mut stmt =
             conn.prepare("SELECT metadata FROM transcripts ORDER BY conversation_id, path")?;
         let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
@@ -175,6 +176,7 @@ pub(crate) fn registered_model(session: &Session) -> Option<String> {
         return None;
     }
     let conn = Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
+    conn.busy_timeout(std::time::Duration::from_secs(2)).ok()?;
     let raw: String = conn
         .query_row(
             "SELECT metadata FROM transcripts WHERE conversation_id = ?1 AND path = ?2",
