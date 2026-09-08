@@ -502,15 +502,17 @@ pub fn enrich_transcript_timestamps(session: &Session, messages: &mut [Message])
         if !source.composers.contains(&session.id.to_ascii_lowercase()) {
             return;
         }
-        // Matching is by id or text, never by position, so the bubbles can
-        // stay unordered. That avoids reading the composer's `composerData`
-        // record (its full context payload) just to learn the order.
-        let bubbles: Vec<Message> = load_bubbles_range(&source.conn, &session.id)
-            .iter()
-            .filter_map(|entry| message_from_bubble(session, entry))
-            .collect();
-        merge_message_timestamps(messages, &bubbles);
+        enrich_from(&source.conn, session, messages);
     });
+}
+
+fn enrich_from(conn: &Connection, session: &Session, messages: &mut [Message]) {
+    // The same loader the IDE reader uses, so every bubble the sidebar
+    // shows is a candidate here too (including ones whose `type` only the
+    // conversation headers carry). A range-only shortcut measured no
+    // faster and silently dropped those.
+    let bubbles = load_bubbles_as_messages(conn, session);
+    merge_message_timestamps(messages, &bubbles);
 }
 
 struct EnrichSource {
@@ -898,6 +900,41 @@ mod tests {
         assert_eq!(sessions[0].summary, "older header");
         assert_eq!(sessions[0].created, "2026-09-01T00:00:00Z");
         assert!(sessions[0].is_sidechain);
+    }
+
+    #[test]
+    fn enrichment_recovers_bubble_type_from_conversation_headers() {
+        let (_tmp, db) = fixture_db();
+        let conn = Connection::open(&db).unwrap();
+        let id = "aaaa1111-bbbb-cccc-dddd-eeeeeeeeeeee";
+        // Some bubbles carry no `type`; the IDE reader takes it from the
+        // conversation headers, and enrichment must do the same.
+        conn.execute(
+            "INSERT INTO cursorDiskKV (key, value) VALUES (?1, ?2)",
+            rusqlite::params![
+                format!("bubbleId:{id}:b2"),
+                serde_json::json!({"text":"Second question","bubbleId":"b2","createdAt":"2026-07-01T21:30:00.000Z"}).to_string()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO cursorDiskKV (key, value) VALUES (?1, ?2)",
+            rusqlite::params![
+                format!("composerData:{id}"),
+                serde_json::json!({"fullConversationHeadersOnly":[{"bubbleId":"b1","type":1},{"bubbleId":"b2","type":1}]}).to_string()
+            ],
+        )
+        .unwrap();
+        let sessions = load_cursor_ide_sessions_from(&db);
+        let mut messages = parse_cursor_ide(&sessions[0]);
+        assert_eq!(messages.len(), 2, "IDE reader sees both bubbles");
+        for m in &mut messages {
+            m.timestamp.clear();
+            m.uuid.clear();
+        }
+        enrich_from(&conn, &sessions[0], &mut messages);
+        assert_eq!(messages[0].timestamp, "2026-07-01T21:25:09.594Z");
+        assert_eq!(messages[1].timestamp, "2026-07-01T21:30:00.000Z");
     }
 
     #[test]

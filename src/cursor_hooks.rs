@@ -131,18 +131,15 @@ fn merge_records(sessions: &mut Vec<Session>, records: Vec<HookRecord>) {
             .find(|p| Path::new(p).is_absolute())
             .cloned()
             .unwrap_or_default();
+        // A file the scan already listed only gains the hook's workspace.
+        // Any other usable file is one more copy of the conversation, listed
+        // like scanned copies are; `inspect`/`resume`/`find` pick one copy.
+        // Skipping by id here would hide a transcript written later at a
+        // path that happens to sort after an older one.
         if let Some(session) = sessions.iter_mut().find(|s| Path::new(&s.file) == path) {
             if session.id == record.conversation_id && !project.is_empty() {
                 session.project = project;
             }
-            continue;
-        }
-        // Keep an existing transcript for this conversation. Hooks must not
-        // make existing rows disappear or double-count a session.
-        if sessions
-            .iter()
-            .any(|s| s.id.eq_ignore_ascii_case(&record.conversation_id))
-        {
             continue;
         }
         let modified = mtime_iso(path).unwrap_or_default();
@@ -243,5 +240,30 @@ mod tests {
             .unwrap();
         assert!(!stored.contains("not-stored"));
         assert!(!stored.contains("prompt"));
+    }
+
+    #[test]
+    fn every_usable_registered_transcript_is_listed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = tmp.path().join("hooks.db");
+        // Registered later but sorts first by path: ordering must not decide.
+        let old = tmp.path().join("a-old.jsonl");
+        let new = tmp.path().join("z-new.jsonl");
+        for (file, text) in [(&old, "old question"), (&new, "new question")] {
+            std::fs::write(
+                file,
+                format!("{{\"role\":\"user\",\"message\":{{\"content\":\"{text}\"}}}}\n"),
+            )
+            .unwrap();
+            let event = serde_json::json!({"conversation_id":"hook-id", "transcript_path":file});
+            record_hook_at(event.to_string().as_bytes(), &db).unwrap();
+        }
+        let mut sessions = Vec::new();
+        merge_records(&mut sessions, read_records(&db));
+        let prompts: Vec<&str> = sessions.iter().map(|s| s.first_prompt.as_str()).collect();
+        assert!(prompts.contains(&"new question"), "{prompts:?}");
+        assert!(prompts.contains(&"old question"), "{prompts:?}");
+        merge_records(&mut sessions, read_records(&db));
+        assert_eq!(sessions.len(), 2, "re-merging must not duplicate");
     }
 }
