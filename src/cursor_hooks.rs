@@ -203,7 +203,10 @@ fn merge_records(sessions: &mut Vec<Session>, records: Vec<HookRecord>) {
             messages: 0,
             branch: String::new(),
             project,
-            is_sidechain: path.components().any(|c| c.as_os_str() == "subagents"),
+            is_sidechain: path
+                .parent()
+                .and_then(|d| d.file_name())
+                .is_some_and(|d| d == "subagents"),
             file: path.to_string_lossy().into_owned(),
             also_ide: false,
         });
@@ -312,6 +315,29 @@ mod tests {
             assert_eq!(sessions.len(), 1);
             assert_eq!(sessions[0].project, after);
         }
+    }
+
+    #[test]
+    fn only_a_subagents_parent_directory_marks_a_hook_row_as_sidechain() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = tmp.path().join("hooks.db");
+        let top = tmp.path().join("subagents-volume/chats/top.jsonl");
+        let sub = tmp.path().join("chats/subagents/sub.jsonl");
+        for (file, id) in [(&top, "top-id"), (&sub, "sub-id")] {
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(
+                file,
+                "{\"role\":\"user\",\"message\":{\"content\":\"q\"}}\n",
+            )
+            .unwrap();
+            let event = serde_json::json!({"conversation_id":id, "transcript_path":file});
+            record_hook_at(event.to_string().as_bytes(), &db).unwrap();
+        }
+        let mut sessions = Vec::new();
+        merge_records(&mut sessions, read_records(&db, true));
+        let flag = |id: &str| sessions.iter().find(|s| s.id == id).unwrap().is_sidechain;
+        assert!(!flag("top-id"));
+        assert!(flag("sub-id"));
     }
 
     #[test]

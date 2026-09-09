@@ -1129,7 +1129,14 @@ pub fn merge_cursor_sessions(agents: Vec<Session>, ide: Vec<Session>) -> Vec<Ses
                 // Only a composer with messages carries real activity: a
                 // header the sidebar merely touched must not move the
                 // transcript's dates or override the CLI store's creation time.
-                if ide_session.messages > 0 && !ide_session.created.is_empty() {
+                // Creation is the earliest known time; the CLI store's
+                // createdAtMs, set moments earlier, is never pushed later.
+                if ide_session.messages > 0
+                    && !ide_session.created.is_empty()
+                    && (agents[index].created.is_empty()
+                        || parse_any_timestamp(&ide_session.created)
+                            < parse_any_timestamp(&agents[index].created))
+                {
                     agents[index].created = ide_session.created.clone();
                 }
                 // The transcript's own mtime is its activity time; a
@@ -2156,12 +2163,15 @@ mod tests {
         assert_eq!(merged[0].date, "2026-08-01");
         assert_eq!(merged[0].created, "2026-07-30T10:00:00Z");
         assert!(merged[0].also_ide);
-        // With bubbles the IDE's creation time counts, but its lastUpdatedAt
-        // still never moves the transcript (a sidebar reopen bumps it too).
+        // With bubbles the IDE's creation time counts only when earlier than
+        // what is known; lastUpdatedAt still never moves the transcript.
         touched.messages = 3;
-        let merged = merge_cursor_sessions(vec![transcript], vec![touched.clone()]);
+        let merged = merge_cursor_sessions(vec![transcript.clone()], vec![touched.clone()]);
         assert_eq!(merged[0].modified, "2026-08-01T10:00:00Z");
-        assert_eq!(merged[0].created, "2026-09-08T09:00:00Z");
+        assert_eq!(merged[0].created, "2026-07-30T10:00:00Z");
+        touched.created = "2026-07-01T09:00:00Z".into();
+        let merged = merge_cursor_sessions(vec![transcript], vec![touched.clone()]);
+        assert_eq!(merged[0].created, "2026-07-01T09:00:00Z");
         // A store-only row superseded by a readable IDE row hands over the
         // workspace, title, and creation time the IDE header lacks.
         let mut store = make_session(

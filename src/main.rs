@@ -416,6 +416,16 @@ fn main() {
                 eprintln!("No session with that ID — searching transcripts...");
             }
             let results = search::scored_search(&pre, &query, &scope, limit, timeframe.as_deref());
+            if scoring::is_uuid(&query)
+                && !json_output
+                && timeframe.is_some()
+                && results.is_empty()
+                && pre.iter().any(|s| s.id.eq_ignore_ascii_case(query.trim()))
+            {
+                eprintln!(
+                    "That session exists but has no activity in the --timeframe; drop the flag to open it."
+                );
+            }
             if json_output {
                 display::print_search_results_json(&results, &query);
             } else {
@@ -504,9 +514,13 @@ fn main() {
             {
                 // The listed workspace (a path, or a slug no store matched)
                 // has no resumable store; say where the chat is reopened.
+                let listed = if std::path::Path::new(&session.project).is_absolute() {
+                    display::abbreviate_home(&session.project)
+                } else {
+                    format!("workspace slug {}", session.project)
+                };
                 eprintln!(
-                    "Note: no resumable Agent CLI store in {}; resuming in {}",
-                    display::abbreviate_home(&session.project),
+                    "Note: no resumable Agent CLI store in {listed}; resuming in {}",
                     display::abbreviate_home(&dir.to_string_lossy())
                 );
             }

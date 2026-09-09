@@ -428,6 +428,49 @@ fn uuid_lookup_respects_timeframe() {
 }
 
 #[test]
+fn empty_conversation_flag_hides_a_store_only_row_but_never_blocks_resume() {
+    let tmp = TempDir::new().unwrap();
+    cli_store_with(
+        &tmp,
+        "h",
+        json!({"schemaVersion":1, "cwd":tmp.path(), "title":"flagged empty",
+        "createdAtMs":1788220800000i64, "updatedAtMs":1788307200000i64, "hasConversation":false}),
+    );
+    // Alone, the store lists nothing (Cursor hides it too)...
+    command(&tmp)
+        .args(["--source", "cursor"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("flagged empty").not());
+    // ...but a transcript proves the chat happened, and the store resumes it.
+    transcript(&tmp, false);
+    let path = agent_shim(&tmp);
+    command(&tmp)
+        .args(["resume", ID])
+        .env("PATH", &path)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("SHIM workspace:"));
+}
+
+#[test]
+fn uuid_outside_the_timeframe_says_so() {
+    let tmp = TempDir::new().unwrap();
+    let path = transcript(&tmp, false);
+    fs::File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_577_836_800))
+        .unwrap();
+    command(&tmp)
+        .args(["search", ID, "--deep", "--timeframe", "today"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("no activity in the --timeframe"));
+}
+
+#[test]
 fn native_cursor_timestamps_enable_timeframe_search() {
     let tmp = TempDir::new().unwrap();
     transcript(&tmp, true);

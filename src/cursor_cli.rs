@@ -33,13 +33,13 @@ pub(crate) struct CliChat {
     is_subagent: bool,
     /// meta.json schemaVersion label when it is not the supported 1.
     unsupported_schema: Option<String>,
+    has_conversation: bool,
 }
 
 /// Why a `~/.cursor/chats/<hash>/<id>` directory is not a usable copy.
 enum Skip {
     NoStore,
     BadMeta,
-    Empty,
 }
 
 /// The single rule for what counts as a resumable CLI chat copy. Listing
@@ -58,9 +58,10 @@ fn read_copy(dir: &Path) -> Result<CliChat, Skip> {
     let schema = meta.get("schemaVersion").and_then(Value::as_u64);
     let unsupported_schema =
         (schema != Some(1)).then(|| schema.map_or("(none)".to_owned(), |v| v.to_string()));
-    if meta.get("hasConversation").and_then(Value::as_bool) == Some(false) {
-        return Err(Skip::Empty);
-    }
+    // Cursor's own list hides a chat it marked as empty; the store itself is
+    // still what `agent --resume` needs, so resume keeps working (as on
+    // 0.4.0) when a transcript proves the chat happened.
+    let has_conversation = meta.get("hasConversation").and_then(Value::as_bool) != Some(false);
     let project = meta
         .get("cwd")
         .and_then(Value::as_str)
@@ -82,6 +83,7 @@ fn read_copy(dir: &Path) -> Result<CliChat, Skip> {
             .unwrap_or(false),
         project,
         unsupported_schema,
+        has_conversation,
     })
 }
 
@@ -92,7 +94,7 @@ pub fn unresumable_reason(session: &Session) -> Option<String> {
 }
 
 fn unresumable_reason_in(chats_dir: &Path, session: &Session) -> Option<String> {
-    let (mut gone, mut blank, mut empty, mut bad_meta) = (Vec::new(), false, false, false);
+    let (mut gone, mut blank, mut bad_meta) = (Vec::new(), false, false);
     let note = |list: &mut Vec<String>, v: String| {
         if !list.contains(&v) {
             list.push(v);
@@ -103,7 +105,6 @@ fn unresumable_reason_in(chats_dir: &Path, session: &Session) -> Option<String> 
             Ok(copy) if copy.workspace_exists => return None,
             Ok(copy) if copy.project.is_empty() => blank = true,
             Ok(copy) => note(&mut gone, copy.project),
-            Err(Skip::Empty) => empty = true,
             Err(Skip::BadMeta) => bad_meta = true,
             Err(Skip::NoStore) => {}
         }
@@ -117,10 +118,7 @@ fn unresumable_reason_in(chats_dir: &Path, session: &Session) -> Option<String> 
     if blank {
         return Some("its meta.json records no workspace directory.".to_owned());
     }
-    if bad_meta {
-        return Some("its meta.json is missing or unreadable.".to_owned());
-    }
-    empty.then(|| "Cursor recorded it as an empty conversation.".to_owned())
+    bad_meta.then(|| "its meta.json is missing or unreadable.".to_owned())
 }
 
 /// Two spellings of one directory (symlinks, `/private/tmp` vs `/tmp`).
@@ -212,7 +210,11 @@ fn merge_cli_sessions_from(sessions: &mut Vec<Session>, root: &Path) {
             .filter(|s| s.id.eq_ignore_ascii_case(&id))
             .collect();
         if listed.is_empty() {
-            push_store_only(sessions, id, chats.swap_remove(0));
+            // Nothing else proves the chat happened: list it only if Cursor
+            // itself would (the store may still be resumable).
+            if chats[0].has_conversation {
+                push_store_only(sessions, id, chats.swap_remove(0));
+            }
             continue;
         }
         for session in listed {
