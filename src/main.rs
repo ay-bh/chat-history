@@ -417,7 +417,6 @@ fn main() {
             }
             let results = search::scored_search(&pre, &query, &scope, limit, timeframe.as_deref());
             if scoring::is_uuid(&query)
-                && !json_output
                 && timeframe.is_some()
                 && results.is_empty()
                 && pre.iter().any(|s| s.id.eq_ignore_ascii_case(query.trim()))
@@ -471,6 +470,9 @@ fn main() {
                     // reason; the sidebar hint is only for chats without one.
                     if let Some(reason) = chat_history::cursor_cli::unresumable_reason(session) {
                         eprintln!("Cannot resume Agent CLI chat {}: {reason}", session.id);
+                        if session.is_ide_ui() {
+                            print!("{}", display::cursor_ide_resume_hint(session));
+                        }
                     } else {
                         if !session.is_ide_ui() {
                             eprintln!(

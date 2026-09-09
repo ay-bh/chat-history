@@ -60,7 +60,7 @@ chat-history --branch feature-xyz -k "auth" -v    # branch / keyword filters
 # Search (always --deep --json from agents)
 chat-history search "auth error" --deep --json
 chat-history search "fix" --scope errors --deep --json   # only messages with error patterns
-chat-history search <full-uuid>                          # direct session lookup
+chat-history search <full-uuid>                          # direct session lookup (with --timeframe: only if active in the window)
 chat-history search "q" --deep --json --limit 30         # default limit is 15
 
 # Inspect / View / Export / Resume / Find

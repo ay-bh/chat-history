@@ -747,8 +747,11 @@ fn existing_slug_paths(root: &Path, rest: &str) -> Vec<PathBuf> {
 
 pub fn load_cursor_sessions() -> Vec<Session> {
     let mut sessions = load_cursor_transcripts();
-    crate::cursor_hooks::merge_registered_transcripts(&mut sessions);
+    // The CLI store knows the exact directory a chat ran in and can match an
+    // undecoded slug; hooks only know the IDE window's roots, so they fill
+    // whatever is still unpinned afterwards.
     crate::cursor_cli::merge_cli_sessions(&mut sessions);
+    crate::cursor_hooks::merge_registered_transcripts(&mut sessions);
     sessions
 }
 
@@ -1086,7 +1089,9 @@ pub fn merge_cursor_sessions(agents: Vec<Session>, ide: Vec<Session>) -> Vec<Ses
         else {
             return true;
         };
-        if readable.project.is_empty() {
+        // The store's cwd is where the chat ran; the IDE row carries the
+        // window root, which resume would otherwise flag as a fallback.
+        if Path::new(&s.project).is_absolute() || readable.project.is_empty() {
             readable.project = s.project.clone();
         }
         if readable.summary.is_empty() {
@@ -2185,7 +2190,7 @@ mod tests {
         store.file = "/home/.cursor/chats/h/id/store.db".into();
         store.created = "2026-07-30T10:00:00Z".into();
         let mut bare = touched.clone();
-        bare.project.clear();
+        bare.project = "/Users/me".into(); // the IDE window root, not the chat's cwd
         bare.created.clear();
         let merged = merge_cursor_sessions(vec![store], vec![bare]);
         assert_eq!(merged.len(), 1);

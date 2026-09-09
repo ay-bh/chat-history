@@ -363,7 +363,9 @@ fn ide_indexed_transcript_with_an_unusable_store_gets_the_reason() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("no longer exists"))
-        .stdout(predicate::str::contains("IDE chats cannot be resumed").not());
+        // The reason comes first; the sidebar pointer still follows for an
+        // IDE-indexed chat, since the IDE may open it.
+        .stdout(predicate::str::contains("Cursor IDE UI"));
 }
 
 #[test]
@@ -468,6 +470,88 @@ fn uuid_outside_the_timeframe_says_so() {
         .assert()
         .success()
         .stderr(predicate::str::contains("no activity in the --timeframe"));
+    // The note is stderr, so JSON consumers get it too without corrupting stdout.
+    command(&tmp)
+        .args(["search", ID, "--deep", "--json", "--timeframe", "today"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("no activity in the --timeframe"));
+}
+
+fn slug_of(path: &Path) -> String {
+    let mut slug = String::new();
+    for c in path.to_string_lossy().chars() {
+        if c.is_ascii_alphanumeric() {
+            slug.push(c);
+        } else if !slug.ends_with('-') && !slug.is_empty() {
+            slug.push('-');
+        }
+    }
+    slug.trim_end_matches('-').to_owned()
+}
+
+#[test]
+fn cli_store_pins_the_workspace_before_the_hook_fills_it() {
+    // A dotted directory name makes the slug undecodable from the filesystem,
+    // so only the CLI store (by slug) or the hook (by IDE root) can supply
+    // the workspace; the store's exact cwd must win over the window root.
+    let tmp = TempDir::new().unwrap();
+    let ws = tmp.path().join("my.app");
+    fs::create_dir_all(&ws).unwrap();
+    let file = tmp.path().join(format!(
+        ".cursor/projects/{}/agent-transcripts/{ID}/{ID}.jsonl",
+        slug_of(&ws)
+    ));
+    fs::create_dir_all(file.parent().unwrap()).unwrap();
+    fs::write(
+        &file,
+        "{\"role\":\"user\",\"message\":{\"content\":\"dotted workspace chat\"}}\n",
+    )
+    .unwrap();
+    cli_store_with(
+        &tmp,
+        "h",
+        json!({"schemaVersion":1, "cwd":ws, "title":"Dotted workspace",
+        "createdAtMs":1788220800000i64, "updatedAtMs":1788307200000i64, "hasConversation":true}),
+    );
+    command(&tmp)
+        .arg("cursor-hook")
+        .write_stdin(
+            json!({"conversation_id":ID, "transcript_path":file, "workspace_roots":[tmp.path()]})
+                .to_string(),
+        )
+        .assert()
+        .success();
+    command(&tmp)
+        .args(["--source", "cursor", "-v"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Dotted workspace"))
+        .stdout(predicate::str::contains("DIR: ~/my.app"));
+}
+
+#[test]
+fn a_hook_transcript_supersedes_the_store_only_row_it_arrives_after() {
+    let tmp = TempDir::new().unwrap();
+    cli_store(&tmp, true);
+    let file = tmp.path().join("elsewhere.jsonl");
+    fs::write(
+        &file,
+        "{\"role\":\"user\",\"message\":{\"content\":\"registered later\"}}\n",
+    )
+    .unwrap();
+    command(&tmp)
+        .arg("cursor-hook")
+        .write_stdin(json!({"conversation_id":ID, "transcript_path":file}).to_string())
+        .assert()
+        .success();
+    command(&tmp)
+        .args(["--source", "cursor"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("1 sessions"))
+        .stdout(predicate::str::contains("CLI store discovery"))
+        .stdout(predicate::str::contains("metadata only").not());
 }
 
 #[test]

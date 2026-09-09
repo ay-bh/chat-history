@@ -177,6 +177,8 @@ fn merge_records(sessions: &mut Vec<Session>, records: Vec<HookRecord>) {
         }) {
             // Fill a workspace the scan could not decode; never replace one
             // it did (or the CLI store pinned).
+            // Fill a workspace the scan could not decode; never replace one
+            // it did (or the CLI store, merged earlier, pinned).
             if !Path::new(&session.project).is_absolute() {
                 let project = root_for(&session.project);
                 if !project.is_empty() {
@@ -185,6 +187,19 @@ fn merge_records(sessions: &mut Vec<Session>, records: Vec<HookRecord>) {
             }
             continue;
         }
+        // A transcript supersedes the store-only row the CLI merge (which
+        // runs first) may have listed for this id; keep its title and times.
+        let mut summary = String::new();
+        let mut created = String::new();
+        sessions.retain(|s| {
+            let superseded =
+                s.is_cursor_store_only() && s.id.eq_ignore_ascii_case(&record.conversation_id);
+            if superseded {
+                summary = s.summary.clone();
+                created = s.created.clone();
+            }
+            !superseded
+        });
         let modified = mtime_iso(&path).unwrap_or_default();
         let date = modified.get(..10).unwrap_or("").to_owned();
         let first_prompt = if path.extension().is_some_and(|e| e == "txt") {
@@ -195,9 +210,13 @@ fn merge_records(sessions: &mut Vec<Session>, records: Vec<HookRecord>) {
         sessions.push(Session {
             source: "cursor".into(),
             id: record.conversation_id,
-            summary: String::new(),
+            summary,
             first_prompt,
-            created: modified.clone(),
+            created: if created.is_empty() {
+                modified.clone()
+            } else {
+                created
+            },
             modified,
             date,
             messages: 0,

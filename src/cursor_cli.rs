@@ -212,7 +212,7 @@ fn merge_cli_sessions_from(sessions: &mut Vec<Session>, root: &Path) {
         if listed.is_empty() {
             // Nothing else proves the chat happened: list it only if Cursor
             // itself would (the store may still be resumable).
-            if chats[0].has_conversation {
+            if chats.iter().any(|c| c.has_conversation) {
                 push_store_only(sessions, id, chats.swap_remove(0));
             }
             continue;
@@ -453,6 +453,25 @@ mod tests {
             here.to_str().unwrap(),
             here.to_str().unwrap()
         ));
+    }
+
+    #[test]
+    fn a_newer_empty_copy_does_not_hide_a_real_conversation() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let chats = tmp.path().join("chats");
+        let (ws_a, ws_b) = (tmp.path().join("a"), tmp.path().join("b"));
+        fs::create_dir_all(&ws_a).unwrap();
+        fs::create_dir_all(&ws_b).unwrap();
+        write_copy(&chats, "a", "id", "Real chat", &ws_a, 1);
+        write_copy(&chats, "b", "id", "", &ws_b, 2);
+        let meta = chats.join("b/id/meta.json");
+        let flagged = fs::read_to_string(&meta)
+            .unwrap()
+            .replace("\"hasConversation\":true", "\"hasConversation\":false");
+        fs::write(&meta, flagged).unwrap();
+        let mut sessions = Vec::new();
+        merge_cli_sessions_from(&mut sessions, &chats);
+        assert_eq!(sessions.len(), 1);
     }
 
     #[test]
