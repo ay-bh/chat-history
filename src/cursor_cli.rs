@@ -92,7 +92,7 @@ pub fn unresumable_reason(session: &Session) -> Option<String> {
 }
 
 fn unresumable_reason_in(chats_dir: &Path, session: &Session) -> Option<String> {
-    let (mut gone, mut blank, mut empty) = (Vec::new(), false, false);
+    let (mut gone, mut blank, mut empty, mut bad_meta) = (Vec::new(), false, false, false);
     let note = |list: &mut Vec<String>, v: String| {
         if !list.contains(&v) {
             list.push(v);
@@ -104,7 +104,8 @@ fn unresumable_reason_in(chats_dir: &Path, session: &Session) -> Option<String> 
             Ok(copy) if copy.project.is_empty() => blank = true,
             Ok(copy) => note(&mut gone, copy.project),
             Err(Skip::Empty) => empty = true,
-            Err(_) => {}
+            Err(Skip::BadMeta) => bad_meta = true,
+            Err(Skip::NoStore) => {}
         }
     }
     if !gone.is_empty() {
@@ -115,6 +116,9 @@ fn unresumable_reason_in(chats_dir: &Path, session: &Session) -> Option<String> 
     }
     if blank {
         return Some("its meta.json records no workspace directory.".to_owned());
+    }
+    if bad_meta {
+        return Some("its meta.json is missing or unreadable.".to_owned());
     }
     empty.then(|| "Cursor recorded it as an empty conversation.".to_owned())
 }
@@ -447,6 +451,24 @@ mod tests {
             here.to_str().unwrap(),
             here.to_str().unwrap()
         ));
+    }
+
+    #[test]
+    fn a_store_without_readable_meta_is_explained() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("chats/h/id");
+        fs::create_dir_all(&dir).unwrap();
+        let conn = rusqlite::Connection::open(dir.join("store.db")).unwrap();
+        conn.execute_batch("CREATE TABLE blobs (id TEXT PRIMARY KEY, data BLOB);")
+            .unwrap();
+        drop(conn);
+        let reason =
+            unresumable_reason_in(&tmp.path().join("chats"), &session_for("id", "")).unwrap();
+        assert!(reason.contains("meta.json"), "{reason}");
+        fs::write(dir.join("meta.json"), "{ not json").unwrap();
+        let reason =
+            unresumable_reason_in(&tmp.path().join("chats"), &session_for("id", "")).unwrap();
+        assert!(reason.contains("meta.json"), "{reason}");
     }
 
     #[test]

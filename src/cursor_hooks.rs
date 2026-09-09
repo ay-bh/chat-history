@@ -1,7 +1,7 @@
 //! Optional discovery via Cursor's documented `stop` hook. This registry holds
 //! only locations and selected metadata, never prompts, tool output, or email.
 
-use crate::session::{Session, mtime_iso, user_home};
+use crate::session::{Session, cursor_project_slug, mtime_iso, user_home};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -150,12 +150,22 @@ fn merge_records(sessions: &mut Vec<Session>, records: Vec<HookRecord>) {
         if !path.is_file() {
             continue;
         }
-        let project = record
+        let roots: Vec<&String> = record
             .workspace_roots
             .iter()
-            .find(|p| Path::new(p).is_absolute())
-            .cloned()
-            .unwrap_or_default();
+            .filter(|p| Path::new(p).is_absolute())
+            .collect();
+        // Multi-root workspaces: the root the transcript's slug names is the
+        // one the chat ran in; otherwise the first root.
+        let root_for = |slug: &str| -> String {
+            roots
+                .iter()
+                .find(|r| cursor_project_slug(r) == slug)
+                .or(roots.first())
+                .map(|r| (*r).clone())
+                .unwrap_or_default()
+        };
+        let project = root_for("");
         // A file the scan already listed only gains the hook's workspace.
         // Any other usable file is one more copy of the conversation, listed
         // like scanned copies are; `inspect`/`resume`/`find` pick one copy.
@@ -166,8 +176,11 @@ fn merge_records(sessions: &mut Vec<Session>, records: Vec<HookRecord>) {
         }) {
             // Fill a workspace the scan could not decode; never replace one
             // it did (or the CLI store pinned).
-            if !project.is_empty() && !Path::new(&session.project).is_absolute() {
-                session.project = project;
+            if !Path::new(&session.project).is_absolute() {
+                let project = root_for(&session.project);
+                if !project.is_empty() {
+                    session.project = project;
+                }
             }
             continue;
         }
@@ -298,6 +311,26 @@ mod tests {
             assert_eq!(sessions.len(), 1);
             assert_eq!(sessions[0].project, after);
         }
+    }
+
+    #[test]
+    fn hook_prefers_the_workspace_root_named_by_the_transcript_slug() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = tmp.path().join("hooks.db");
+        let file = tmp.path().join("t.jsonl");
+        std::fs::write(
+            &file,
+            "{\"role\":\"user\",\"message\":{\"content\":\"q\"}}\n",
+        )
+        .unwrap();
+        let event = serde_json::json!({"conversation_id":"hook-id", "transcript_path":file,
+            "workspace_roots":["/repo-a", "/repo-b"]});
+        record_hook_at(event.to_string().as_bytes(), &db).unwrap();
+        let mut session = listed(&file);
+        session.project = "repo-b".into();
+        let mut sessions = vec![session];
+        merge_records(&mut sessions, read_records(&db, true));
+        assert_eq!(sessions[0].project, "/repo-b");
     }
 
     #[test]

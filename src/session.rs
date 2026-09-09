@@ -1072,12 +1072,30 @@ pub fn load_sessions(source: Option<&str>) -> Vec<Session> {
 /// Matching pairs are one Agent row (`also_ide`) so search does not duplicate.
 pub fn merge_cursor_sessions(agents: Vec<Session>, ide: Vec<Session>) -> Vec<Session> {
     let mut agents = agents;
-    // A readable IDE transcript takes precedence over CLI metadata alone.
+    let mut ide = ide;
+    // A readable IDE transcript takes precedence over CLI metadata alone,
+    // but the store still knows the workspace, title, and creation time the
+    // IDE header may lack.
     agents.retain(|s| {
-        !s.is_cursor_store_only()
-            || !ide
-                .iter()
-                .any(|i| i.id.eq_ignore_ascii_case(&s.id) && i.messages > 0)
+        if !s.is_cursor_store_only() {
+            return true;
+        }
+        let Some(readable) = ide
+            .iter_mut()
+            .find(|i| i.id.eq_ignore_ascii_case(&s.id) && i.messages > 0)
+        else {
+            return true;
+        };
+        if readable.project.is_empty() {
+            readable.project = s.project.clone();
+        }
+        if readable.summary.is_empty() {
+            readable.summary = s.summary.clone();
+        }
+        if readable.created.is_empty() {
+            readable.created = s.created.clone();
+        }
+        false
     });
     let mut agent_indexes: HashMap<String, Vec<usize>> = HashMap::new();
     for (index, session) in agents.iter().enumerate() {
@@ -1108,13 +1126,17 @@ pub fn merge_cursor_sessions(agents: Vec<Session>, ide: Vec<Session>) -> Vec<Ses
                 {
                     agents[index].project = ide_session.project.clone();
                 }
-                if !ide_session.created.is_empty() {
+                // Only a composer with messages carries real activity: a
+                // header the sidebar merely touched must not move the
+                // transcript's dates or override the CLI store's creation time.
+                if ide_session.messages > 0 && !ide_session.created.is_empty() {
                     agents[index].created = ide_session.created.clone();
                 }
                 // Listing remains ordered by latest activity, including a
                 // transcript that has advanced ahead of the SQLite snapshot.
-                if parse_any_timestamp(&ide_session.modified)
-                    > parse_any_timestamp(&agents[index].modified)
+                if ide_session.messages > 0
+                    && parse_any_timestamp(&ide_session.modified)
+                        > parse_any_timestamp(&agents[index].modified)
                 {
                     agents[index].modified = ide_session.modified.clone();
                     agents[index].date = ide_session.date.clone();
@@ -2123,6 +2145,48 @@ mod tests {
             lookup_session(&sessions, "abc-1"),
             SessionLookup::Found(s) if s.id == "abc-123"
         ));
+    }
+
+    #[test]
+    fn header_only_ide_rows_do_not_move_dates_and_superseded_stores_keep_facts() {
+        // A sidebar-touched header (no bubbles) must not move the transcript.
+        let mut transcript = make_session("id", "2026-08-01", "cursor", "/repo", "", "");
+        transcript.file = "/t/id.jsonl".into();
+        transcript.modified = "2026-08-01T10:00:00Z".into();
+        transcript.created = "2026-07-30T10:00:00Z".into();
+        let mut touched = make_session("id", "2026-09-08", "cursor-ide", "/repo", "", "");
+        touched.modified = "2026-09-08T10:00:00Z".into();
+        touched.created = "2026-09-08T09:00:00Z".into();
+        let merged = merge_cursor_sessions(vec![transcript.clone()], vec![touched.clone()]);
+        assert_eq!(merged[0].modified, "2026-08-01T10:00:00Z");
+        assert_eq!(merged[0].date, "2026-08-01");
+        assert_eq!(merged[0].created, "2026-07-30T10:00:00Z");
+        assert!(merged[0].also_ide);
+        // With bubbles, the IDE's newer activity does count.
+        touched.messages = 3;
+        let merged = merge_cursor_sessions(vec![transcript], vec![touched.clone()]);
+        assert_eq!(merged[0].modified, "2026-09-08T10:00:00Z");
+        // A store-only row superseded by a readable IDE row hands over the
+        // workspace, title, and creation time the IDE header lacks.
+        let mut store = make_session(
+            "id",
+            "2026-08-01",
+            "cursor",
+            "/Users/me/proj",
+            "",
+            "CLI title",
+        );
+        store.file = "/home/.cursor/chats/h/id/store.db".into();
+        store.created = "2026-07-30T10:00:00Z".into();
+        let mut bare = touched.clone();
+        bare.project.clear();
+        bare.created.clear();
+        let merged = merge_cursor_sessions(vec![store], vec![bare]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].source, "cursor-ide");
+        assert_eq!(merged[0].project, "/Users/me/proj");
+        assert_eq!(merged[0].summary, "CLI title");
+        assert_eq!(merged[0].created, "2026-07-30T10:00:00Z");
     }
 
     #[test]

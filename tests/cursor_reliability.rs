@@ -209,7 +209,7 @@ fn last_notes_a_skipped_newer_metadata_only_session() {
         &tmp,
         "h",
         json!({"schemaVersion":1, "cwd":tmp.path(), "title":"newest, metadata only",
-        "createdAtMs":now - 1000, "updatedAtMs":now, "hasConversation":true}),
+        "createdAtMs":now, "updatedAtMs":now + 60_000, "hasConversation":true}),
     );
     let other = "11111111-2222-4000-8000-333333333333";
     let old = tmp.path().join(format!(
@@ -383,14 +383,22 @@ fn uuid_lookup_respects_timeframe() {
             .success()
             .stdout(predicate::str::contains(hit.as_str()));
     }
-    // No message times: found by id, but not once a window is requested...
+    // No message times but active today: the session's own activity time
+    // satisfies the window, like the index title entry.
     let tmp = TempDir::new().unwrap();
-    transcript(&tmp, false);
+    let path = transcript(&tmp, false);
     command(&tmp)
-        .args(["search", ID, "--deep", "--json"])
+        .args(["search", ID, "--deep", "--json", "--timeframe", "today"])
         .assert()
         .success()
         .stdout(predicate::str::contains(hit.as_str()));
+    // Last active years ago: not found by id in the window...
+    fs::File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_577_836_800))
+        .unwrap();
     command(&tmp)
         .args(["search", ID, "--deep", "--json", "--timeframe", "today"])
         .assert()

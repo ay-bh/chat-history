@@ -167,8 +167,9 @@ pub fn scored_search(
         let dur = parse_timeframe_duration(tf);
         (Utc::now() - dur).fixed_offset()
     });
-    // The direct lookup still honors --timeframe: it returns the first
-    // message inside the window, and never the untimestamped stub.
+    // The direct lookup honors --timeframe the way the index title entry
+    // does: a message inside the window, else the session's own activity
+    // time; a session outside the window falls through to content search.
     if is_uuid(query)
         && let Some(s) = sessions
             .iter()
@@ -186,10 +187,19 @@ pub fn scored_search(
                 message: msg,
             }];
         }
-        if tf_cutoff.is_none() {
+        let activity = if s.modified.is_empty() {
+            &s.created
+        } else {
+            &s.modified
+        };
+        let session_in_window = match tf_cutoff {
+            None => true,
+            Some(cutoff) => parse_any_timestamp(activity).is_some_and(|t| t >= cutoff),
+        };
+        if session_in_window {
             let stub = Message {
                 uuid: String::new(),
-                timestamp: String::new(),
+                timestamp: activity.clone(),
                 role: "user".into(),
                 content: if !s.summary.is_empty() {
                     s.summary.clone()
@@ -209,8 +219,8 @@ pub fn scored_search(
                 message: stub,
             }];
         }
-        // With a window and no in-window message, content search may still
-        // find the id quoted in another, recent conversation.
+        // Outside the window, content search may still find the id quoted in
+        // another, recent conversation.
     }
 
     let boosts = semantic_boosts(query);

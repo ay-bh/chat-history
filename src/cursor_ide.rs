@@ -164,7 +164,7 @@ fn composer_header_order(conn: &Connection, composer_id: &str) -> Option<Vec<Val
     let mut stmt = conn
         .prepare_cached(
             "SELECT json_extract(value, '$.fullConversationHeadersOnly')
-         FROM cursorDiskKV WHERE key = ?1 AND json_valid(value)",
+         FROM cursorDiskKV WHERE key = ?1",
         )
         .ok()?;
     let raw: String = stmt
@@ -177,7 +177,9 @@ fn composer_header_order(conn: &Connection, composer_id: &str) -> Option<Vec<Val
     Some(headers)
 }
 
-fn load_bubble_entries(conn: &Connection, composer_id: &str) -> Vec<Value> {
+/// Bubbles for a composer and whether they came in the conversation's own
+/// header order (else sorted by time, untimestamped last).
+fn load_bubble_entries(conn: &Connection, composer_id: &str) -> (Vec<Value>, bool) {
     if let Some(headers) = composer_header_order(conn, composer_id) {
         let mut entries = Vec::new();
         for h in headers {
@@ -198,7 +200,7 @@ fn load_bubble_entries(conn: &Connection, composer_id: &str) -> Vec<Value> {
             }
         }
         if !entries.is_empty() {
-            return entries;
+            return (entries, true);
         }
     }
     let mut entries = load_bubbles_range(conn, composer_id);
@@ -207,7 +209,7 @@ fn load_bubble_entries(conn: &Connection, composer_id: &str) -> Vec<Value> {
         let ts = parse_any_timestamp(&cursor_entry_timestamp(entry));
         (ts.is_none(), ts)
     });
-    entries
+    (entries, false)
 }
 
 fn first_user_text(conn: &Connection, composer_id: &str, headers: Option<&[Value]>) -> String {
@@ -269,7 +271,8 @@ fn first_user_text(conn: &Connection, composer_id: &str, headers: Option<&[Value
 fn load_bubbles_as_messages(conn: &Connection, session: &Session) -> Vec<Message> {
     let mut messages = Vec::new();
     let mut total_chars: usize = 0;
-    for entry in load_bubble_entries(conn, &session.id) {
+    let (entries, ordered) = load_bubble_entries(conn, &session.id);
+    for entry in entries {
         if total_chars > 4 * 1024 * 1024 {
             break;
         }
@@ -279,7 +282,7 @@ fn load_bubbles_as_messages(conn: &Connection, session: &Session) -> Vec<Message
         total_chars += msg.content.len();
         messages.push(msg);
     }
-    if composer_header_order(conn, &session.id).is_none() {
+    if !ordered {
         sort_messages_stable(&mut messages);
     }
     messages
