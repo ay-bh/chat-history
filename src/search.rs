@@ -176,11 +176,10 @@ pub fn scored_search(
             .find(|s| s.id.eq_ignore_ascii_case(query.trim()))
     {
         let (messages, _) = parse_session_recovering_timestamps(s, false);
-        let within = |m: &Message| match tf_cutoff {
-            None => true,
-            Some(cutoff) => parse_any_timestamp(&m.timestamp).is_some_and(|t| t >= cutoff),
+        let in_window = |ts: &str| {
+            tf_cutoff.is_none_or(|cutoff| parse_any_timestamp(ts).is_some_and(|t| t >= cutoff))
         };
-        if let Some(mut msg) = messages.into_iter().find(within) {
+        if let Some(mut msg) = messages.into_iter().find(|m| in_window(&m.timestamp)) {
             msg.final_score = 100.0;
             return vec![SearchResult {
                 session: s.clone(),
@@ -192,11 +191,7 @@ pub fn scored_search(
         } else {
             &s.modified
         };
-        let session_in_window = match tf_cutoff {
-            None => true,
-            Some(cutoff) => parse_any_timestamp(activity).is_some_and(|t| t >= cutoff),
-        };
-        if session_in_window {
+        if in_window(activity) {
             let stub = Message {
                 uuid: String::new(),
                 timestamp: activity.clone(),

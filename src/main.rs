@@ -466,20 +466,22 @@ fn main() {
             let action = match session::resume_command(session) {
                 Some(a) => a,
                 None if session.source.starts_with("cursor") => {
-                    // A store that exists but cannot be used gets its own
-                    // reason; the sidebar hint is only for chats without one.
-                    if let Some(reason) = chat_history::cursor_cli::unresumable_reason(session) {
-                        eprintln!("Cannot resume Agent CLI chat {}: {reason}", session.id);
-                        if session.is_ide_ui() {
-                            print!("{}", display::cursor_ide_resume_hint(session));
+                    // Two independent decisions: which stderr line explains
+                    // the missing or unusable store, and whether the sidebar
+                    // pointer follows (IDE-indexed chats, and chats with no
+                    // store at all, may still open in the IDE).
+                    let reason = chat_history::cursor_cli::unresumable_reason(session);
+                    match &reason {
+                        Some(reason) => {
+                            eprintln!("Cannot resume Agent CLI chat {}: {reason}", session.id)
                         }
-                    } else {
-                        if !session.is_ide_ui() {
-                            eprintln!(
-                                "No Agent CLI chat store for this id under ~/.cursor/chats, so \
-                                 `agent --resume` cannot load it (it would start a blank chat)."
-                            );
-                        }
+                        None if !session.is_ide_ui() => eprintln!(
+                            "No Agent CLI chat store for this id under ~/.cursor/chats, so \
+                             `agent --resume` cannot load it (it would start a blank chat)."
+                        ),
+                        None => {}
+                    }
+                    if reason.is_none() || session.is_ide_ui() {
                         print!("{}", display::cursor_ide_resume_hint(session));
                     }
                     std::process::exit(1);

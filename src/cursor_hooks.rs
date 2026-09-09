@@ -1,7 +1,7 @@
 //! Optional discovery via Cursor's documented `stop` hook. This registry holds
 //! only locations and selected metadata, never prompts, tool output, or email.
 
-use crate::session::{Session, cursor_project_slug, mtime_iso, user_home};
+use crate::session::{Session, cursor_project_slug, iso_date, mtime_iso, user_home};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -176,8 +176,6 @@ fn merge_records(sessions: &mut Vec<Session>, records: Vec<HookRecord>) {
             s.id.eq_ignore_ascii_case(&record.conversation_id) && same_transcript(&s.file, &path)
         }) {
             // Fill a workspace the scan could not decode; never replace one
-            // it did (or the CLI store pinned).
-            // Fill a workspace the scan could not decode; never replace one
             // it did (or the CLI store, merged earlier, pinned).
             if !Path::new(&session.project).is_absolute() {
                 let project = root_for(&session.project);
@@ -201,7 +199,7 @@ fn merge_records(sessions: &mut Vec<Session>, records: Vec<HookRecord>) {
             !superseded
         });
         let modified = mtime_iso(&path).unwrap_or_default();
-        let date = modified.get(..10).unwrap_or("").to_owned();
+        let date = iso_date(&modified);
         let first_prompt = if path.extension().is_some_and(|e| e == "txt") {
             crate::session::cursor_first_prompt_txt(&path)
         } else {

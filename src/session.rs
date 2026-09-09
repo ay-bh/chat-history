@@ -427,6 +427,11 @@ pub(crate) fn cursor_timestamp(value: &Value) -> String {
 /// The one epoch-milliseconds formatter for Cursor data: preserves
 /// milliseconds when present, keeps whole seconds compact, and treats
 /// non-positive or out-of-range values as unknown.
+/// The `YYYY-MM-DD` day of an ISO timestamp ("" for unknown).
+pub(crate) fn iso_date(iso: &str) -> String {
+    iso.get(..10).unwrap_or("").to_owned()
+}
+
 pub(crate) fn ms_to_iso(ms: i64) -> String {
     Some(ms)
         .filter(|ms| *ms > 0)

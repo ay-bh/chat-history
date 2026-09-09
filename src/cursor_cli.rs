@@ -3,11 +3,12 @@
 //! is deliberately not treated as a text transcript.
 
 use crate::session::{
-    Session, cursor_project_slug, cursor_timestamp, existing_absolute_dir, mtime_iso, user_home,
+    Session, cursor_project_slug, cursor_timestamp, existing_absolute_dir, iso_date, ms_to_iso,
+    mtime_iso, user_home,
 };
 use serde_json::Value;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
 };
@@ -23,11 +24,11 @@ pub(crate) fn merge_cli_sessions(sessions: &mut Vec<Session>) {
 }
 
 /// One `~/.cursor/chats/<workspace-hash>/<id>` directory with a usable store.
-pub(crate) struct CliChat {
+struct CliChat {
     dir: PathBuf,
-    pub(crate) project: String,
+    project: String,
     updated: i64,
-    pub(crate) workspace_exists: bool,
+    workspace_exists: bool,
     title: String,
     created: String,
     is_subagent: bool,
@@ -94,17 +95,14 @@ pub fn unresumable_reason(session: &Session) -> Option<String> {
 }
 
 fn unresumable_reason_in(chats_dir: &Path, session: &Session) -> Option<String> {
-    let (mut gone, mut blank, mut bad_meta) = (Vec::new(), false, false);
-    let note = |list: &mut Vec<String>, v: String| {
-        if !list.contains(&v) {
-            list.push(v);
-        }
-    };
+    let (mut gone, mut blank, mut bad_meta) = (BTreeSet::new(), false, false);
     for workspace in fs::read_dir(chats_dir).ok()?.flatten() {
         match read_copy(&workspace.path().join(&session.id)) {
             Ok(copy) if copy.workspace_exists => return None,
             Ok(copy) if copy.project.is_empty() => blank = true,
-            Ok(copy) => note(&mut gone, copy.project),
+            Ok(copy) => {
+                gone.insert(copy.project);
+            }
             Err(Skip::BadMeta) => bad_meta = true,
             Err(Skip::NoStore) => {}
         }
@@ -112,7 +110,7 @@ fn unresumable_reason_in(chats_dir: &Path, session: &Session) -> Option<String> 
     if !gone.is_empty() {
         return Some(format!(
             "its workspace {} no longer exists. Cursor keys the chat by workspace and id, so recreate that directory to resume it.",
-            gone.join(", ")
+            gone.into_iter().collect::<Vec<_>>().join(", ")
         ));
     }
     if blank {
@@ -252,11 +250,11 @@ fn merge_cli_sessions_from(sessions: &mut Vec<Session>, root: &Path) {
 
 fn push_store_only(sessions: &mut Vec<Session>, id: String, chat: CliChat) {
     let store = chat.dir.join("store.db");
-    let (mut modified, mut date) = crate::cursor_ide::ms_iso_date(chat.updated);
+    let mut modified = ms_to_iso(chat.updated);
     if modified.is_empty() {
         modified = mtime_iso(&store).unwrap_or_default();
-        date = modified.get(..10).unwrap_or("").to_owned();
     }
+    let date = iso_date(&modified);
     sessions.push(Session {
         source: "cursor".into(),
         id,

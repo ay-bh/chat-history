@@ -2,7 +2,9 @@
 //! Schema is unofficial and can drift with Cursor releases.
 
 use crate::parser::{clean_first_prompt, extract_text, is_clear_metadata, is_warmup_message};
-use crate::session::{Message, Session, cursor_entry_timestamp, parse_any_timestamp, user_home};
+use crate::session::{
+    Message, Session, cursor_entry_timestamp, iso_date, ms_to_iso, parse_any_timestamp, user_home,
+};
 use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
 use std::cell::RefCell;
@@ -38,12 +40,6 @@ pub(crate) fn open_ro(path: &Path) -> Option<Connection> {
     let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
     conn.busy_timeout(std::time::Duration::from_secs(2)).ok()?;
     Some(conn)
-}
-
-pub(crate) fn ms_iso_date(ms: i64) -> (String, String) {
-    let iso = crate::session::ms_to_iso(ms);
-    let date = iso.get(..10).unwrap_or("").to_owned();
-    (iso, date)
 }
 
 pub fn workspace_path(value: &Value) -> String {
@@ -404,10 +400,11 @@ fn load_cursor_ide_sessions_from(db: &Path) -> Vec<Session> {
         } else {
             created_ms
         };
-        let (iso, date) = ms_iso_date(ts);
+        let iso = ms_to_iso(ts);
+        let date = iso_date(&iso);
         // No fabricated creation time: an absent createdAt stays unknown
         // rather than becoming the last-update time.
-        let (created, _) = ms_iso_date(created_ms);
+        let created = ms_to_iso(created_ms);
         sessions.push(Session {
             source: "cursor-ide".into(),
             id,
@@ -805,7 +802,7 @@ mod tests {
         assert_eq!(sessions[0].created, "2026-09-01T00:00:00Z");
         assert_eq!(sessions[0].modified, "2026-09-02T00:00:00Z");
         assert_eq!(sessions[0].date, "2026-09-02");
-        assert_eq!(ms_iso_date(0), (String::new(), String::new()));
+        assert_eq!(ms_to_iso(0), "");
     }
 
     #[test]
