@@ -27,7 +27,7 @@ Search, inspect, and export Claude Code, Cursor, and Codex conversation history.
 
 1. `chat-history --from yesterday --to yesterday` — every row shows a short session ID; `-s` groups by day for multi-day overviews.
    - `--from X` alone means **X through today**. Always pair with `--to` when the user means a specific day.
-   - Short IDs work everywhere a session ID is accepted (`inspect`, `view`, `export`, `find`); `-v` adds full IDs and file paths. `resume` works for `claude` / `codex` rows and for Cursor Agent CLI chats; `cursor-ide` rows (and Agent transcripts without a CLI store) print the **title** and `DIR:` — tell the user to open that folder in Cursor and pick the chat in the sidebar.
+   - Short IDs work everywhere a session ID is accepted (`inspect`, `view`, `export`, `find`); `-v` adds full IDs and file paths. `resume` works for `claude` / `codex` rows and for Cursor Agent CLI chats; Cursor rows whose id has no `~/.cursor/chats` store (whatever their tag) print the **title** and `DIR:` — tell the user to open that folder in Cursor and pick the chat in the sidebar.
 2. `chat-history inspect <id>` for accomplishments, tools, files touched.
 
 ## Choosing the best hit
@@ -41,7 +41,7 @@ Search, inspect, and export Claude Code, Cursor, and Codex conversation history.
 - Only `search` accepts `--json`; the session list and `inspect` reject it.
 - The subcommands are `search`, `inspect`, `view`, `export`, `resume`, `find`, `install-skill`, `completions`, and the optional `cursor-hook` receiver. Do not guess others; run `chat-history --help` when unsure. `cursor-hook` is for configured Cursor hooks, not normal history queries.
 - Cursor CLI rows labeled `[metadata only]` support `find`, `resume`, and title search when Cursor recorded a title (print-mode chats usually have none); their internal `store.db` cannot be viewed or exported as a transcript. Do not claim that metadata-only search covers message content.
-- Cursor message timestamps may be unavailable. `search --timeframe` excludes unknown message times; use session `--from` / `--to` filters for activity-date questions. File modification times are not message timestamps.
+- Cursor message timestamps may be unavailable. `search --deep --timeframe` excludes unknown message times (without `--deep`, the index shortcut ignores `--timeframe`); use session `--from` / `--to` filters for activity-date questions. File modification times are not message timestamps.
 - Don't dump raw JSON or full transcripts at the user — summarize, cite the session ID and date (or title + directory for `cursor-ide`).
 - `cursor-ide` rows (and `--json` items with `"also_ide": true`) resume only when the Agent CLI has a `~/.cursor/chats` store for the id; otherwise `resume` prints a sidebar hint instead of launching the Agent CLI. Run `resume` and follow its output rather than assuming.
 - Some Cursor sessions have thin metadata (`(no summary)`, `duration: 0min`, raw first-message titles). If `inspect` is thin, fall back to `chat-history view <id> --plain`.
@@ -68,7 +68,7 @@ chat-history inspect --last                # accomplishments, tools, model, toke
 chat-history inspect <partial-uuid>
 chat-history view <id> --plain             # transcript, pipe-friendly (--tools for tool names)
 chat-history export <id> -o session.md
-chat-history resume <id>                   # Claude Code, Cursor Agent CLI, or Codex — not IDE sidebar
+chat-history resume <id>                   # Claude Code, Codex, or any Cursor chat with a CLI store
 chat-history find <id>                     # print transcript file path for scripting
 chat-history completions zsh               # shell completions (bash/zsh/fish/elvish/powershell)
 ```
@@ -79,6 +79,6 @@ chat-history completions zsh               # shell completions (bash/zsh/fish/el
 ## Interpreting output
 
 - Display tags: `claude` = Claude Code, `cursor-ide` = Cursor IDE sidebar (SQLite; IDE Agent also writes jsonl with the same id — still listed once as `cursor-ide`), `cursor-agent` = Agent CLI / jsonl-only, `codex` = Codex; `★ N.N` = relevance score. `--source cursor` / `cursor-agent` = Agent transcripts plus CLI chat metadata and hook-registered paths; `--source cursor-ide` = SQLite.
-- Header line has `DIR:` (spawn directory) and, for index search, `INDEX_FIELD:` (`summary` / `first_prompt` / `branch`). Title is on the next line. Pass the short ID to `find` for any row and to `inspect` / `view` / `export` for rows with a transcript (`[metadata only]` rows refuse those three), and to `resume` for `claude` / `codex` rows and Cursor Agent CLI chats (`cursor-agent` rows that still have a `~/.cursor/chats` store). Other Cursor rows are found in the sidebar by title + `DIR:`.
+- Header line has `DIR:` (spawn directory) and, for index search, `INDEX_FIELD:` (`summary` / `first_prompt` / `branch`). Title is on the next line. Pass the short ID to `find` for any row and to `inspect` / `view` / `export` for rows with a transcript (`[metadata only]` rows refuse those three), and to `resume` for `claude` / `codex` rows and any Cursor row whose id has a `~/.cursor/chats` store. Cursor rows without one are found in the sidebar by title + `DIR:`.
 - `COPIES: N` means the same Cursor Agent session id exists in more than one project folder; `inspect`/`resume`/`find` pick one copy (cwd match, else newest) and print the others.
 - Accepted dates: `YYYY-MM-DD`, `today`, `yesterday`, `"3 days ago"`, `"last week"`, `"last month"`.

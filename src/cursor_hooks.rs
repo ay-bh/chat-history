@@ -31,14 +31,15 @@ pub fn record_hook(input: impl Read) -> Result<(), String> {
 
 fn record_hook_at(input: impl Read, db: &Path) -> Result<(), String> {
     const MAX_INPUT: u64 = 1024 * 1024;
-    let mut raw = String::new();
+    let mut raw = Vec::new();
     input
         .take(MAX_INPUT + 1)
-        .read_to_string(&mut raw)
+        .read_to_end(&mut raw)
         .map_err(|e| e.to_string())?;
     if raw.len() as u64 > MAX_INPUT {
         return Err("Cursor hook input exceeds 1 MiB".into());
     }
+    let raw = String::from_utf8(raw).map_err(|_| "Cursor hook input is not UTF-8".to_owned())?;
     let record: HookRecord =
         serde_json::from_str(&raw).map_err(|e| format!("Invalid Cursor hook input: {e}"))?;
     // Null means transcripts are disabled. No registry or directory is created.
@@ -311,6 +312,16 @@ mod tests {
             assert_eq!(sessions.len(), 1);
             assert_eq!(sessions[0].project, after);
         }
+    }
+
+    #[test]
+    fn oversized_hook_input_is_reported_as_such() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = tmp.path().join("hooks.db");
+        let huge = vec![b' '; 1024 * 1024 + 1];
+        let err = record_hook_at(huge.as_slice(), &db).unwrap_err();
+        assert!(err.contains("exceeds 1 MiB"), "{err}");
+        assert!(!db.exists());
     }
 
     #[test]

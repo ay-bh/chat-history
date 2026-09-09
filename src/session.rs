@@ -1132,15 +1132,9 @@ pub fn merge_cursor_sessions(agents: Vec<Session>, ide: Vec<Session>) -> Vec<Ses
                 if ide_session.messages > 0 && !ide_session.created.is_empty() {
                     agents[index].created = ide_session.created.clone();
                 }
-                // Listing remains ordered by latest activity, including a
-                // transcript that has advanced ahead of the SQLite snapshot.
-                if ide_session.messages > 0
-                    && parse_any_timestamp(&ide_session.modified)
-                        > parse_any_timestamp(&agents[index].modified)
-                {
-                    agents[index].modified = ide_session.modified.clone();
-                    agents[index].date = ide_session.date.clone();
-                }
+                // The transcript's own mtime is its activity time; a
+                // composer's lastUpdatedAt also moves when the sidebar merely
+                // reopens or renames the chat, so it never overrides it.
                 agents[index].messages = agents[index].messages.max(ide_session.messages);
             }
         } else if ide_session.messages > 0 {
@@ -2162,10 +2156,12 @@ mod tests {
         assert_eq!(merged[0].date, "2026-08-01");
         assert_eq!(merged[0].created, "2026-07-30T10:00:00Z");
         assert!(merged[0].also_ide);
-        // With bubbles, the IDE's newer activity does count.
+        // With bubbles the IDE's creation time counts, but its lastUpdatedAt
+        // still never moves the transcript (a sidebar reopen bumps it too).
         touched.messages = 3;
         let merged = merge_cursor_sessions(vec![transcript], vec![touched.clone()]);
-        assert_eq!(merged[0].modified, "2026-09-08T10:00:00Z");
+        assert_eq!(merged[0].modified, "2026-08-01T10:00:00Z");
+        assert_eq!(merged[0].created, "2026-09-08T09:00:00Z");
         // A store-only row superseded by a readable IDE row hands over the
         // workspace, title, and creation time the IDE header lacks.
         let mut store = make_session(

@@ -405,7 +405,9 @@ fn load_cursor_ide_sessions_from(db: &Path) -> Vec<Session> {
             created_ms
         };
         let (iso, date) = ms_iso_date(ts);
-        let (created, _) = ms_iso_date(if created_ms > 0 { created_ms } else { ts });
+        // No fabricated creation time: an absent createdAt stays unknown
+        // rather than becoming the last-update time.
+        let (created, _) = ms_iso_date(created_ms);
         sessions.push(Session {
             source: "cursor-ide".into(),
             id,
@@ -813,12 +815,17 @@ mod tests {
         let conn = Connection::open(&db).unwrap();
         conn.execute_batch("CREATE TABLE composerHeaders (composerId TEXT PRIMARY KEY, value TEXT);
             CREATE TABLE cursorDiskKV (key TEXT PRIMARY KEY, value BLOB);
-            INSERT INTO composerHeaders VALUES ('id', '{\"name\":\"older header\",\"createdAt\":1788220800000,\"isSubagent\":true}');").unwrap();
-        let sessions = load_cursor_ide_sessions_from(&db);
-        assert_eq!(sessions.len(), 1);
+            INSERT INTO composerHeaders VALUES ('id', '{\"name\":\"older header\",\"createdAt\":1788220800000,\"isSubagent\":true}');
+            INSERT INTO composerHeaders VALUES ('id2', '{\"name\":\"no times\",\"lastUpdatedAt\":1788307200000}');").unwrap();
+        let mut sessions = load_cursor_ide_sessions_from(&db);
+        sessions.sort_by(|a, b| a.id.cmp(&b.id));
+        assert_eq!(sessions.len(), 2);
         assert_eq!(sessions[0].summary, "older header");
         assert_eq!(sessions[0].created, "2026-09-01T00:00:00Z");
         assert!(sessions[0].is_sidechain);
+        // No createdAt anywhere: creation stays unknown, activity is known.
+        assert_eq!(sessions[1].created, "");
+        assert_eq!(sessions[1].date, "2026-09-02");
     }
 
     #[test]
