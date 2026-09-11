@@ -143,6 +143,11 @@ enum Commands {
         /// Session ID or unique prefix
         session_id: String,
     },
+    /// Record a Cursor stop-hook payload from stdin (optional local discovery)
+    #[command(
+        after_help = "EXAMPLES:\n  Configure a Cursor stop hook with command: chat-history cursor-hook\n  Replay a saved event: chat-history cursor-hook < event.json\n\nRecords only transcript paths and selected metadata in ~/.chat-history/cursor-hooks.db.\nDoes not install hooks. Outputs {} and never blocks Cursor on a recording error."
+    )]
+    CursorHook,
     /// Install the agent skill for Claude Code, Cursor, and Codex
     #[command(name = "install-skill")]
     InstallSkill {
@@ -219,6 +224,63 @@ fn parse_date_arg(val: &Option<String>) -> Option<chrono::NaiveDate> {
     })
 }
 
+/// The session a transcript-reading command (inspect, view, export) works
+/// on: by id, or with `--last` the newest readable one. Exits with an
+/// explanation when only Cursor CLI metadata exists for it.
+fn transcript_or_exit<'a>(
+    sessions: &'a [session::Session],
+    filtered: &'a [session::Session],
+    session_id: Option<&str>,
+    last: bool,
+) -> &'a session::Session {
+    let session = if last {
+        let newest = |readable_only: bool| {
+            filtered
+                .iter()
+                .filter(|s| !readable_only || !s.is_cursor_store_only())
+                .max_by_key(|s| session::recency_key(s))
+        };
+        // Fall back to a metadata-only row so the message below explains
+        // it, instead of claiming nothing matched what the listing showed.
+        let (readable, any) = (newest(true), newest(false));
+        if let (Some(r), Some(a)) = (readable, any)
+            && session::recency_key(a) > session::recency_key(r)
+        {
+            eprintln!(
+                "Note: skipped newer Cursor CLI session {} (metadata only, no transcript)",
+                a.id
+            );
+        }
+        match readable.or(any) {
+            Some(s) => s,
+            None => {
+                eprintln!("Session not found");
+                std::process::exit(1);
+            }
+        }
+    } else if let Some(sid) = session_id {
+        resolve_session_or_exit(sessions, sid)
+    } else {
+        eprintln!("Provide a session ID or use --last");
+        std::process::exit(2);
+    };
+    if session.is_cursor_store_only() {
+        let reopen = match chat_history::cursor_cli::unresumable_reason(session) {
+            Some(reason) => format!("It cannot be resumed either: {reason}"),
+            None => format!(
+                "Use `chat-history resume {}` to reopen it in Cursor Agent.",
+                session.id
+            ),
+        };
+        eprintln!(
+            "Only metadata is available for Cursor CLI session {}. Its store.db format is not a readable transcript. {reopen}",
+            session.id
+        );
+        std::process::exit(1);
+    }
+    session
+}
+
 fn main() {
     // Rust ignores SIGPIPE by default, turning writes to a closed pipe
     // (e.g. `chat-history ... | head`) into println! panics. Restore the
@@ -229,6 +291,22 @@ fn main() {
     }
 
     let cli = Cli::parse();
+
+    if matches!(&cli.command, Some(Commands::CursorHook)) {
+        use std::io::IsTerminal;
+        let result = if std::io::stdin().is_terminal() {
+            Err("cursor-hook expects a Cursor JSON payload on stdin".to_owned())
+        } else {
+            chat_history::cursor_hooks::record_hook(std::io::stdin().lock())
+        };
+        if let Err(error) = result {
+            eprintln!("Warning: {error}");
+        }
+        // Observational hook: no follow-up prompt, permission decision, skill
+        // installation, or history scan, including when recording fails.
+        println!("{{}}");
+        return;
+    }
 
     if let Some(Commands::Completions { shell }) = &cli.command {
         use clap::CommandFactory;
@@ -338,6 +416,15 @@ fn main() {
                 eprintln!("No session with that ID — searching transcripts...");
             }
             let results = search::scored_search(&pre, &query, &scope, limit, timeframe.as_deref());
+            if scoring::is_uuid(&query)
+                && timeframe.is_some()
+                && results.is_empty()
+                && pre.iter().any(|s| s.id.eq_ignore_ascii_case(query.trim()))
+            {
+                eprintln!(
+                    "That session exists but has no activity in the --timeframe; drop the flag to open it."
+                );
+            }
             if json_output {
                 display::print_search_results_json(&results, &query);
             } else {
@@ -345,18 +432,7 @@ fn main() {
             }
         }
         Some(Commands::Inspect { session_id, last }) => {
-            let session = if last {
-                let Some(s) = filtered.iter().max_by_key(|s| session::recency_key(s)) else {
-                    eprintln!("Session not found");
-                    std::process::exit(1);
-                };
-                s
-            } else if let Some(sid) = &session_id {
-                resolve_session_or_exit(&sessions, sid)
-            } else {
-                eprintln!("Provide a session ID or use --last");
-                std::process::exit(2);
-            };
+            let session = transcript_or_exit(&sessions, &filtered, session_id.as_deref(), last);
             match inspect::inspect_session(session) {
                 Some(info) => display::print_inspect(&info),
                 None => eprintln!("Could not inspect session (transcript may be expired)."),
@@ -368,18 +444,7 @@ fn main() {
             tools,
             plain,
         }) => {
-            let session = if last {
-                let Some(s) = filtered.iter().max_by_key(|s| session::recency_key(s)) else {
-                    eprintln!("Session not found");
-                    std::process::exit(1);
-                };
-                s
-            } else if let Some(sid) = &session_id {
-                resolve_session_or_exit(&sessions, sid)
-            } else {
-                eprintln!("Provide a session ID or use --last");
-                std::process::exit(2);
-            };
+            let session = transcript_or_exit(&sessions, &filtered, session_id.as_deref(), last);
             let (messages, _) = parse_session(session, false);
             if plain {
                 display::print_plain(&messages);
@@ -388,7 +453,7 @@ fn main() {
             }
         }
         Some(Commands::Export { session_id, output }) => {
-            let session = resolve_session_or_exit(&sessions, &session_id);
+            let session = transcript_or_exit(&sessions, &filtered, Some(&session_id), false);
             let (messages, _) = parse_session(session, false);
             if !display::export_transcript(&messages, session, output.as_deref()) {
                 std::process::exit(1);
@@ -396,18 +461,29 @@ fn main() {
         }
         Some(Commands::Resume { session_id }) => {
             let session = resolve_session_or_exit(&sessions, &session_id);
-            if session.is_ide_ui() {
-                print!("{}", display::cursor_ide_resume_hint(session));
-                std::process::exit(1);
-            }
+            // A CLI store wins even when the IDE also indexes the chat; the
+            // sidebar hint is for chats no store can reopen.
             let action = match session::resume_command(session) {
                 Some(a) => a,
-                None if session.source == "cursor" => {
-                    eprintln!(
-                        "No Agent CLI chat store for this id under ~/.cursor/chats, so \
-                         `agent --resume` cannot load it (it would start a blank chat)."
-                    );
-                    print!("{}", display::cursor_ide_resume_hint(session));
+                None if session.source.starts_with("cursor") => {
+                    // Two independent decisions: which stderr line explains
+                    // the missing or unusable store, and whether the sidebar
+                    // pointer follows (IDE-indexed chats, and chats with no
+                    // store at all, may still open in the IDE).
+                    let reason = chat_history::cursor_cli::unresumable_reason(session);
+                    match &reason {
+                        Some(reason) => {
+                            eprintln!("Cannot resume Agent CLI chat {}: {reason}", session.id)
+                        }
+                        None if !session.is_ide_ui() => eprintln!(
+                            "No Agent CLI chat store for this id under ~/.cursor/chats, so \
+                             `agent --resume` cannot load it (it would start a blank chat)."
+                        ),
+                        None => {}
+                    }
+                    if reason.is_none() || session.is_ide_ui() {
+                        print!("{}", display::cursor_ide_resume_hint(session));
+                    }
                     std::process::exit(1);
                 }
                 None => {
@@ -421,7 +497,7 @@ fn main() {
                 );
                 std::process::exit(1);
             }
-            let ResumeAction::Exec { bin, args } = action else {
+            let ResumeAction::Exec { bin, args, workdir } = action else {
                 unreachable!();
             };
             println!(
@@ -432,7 +508,26 @@ fn main() {
                     &session.summary
                 }
             );
-            let workdir = session::resume_working_dir(session);
+            if session.source.starts_with("cursor")
+                && let Some(dir) = &workdir
+                && !session.project.is_empty()
+                && !chat_history::cursor_cli::same_workspace(
+                    &session.project,
+                    &dir.to_string_lossy(),
+                )
+            {
+                // The listed workspace (a path, or a slug no store matched)
+                // has no resumable store; say where the chat is reopened.
+                let listed = if std::path::Path::new(&session.project).is_absolute() {
+                    display::abbreviate_home(&session.project)
+                } else {
+                    format!("workspace slug {}", session.project)
+                };
+                eprintln!(
+                    "Note: no resumable Agent CLI store in {listed}; resuming in {}",
+                    display::abbreviate_home(&dir.to_string_lossy())
+                );
+            }
             if workdir.is_none() && !session.project.is_empty() {
                 if session.source == "claude" {
                     eprintln!(
@@ -475,7 +570,9 @@ fn main() {
             let session = resolve_session_or_exit(&sessions, &session_id);
             println!("{}", session.file);
         }
-        Some(Commands::InstallSkill { .. }) | Some(Commands::Completions { .. }) => unreachable!(),
+        Some(Commands::InstallSkill { .. })
+        | Some(Commands::Completions { .. })
+        | Some(Commands::CursorHook) => unreachable!(),
         None => {
             if cli.summarize {
                 display::print_summarized(&filtered);

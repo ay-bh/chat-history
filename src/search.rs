@@ -161,46 +161,62 @@ pub fn scored_search(
     // On a UUID-shaped query try a direct session-id lookup first; on miss,
     // fall through to content search so a UUID that was discussed inside a
     // conversation is still findable.
+    // With --timeframe the stub has no message time to filter on, so the
+    // query goes through content search like everything else.
+    let tf_cutoff: Option<DateTime<FixedOffset>> = timeframe.map(|tf| {
+        let dur = parse_timeframe_duration(tf);
+        (Utc::now() - dur).fixed_offset()
+    });
+    // The direct lookup honors --timeframe the way the index title entry
+    // does: a message inside the window, else the session's own activity
+    // time; a session outside the window falls through to content search.
     if is_uuid(query)
         && let Some(s) = sessions
             .iter()
             .find(|s| s.id.eq_ignore_ascii_case(query.trim()))
     {
-        let (messages, _) = parse_session(s, false);
-        if let Some(mut msg) = messages.into_iter().next() {
+        let (messages, _) = parse_session_recovering_timestamps(s, false);
+        let in_window = |ts: &str| {
+            tf_cutoff.is_none_or(|cutoff| parse_any_timestamp(ts).is_some_and(|t| t >= cutoff))
+        };
+        if let Some(mut msg) = messages.into_iter().find(|m| in_window(&m.timestamp)) {
             msg.final_score = 100.0;
             return vec![SearchResult {
                 session: s.clone(),
                 message: msg,
             }];
         }
-        let stub = Message {
-            uuid: String::new(),
-            timestamp: String::new(),
-            role: "user".into(),
-            content: if !s.summary.is_empty() {
-                s.summary.clone()
-            } else {
-                s.first_prompt.clone()
-            },
-            session_id: s.id.clone(),
-            project_path: s.project.clone(),
-            tool_uses: Vec::new(),
-            files_referenced: Vec::new(),
-            error_patterns: Vec::new(),
-            relevance_score: 0.0,
-            final_score: 100.0,
+        let activity = if s.modified.is_empty() {
+            &s.created
+        } else {
+            &s.modified
         };
-        return vec![SearchResult {
-            session: s.clone(),
-            message: stub,
-        }];
+        if in_window(activity) {
+            let stub = Message {
+                uuid: String::new(),
+                timestamp: activity.clone(),
+                role: "user".into(),
+                content: if !s.summary.is_empty() {
+                    s.summary.clone()
+                } else {
+                    s.first_prompt.clone()
+                },
+                session_id: s.id.clone(),
+                project_path: s.project.clone(),
+                tool_uses: Vec::new(),
+                files_referenced: Vec::new(),
+                error_patterns: Vec::new(),
+                relevance_score: 0.0,
+                final_score: 100.0,
+            };
+            return vec![SearchResult {
+                session: s.clone(),
+                message: stub,
+            }];
+        }
+        // Outside the window, content search may still find the id quoted in
+        // another, recent conversation.
     }
-
-    let tf_cutoff: Option<DateTime<FixedOffset>> = timeframe.map(|tf| {
-        let dur = parse_timeframe_duration(tf);
-        (Utc::now() - dur).fixed_offset()
-    });
 
     let boosts = semantic_boosts(query);
     let raw_words: Vec<String> = {
@@ -246,13 +262,19 @@ pub fn scored_search(
         .par_iter()
         .filter(|s| !s.file.is_empty() && std::path::Path::new(&s.file).exists())
         .flat_map(|s| {
-            let (mut messages, _) = parse_session(s, false);
+            // Recovered times feed recency scoring, so recover them for every
+            // deep search: the same hit must score the same with and without
+            // --timeframe.
+            let (mut messages, _) = parse_session_recovering_timestamps(s, false);
             let title = s.summary.clone();
             if !title.is_empty() && !messages.iter().any(|m| m.content == title) {
                 messages.insert(
                     0,
                     Message {
                         uuid: "index-title".into(),
+                        // The title entry carries the session's activity time
+                        // for every source (Cursor's own updatedAtMs for CLI
+                        // stores); message times come from the transcript.
                         timestamp: if s.modified.is_empty() {
                             s.created.clone()
                         } else {

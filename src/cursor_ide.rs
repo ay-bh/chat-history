@@ -2,10 +2,12 @@
 //! Schema is unofficial and can drift with Cursor releases.
 
 use crate::parser::{clean_first_prompt, extract_text, is_clear_metadata, is_warmup_message};
-use crate::session::{Message, Session, parse_any_timestamp, user_home};
-use chrono::{TimeZone, Utc};
+use crate::session::{
+    Message, Session, cursor_entry_timestamp, iso_date, ms_to_iso, parse_any_timestamp, user_home,
+};
 use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -32,18 +34,12 @@ fn global_vscdb() -> PathBuf {
     cursor_user_dir().join("globalStorage/state.vscdb")
 }
 
-fn open_ro(path: &Path) -> Option<Connection> {
-    Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).ok()
-}
-
-fn ms_iso_date(ms: i64) -> (String, String) {
-    let Some(dt) = Utc.timestamp_millis_opt(ms).single() else {
-        return (String::new(), String::new());
-    };
-    (
-        dt.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
-        dt.format("%Y-%m-%d").to_string(),
-    )
+/// Read-only SQLite handle that waits briefly on a writer's lock instead of
+/// failing the whole listing while Cursor (or a hook) is mid-write.
+pub(crate) fn open_ro(path: &Path) -> Option<Connection> {
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
+    conn.busy_timeout(std::time::Duration::from_secs(2)).ok()?;
+    Some(conn)
 }
 
 pub fn workspace_path(value: &Value) -> String {
@@ -106,11 +102,7 @@ fn message_from_bubble(session: &Session, entry: &Value) -> Option<Message> {
     if role == "user" && (is_warmup_message(&cleaned) || is_clear_metadata(&cleaned)) {
         return None;
     }
-    let ts = entry
-        .get("createdAt")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
+    let ts = cursor_entry_timestamp(entry);
     Some(Message {
         uuid: entry
             .get("bubbleId")
@@ -163,16 +155,27 @@ fn load_bubbles_range(conn: &Connection, composer_id: &str) -> Vec<Value> {
 }
 
 fn composer_header_order(conn: &Connection, composer_id: &str) -> Option<Vec<Value>> {
-    let raw = kv_blob(conn, &format!("composerData:{composer_id}"))?;
-    let data: Value = serde_json::from_str(&raw).ok()?;
-    let headers = data.get("fullConversationHeadersOnly")?.as_array()?;
+    // Avoid deserializing the large context/tool payload just to read the
+    // active conversation order. The bundled SQLite supports JSON extraction.
+    let mut stmt = conn
+        .prepare_cached(
+            "SELECT json_extract(value, '$.fullConversationHeadersOnly')
+         FROM cursorDiskKV WHERE key = ?1",
+        )
+        .ok()?;
+    let raw: String = stmt
+        .query_row([format!("composerData:{composer_id}")], |row| row.get(0))
+        .ok()?;
+    let headers: Vec<Value> = serde_json::from_str(&raw).ok()?;
     if headers.is_empty() {
         return None;
     }
-    Some(headers.clone())
+    Some(headers)
 }
 
-fn load_bubble_entries(conn: &Connection, composer_id: &str) -> Vec<Value> {
+/// Bubbles for a composer and whether they came in the conversation's own
+/// header order (else sorted by time, untimestamped last).
+fn load_bubble_entries(conn: &Connection, composer_id: &str) -> (Vec<Value>, bool) {
     if let Some(headers) = composer_header_order(conn, composer_id) {
         let mut entries = Vec::new();
         for h in headers {
@@ -193,21 +196,16 @@ fn load_bubble_entries(conn: &Connection, composer_id: &str) -> Vec<Value> {
             }
         }
         if !entries.is_empty() {
-            return entries;
+            return (entries, true);
         }
     }
     let mut entries = load_bubbles_range(conn, composer_id);
-    entries.sort_by(|a, b| {
-        let ta = a.get("createdAt").and_then(Value::as_str).unwrap_or("");
-        let tb = b.get("createdAt").and_then(Value::as_str).unwrap_or("");
-        match (parse_any_timestamp(ta), parse_any_timestamp(tb)) {
-            (Some(a), Some(b)) => a.cmp(&b),
-            (Some(_), None) => std::cmp::Ordering::Less,
-            (None, Some(_)) => std::cmp::Ordering::Greater,
-            (None, None) => std::cmp::Ordering::Equal,
-        }
+    // Timestamped first, in order; untimestamped keep their scan order.
+    entries.sort_by_cached_key(|entry| {
+        let ts = parse_any_timestamp(&cursor_entry_timestamp(entry));
+        (ts.is_none(), ts)
     });
-    entries
+    (entries, false)
 }
 
 fn first_user_text(conn: &Connection, composer_id: &str, headers: Option<&[Value]>) -> String {
@@ -269,7 +267,8 @@ fn first_user_text(conn: &Connection, composer_id: &str, headers: Option<&[Value
 fn load_bubbles_as_messages(conn: &Connection, session: &Session) -> Vec<Message> {
     let mut messages = Vec::new();
     let mut total_chars: usize = 0;
-    for entry in load_bubble_entries(conn, &session.id) {
+    let (entries, ordered) = load_bubble_entries(conn, &session.id);
+    for entry in entries {
         if total_chars > 4 * 1024 * 1024 {
             break;
         }
@@ -279,7 +278,7 @@ fn load_bubbles_as_messages(conn: &Connection, session: &Session) -> Vec<Message
         total_chars += msg.content.len();
         messages.push(msg);
     }
-    if composer_header_order(conn, &session.id).is_none() {
+    if !ordered {
         sort_messages_stable(&mut messages);
     }
     messages
@@ -314,21 +313,40 @@ fn load_cursor_ide_sessions_from(db: &Path) -> Vec<Session> {
         return Vec::new();
     }
     let Some(conn) = open_ro(db) else {
+        eprintln!(
+            "Warning: cannot read Cursor history database {}. Check file permissions and CURSOR_USER_DIR.",
+            db.display()
+        );
         return Vec::new();
     };
     let mut sessions = Vec::new();
-    let sql = "SELECT composerId, createdAt, lastUpdatedAt, isSubagent, value FROM composerHeaders";
-    let mut stmt = match conn.prepare(sql) {
+    // Required columns identify the supported storage family; the message
+    // table is checked too so header-only rows never masquerade as readable
+    // conversations. Optional header columns vary between Cursor versions and
+    // are read by name below, defaulting when absent.
+    let supported = conn
+        .prepare("SELECT composerId, value FROM composerHeaders LIMIT 0")
+        .and(conn.prepare("SELECT key, value FROM cursorDiskKV LIMIT 0"));
+    let mut stmt = match supported.and(conn.prepare("SELECT * FROM composerHeaders")) {
         Ok(s) => s,
-        Err(_) => return sessions,
+        Err(reason) => {
+            eprintln!(
+                "Warning: unsupported Cursor history database {}: {reason}. Agent transcript files are still searched; check CURSOR_USER_DIR or update chat-history.",
+                db.display()
+            );
+            return sessions;
+        }
+    };
+    let optional_int = |row: &rusqlite::Row, name: &str| {
+        row.get::<_, Option<i64>>(name).ok().flatten().unwrap_or(0)
     };
     let rows = stmt.query_map([], |row| {
         Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, Option<i64>>(1)?.unwrap_or(0),
-            row.get::<_, Option<i64>>(2)?.unwrap_or(0),
-            row.get::<_, i64>(3).unwrap_or(0) != 0,
-            blob_text(row.get_ref(4)?),
+            row.get::<_, String>("composerId")?,
+            optional_int(row, "createdAt"),
+            optional_int(row, "lastUpdatedAt"),
+            optional_int(row, "isSubagent") != 0,
+            blob_text(row.get_ref("value")?),
         ))
     });
     let Ok(rows) = rows else {
@@ -337,8 +355,21 @@ fn load_cursor_ide_sessions_from(db: &Path) -> Vec<Session> {
     let counts = bubble_counts(&conn);
     let file = db.to_string_lossy().to_string();
     for row in rows.flatten() {
-        let (id, created_ms, updated_ms, is_sidechain, raw) = row;
+        let (id, mut created_ms, mut updated_ms, mut is_sidechain, raw) = row;
         let meta: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
+        if created_ms <= 0 {
+            created_ms = meta.get("createdAt").and_then(Value::as_i64).unwrap_or(0);
+        }
+        if updated_ms <= 0 {
+            updated_ms = meta
+                .get("lastUpdatedAt")
+                .and_then(Value::as_i64)
+                .unwrap_or(0);
+        }
+        is_sidechain |= meta
+            .get("isSubagent")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let name = meta
             .get("name")
             .and_then(Value::as_str)
@@ -369,13 +400,17 @@ fn load_cursor_ide_sessions_from(db: &Path) -> Vec<Session> {
         } else {
             created_ms
         };
-        let (iso, date) = ms_iso_date(ts);
+        let iso = ms_to_iso(ts);
+        let date = iso_date(&iso);
+        // No fabricated creation time: an absent createdAt stays unknown
+        // rather than becoming the last-update time.
+        let created = ms_to_iso(created_ms);
         sessions.push(Session {
             source: "cursor-ide".into(),
             id,
             summary: name,
             first_prompt: first,
-            created: iso.clone(),
+            created,
             modified: iso,
             date,
             messages: nmsg,
@@ -387,6 +422,90 @@ fn load_cursor_ide_sessions_from(db: &Path) -> Vec<Session> {
         });
     }
     sessions
+}
+
+/// Enrich only unambiguous matches. Do not reorder, replace, or drop transcript
+/// content, and never turn a session timestamp into a message timestamp.
+pub fn enrich_transcript_timestamps(session: &Session, messages: &mut [Message]) {
+    if messages.is_empty() || messages.iter().all(|m| !m.timestamp.is_empty()) {
+        return;
+    }
+    let db = global_vscdb();
+    if !db.is_file() {
+        return;
+    }
+    // Deep search enriches many sessions from a rayon pool: keep one
+    // read-only connection per worker thread instead of reopening the
+    // (multi-GB) database for every transcript. The bubbles come from the
+    // same loader the IDE reader uses, so every bubble the sidebar shows is
+    // a candidate here too, including ones whose `type` only the
+    // conversation headers carry.
+    ENRICH_SOURCE.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        if slot.as_ref().is_none_or(|(path, _)| *path != db) {
+            *slot = open_ro(&db).map(|conn| (db.clone(), conn));
+        }
+        if let Some((_, conn)) = slot.as_ref() {
+            merge_message_timestamps(messages, &load_bubbles_as_messages(conn, session));
+        }
+    });
+}
+
+thread_local! {
+    static ENRICH_SOURCE: RefCell<Option<(PathBuf, Connection)>> = const { RefCell::new(None) };
+}
+
+fn merge_message_timestamps(messages: &mut [Message], bubbles: &[Message]) {
+    let content_key = |m: &Message| {
+        (
+            m.role.clone(),
+            if m.role == "user" {
+                clean_first_prompt(&m.content)
+            } else {
+                m.content.trim().to_owned()
+            },
+        )
+    };
+    let mut by_id: HashMap<(&str, &str), Vec<&Message>> = HashMap::new();
+    let mut by_text: HashMap<(String, String), Vec<&Message>> = HashMap::new();
+    let mut occurrences = HashMap::new();
+    for bubble in bubbles {
+        if !bubble.uuid.is_empty() {
+            by_id
+                .entry((&bubble.role, &bubble.uuid))
+                .or_default()
+                .push(bubble);
+        }
+        by_text.entry(content_key(bubble)).or_default().push(bubble);
+    }
+    for message in messages.iter() {
+        *occurrences.entry(content_key(message)).or_insert(0usize) += 1;
+    }
+    for message in messages {
+        if !message.timestamp.is_empty() {
+            continue;
+        }
+        let key = content_key(message);
+        let by_unique_text = || {
+            (occurrences.get(&key) == Some(&1) && !key.1.is_empty())
+                .then(|| by_text.get(&key))
+                .flatten()
+        };
+        // A transcript id the IDE never assigned must not block the text
+        // match; a real bubble id still wins when it resolves.
+        let matched = if message.uuid.is_empty() {
+            by_unique_text()
+        } else {
+            by_id
+                .get(&(message.role.as_str(), message.uuid.as_str()))
+                .or_else(by_unique_text)
+        };
+        if let Some(matches) = matched
+            && matches.len() == 1
+        {
+            message.timestamp = matches[0].timestamp.clone();
+        }
+    }
 }
 
 pub fn parse_cursor_ide(session: &Session) -> Vec<Message> {
@@ -668,5 +787,130 @@ mod tests {
         let sessions = load_cursor_ide_sessions_from(&db);
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].summary, "hash path");
+    }
+
+    #[test]
+    fn cursor_ide_preserves_creation_and_activity_times() {
+        let (_tmp, db) = fixture_db();
+        let conn = Connection::open(&db).unwrap();
+        conn.execute(
+            "UPDATE composerHeaders SET createdAt = 1788220800000, lastUpdatedAt = 1788307200000",
+            [],
+        )
+        .unwrap();
+        let sessions = load_cursor_ide_sessions_from(&db);
+        assert_eq!(sessions[0].created, "2026-09-01T00:00:00Z");
+        assert_eq!(sessions[0].modified, "2026-09-02T00:00:00Z");
+        assert_eq!(sessions[0].date, "2026-09-02");
+        assert_eq!(ms_to_iso(0), "");
+    }
+
+    #[test]
+    fn cursor_ide_tolerates_missing_optional_header_columns() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = tmp.path().join("state.vscdb");
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch("CREATE TABLE composerHeaders (composerId TEXT PRIMARY KEY, value TEXT);
+            CREATE TABLE cursorDiskKV (key TEXT PRIMARY KEY, value BLOB);
+            INSERT INTO composerHeaders VALUES ('id', '{\"name\":\"older header\",\"createdAt\":1788220800000,\"isSubagent\":true}');
+            INSERT INTO composerHeaders VALUES ('id2', '{\"name\":\"no times\",\"lastUpdatedAt\":1788307200000}');").unwrap();
+        let mut sessions = load_cursor_ide_sessions_from(&db);
+        sessions.sort_by(|a, b| a.id.cmp(&b.id));
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions[0].summary, "older header");
+        assert_eq!(sessions[0].created, "2026-09-01T00:00:00Z");
+        assert!(sessions[0].is_sidechain);
+        // No createdAt anywhere: creation stays unknown, activity is known.
+        assert_eq!(sessions[1].created, "");
+        assert_eq!(sessions[1].date, "2026-09-02");
+    }
+
+    #[test]
+    fn enrichment_recovers_bubble_type_from_conversation_headers() {
+        let (_tmp, db) = fixture_db();
+        let conn = Connection::open(&db).unwrap();
+        let id = "aaaa1111-bbbb-cccc-dddd-eeeeeeeeeeee";
+        // Some bubbles carry no `type`; the IDE reader takes it from the
+        // conversation headers, and enrichment must do the same.
+        conn.execute(
+            "INSERT INTO cursorDiskKV (key, value) VALUES (?1, ?2)",
+            rusqlite::params![
+                format!("bubbleId:{id}:b2"),
+                serde_json::json!({"text":"Second question","bubbleId":"b2","createdAt":"2026-07-01T21:30:00.000Z"}).to_string()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO cursorDiskKV (key, value) VALUES (?1, ?2)",
+            rusqlite::params![
+                format!("composerData:{id}"),
+                serde_json::json!({"fullConversationHeadersOnly":[{"bubbleId":"b1","type":1},{"bubbleId":"b2","type":1}]}).to_string()
+            ],
+        )
+        .unwrap();
+        let sessions = load_cursor_ide_sessions_from(&db);
+        let mut messages = parse_cursor_ide(&sessions[0]);
+        assert_eq!(messages.len(), 2, "IDE reader sees both bubbles");
+        for m in &mut messages {
+            m.timestamp.clear();
+            m.uuid.clear();
+        }
+        merge_message_timestamps(
+            &mut messages,
+            &load_bubbles_as_messages(&conn, &sessions[0]),
+        );
+        assert_eq!(messages[0].timestamp, "2026-07-01T21:25:09.594Z");
+        assert_eq!(messages[1].timestamp, "2026-07-01T21:30:00.000Z");
+    }
+
+    #[test]
+    fn unique_text_fallback_applies_when_uuid_is_not_a_bubble_id() {
+        let (_tmp, db) = fixture_db();
+        let sessions = load_cursor_ide_sessions_from(&db);
+        let original = parse_cursor_ide(&sessions[0]).remove(0);
+        let mut message = original.clone();
+        message.uuid = "msg_01X-not-a-bubble-id".into();
+        message.timestamp.clear();
+        let mut messages = vec![message];
+        merge_message_timestamps(&mut messages, std::slice::from_ref(&original));
+        assert_eq!(messages[0].timestamp, original.timestamp);
+    }
+
+    #[test]
+    fn cursor_ide_enrichment_preserves_content_and_rejects_ambiguous_matches() {
+        let (_tmp, db) = fixture_db();
+        let sessions = load_cursor_ide_sessions_from(&db);
+        let original = parse_cursor_ide(&sessions[0]).remove(0);
+        let mut unknown = original.clone();
+        unknown.uuid.clear();
+        unknown.timestamp.clear();
+        let mut messages = vec![unknown.clone()];
+        merge_message_timestamps(&mut messages, std::slice::from_ref(&original));
+        assert_eq!(messages[0].timestamp, original.timestamp);
+        assert_eq!(messages[0].content, unknown.content);
+        assert!(messages[0].uuid.is_empty());
+
+        let mut repeated = vec![unknown.clone(), unknown.clone()];
+        merge_message_timestamps(&mut repeated, std::slice::from_ref(&original));
+        assert!(repeated.iter().all(|m| m.timestamp.is_empty()));
+        let mut repeated_bubbles = vec![unknown.clone()];
+        merge_message_timestamps(&mut repeated_bubbles, &[original.clone(), original.clone()]);
+        assert!(repeated_bubbles[0].timestamp.is_empty());
+
+        let mut native = original.clone();
+        native.timestamp = "2026-09-07T10:00:00Z".into();
+        let mut with_native = vec![native.clone()];
+        merge_message_timestamps(&mut with_native, std::slice::from_ref(&original));
+        assert_eq!(with_native[0].timestamp, native.timestamp);
+
+        unknown.uuid = original.uuid.clone();
+        unknown.content = "same ID, richer transcript text with tools".into();
+        let mut by_id = vec![unknown];
+        merge_message_timestamps(&mut by_id, std::slice::from_ref(&original));
+        assert_eq!(by_id[0].timestamp, original.timestamp);
+        assert_eq!(
+            by_id[0].content,
+            "same ID, richer transcript text with tools"
+        );
     }
 }

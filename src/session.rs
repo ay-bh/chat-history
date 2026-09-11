@@ -10,7 +10,7 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Session {
     pub source: String,
     pub id: String,
@@ -29,6 +29,14 @@ pub struct Session {
 }
 
 impl Session {
+    /// A CLI chat whose metadata is available, but whose transcript is not.
+    pub fn is_cursor_store_only(&self) -> bool {
+        self.source == "cursor"
+            && Path::new(&self.file)
+                .file_name()
+                .is_some_and(|n| n == "store.db")
+    }
+
     /// Listed as `cursor-ide`: SQLite-only composers, or IDE Agent chats that
     /// also have an `agent-transcripts` jsonl with the same id.
     pub fn is_ide_ui(&self) -> bool {
@@ -275,11 +283,17 @@ pub fn copy_session_to_dir(session: &Session, target_dir: &Path) -> std::io::Res
 /// How to resume a session in its original tool.
 #[derive(Debug, PartialEq, Eq)]
 pub enum ResumeAction {
-    Exec { bin: String, args: Vec<String> },
-    Print { cmdline: String },
+    Exec {
+        bin: String,
+        args: Vec<String>,
+        workdir: Option<PathBuf>,
+    },
+    Print {
+        cmdline: String,
+    },
 }
 
-/// Binary + args to resume this session in its original tool.
+/// Resolve binary, args, and working directory once for this invocation.
 /// Cursor Agent: `agent`, then `cursor-agent`, never exec `cursor agent`
 /// (that launcher can download the CLI as a side effect).
 pub fn resume_command(session: &Session) -> Option<ResumeAction> {
@@ -287,15 +301,19 @@ pub fn resume_command(session: &Session) -> Option<ResumeAction> {
         "codex" => Some(ResumeAction::Exec {
             bin: "codex".into(),
             args: vec!["resume".into(), session.id.clone()],
+            workdir: existing_absolute_dir(&session.project),
         }),
         "claude" => Some(ResumeAction::Exec {
             bin: "claude".into(),
             args: vec!["--resume".into(), session.id.clone()],
+            workdir: existing_absolute_dir(&session.project),
         }),
-        "cursor" => {
+        // A cursor-ide row can still be a CLI chat the IDE indexes (or a
+        // CLI chat whose transcript is gone): the store decides, not the tag.
+        "cursor" | "cursor-ide" => {
             // Only chats the Agent CLI itself stored can be resumed, and only
             // from their own workspace; anything else would start a blank chat.
-            let cwd = cursor_cli_chat_cwd(&session.id)?;
+            let cwd = crate::cursor_cli::resume_workspace(session)?;
             let mut args = Vec::new();
             let (bin, print_only): (String, bool) = if command_on_path("agent") {
                 ("agent".into(), false)
@@ -319,7 +337,11 @@ pub fn resume_command(session: &Session) -> Option<ResumeAction> {
                     .join(" ");
                 Some(ResumeAction::Print { cmdline })
             } else {
-                Some(ResumeAction::Exec { bin, args })
+                Some(ResumeAction::Exec {
+                    bin,
+                    args,
+                    workdir: Some(cwd),
+                })
             }
         }
         _ => None,
@@ -339,59 +361,11 @@ fn shell_quote(arg: &str) -> String {
     }
 }
 
-/// Directory the resumed tool should start in (the session's spawn cwd).
-pub fn resume_working_dir(session: &Session) -> Option<PathBuf> {
-    if session.source == "cursor" {
-        return cursor_cli_chat_cwd(&session.id);
-    }
-    existing_absolute_dir(&session.project)
-}
-
-/// Workspace of the Cursor Agent CLI chat with this id, if the CLI has a
-/// store for it. The CLI keeps its sessions under
-/// `~/.cursor/chats/<hash of cwd>/<chat id>/{store.db,meta.json}` and looks a
-/// chat up by (workspace, id): resuming from another `--workspace` silently
-/// starts a blank chat that reuses the id. IDE sidebar chats also write
-/// `agent-transcripts` but never have such a store, so they get the sidebar
-/// hint instead. Several stores for one id (different workspaces) resolve to
-/// the most recently updated one whose workspace still exists.
-pub fn cursor_cli_chat_cwd(chat_id: &str) -> Option<PathBuf> {
-    let chats = user_home()?.join(".cursor").join("chats");
-    cursor_cli_chat_cwd_in(&chats, chat_id)
-}
-
-fn cursor_cli_chat_cwd_in(chats_dir: &Path, chat_id: &str) -> Option<PathBuf> {
-    let mut best: Option<(i64, PathBuf)> = None;
-    for entry in fs::read_dir(chats_dir).ok()?.flatten() {
-        let meta_path = entry.path().join(chat_id).join("meta.json");
-        let Ok(raw) = fs::read_to_string(&meta_path) else {
-            continue;
-        };
-        let Ok(meta) = serde_json::from_str::<serde_json::Value>(&raw) else {
-            continue;
-        };
-        let Some(cwd) = meta.get("cwd").and_then(|v| v.as_str()) else {
-            continue;
-        };
-        let Some(dir) = existing_absolute_dir(cwd) else {
-            continue;
-        };
-        let updated = meta
-            .get("updatedAtMs")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0);
-        if best.as_ref().is_none_or(|(t, _)| updated > *t) {
-            best = Some((updated, dir));
-        }
-    }
-    best.map(|(_, dir)| dir)
-}
-
 /// `project` as an existing, absolute directory. Cursor slugs that could not
 /// be decoded are kept verbatim (relative) for display; they must never be
 /// used as a cwd or `--workspace`, or a same-named subdirectory of the
 /// current directory would be picked up silently.
-fn existing_absolute_dir(project: &str) -> Option<PathBuf> {
+pub(crate) fn existing_absolute_dir(project: &str) -> Option<PathBuf> {
     if project.is_empty() {
         return None;
     }
@@ -423,7 +397,7 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-fn mtime_iso(path: &Path) -> Option<String> {
+pub(crate) fn mtime_iso(path: &Path) -> Option<String> {
     let meta = fs::metadata(path).ok()?;
     let mtime = meta.modified().ok()?;
     let dur = mtime.duration_since(SystemTime::UNIX_EPOCH).ok()?;
@@ -437,6 +411,47 @@ pub fn parse_any_timestamp(s: &str) -> Option<DateTime<FixedOffset>> {
         .or_else(|_| DateTime::parse_from_str(&s, "%Y-%m-%dT%H:%M:%S%.f%:z"))
         .ok()
         .or_else(|| s.parse::<DateTime<Utc>>().ok().map(|t| t.fixed_offset()))
+}
+
+/// Cursor uses ISO strings in transcripts and milliseconds in SQLite metadata.
+/// Never substitute a file or session time for an unknown message time.
+pub(crate) fn cursor_timestamp(value: &Value) -> String {
+    if let Some(s) = value.as_str() {
+        return parse_any_timestamp(s)
+            .map(|_| s.to_owned())
+            .unwrap_or_default();
+    }
+    value.as_i64().map(ms_to_iso).unwrap_or_default()
+}
+
+/// The one epoch-milliseconds formatter for Cursor data: preserves
+/// milliseconds when present, keeps whole seconds compact, and treats
+/// non-positive or out-of-range values as unknown.
+/// The `YYYY-MM-DD` day of an ISO timestamp ("" for unknown).
+pub(crate) fn iso_date(iso: &str) -> String {
+    iso.get(..10).unwrap_or("").to_owned()
+}
+
+pub(crate) fn ms_to_iso(ms: i64) -> String {
+    Some(ms)
+        .filter(|ms| *ms > 0)
+        .and_then(DateTime::<Utc>::from_timestamp_millis)
+        .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true))
+        .unwrap_or_default()
+}
+
+pub(crate) fn cursor_entry_timestamp(entry: &Value) -> String {
+    [
+        "/timestamp",
+        "/createdAt",
+        "/message/timestamp",
+        "/message/createdAt",
+    ]
+    .iter()
+    .filter_map(|p| entry.pointer(p))
+    .map(cursor_timestamp)
+    .find(|ts| !ts.is_empty())
+    .unwrap_or_default()
 }
 
 fn mtime_date(path: &Path) -> Option<String> {
@@ -483,7 +498,7 @@ fn claude_first_prompt(path: &Path) -> String {
     String::new()
 }
 
-fn cursor_first_prompt_jsonl(path: &Path) -> String {
+pub(crate) fn cursor_first_prompt_jsonl(path: &Path) -> String {
     let file = match fs::File::open(path) {
         Ok(f) => f,
         Err(_) => return String::new(),
@@ -518,7 +533,7 @@ fn cursor_first_prompt_jsonl(path: &Path) -> String {
     String::new()
 }
 
-fn cursor_first_prompt_txt(path: &Path) -> String {
+pub(crate) fn cursor_first_prompt_txt(path: &Path) -> String {
     let content = match fs::read_to_string(path) {
         Ok(c) => c,
         Err(_) => return String::new(),
@@ -675,6 +690,23 @@ pub fn decode_cursor_project_slug(slug: &str) -> WorkspaceResolution {
     decode_from_root(Path::new("/"), slug)
 }
 
+/// The encode direction of the slug above: Cursor names
+/// `~/.cursor/projects/<slug>` by replacing every run of non-alphanumeric
+/// characters in the workspace path with one hyphen (matched all 204
+/// resolved transcripts on a real install). The decoder only reverses `/`,
+/// so a workspace containing other punctuation encodes but never decodes.
+pub(crate) fn cursor_project_slug(workspace: &str) -> String {
+    let mut slug = String::with_capacity(workspace.len());
+    for c in workspace.chars() {
+        if c.is_ascii_alphanumeric() {
+            slug.push(c);
+        } else if !slug.ends_with('-') && !slug.is_empty() {
+            slug.push('-');
+        }
+    }
+    slug.trim_end_matches('-').to_owned()
+}
+
 fn decode_from_root(root: &Path, slug: &str) -> WorkspaceResolution {
     if slug.is_empty() {
         return WorkspaceResolution::Missing;
@@ -719,6 +751,16 @@ fn existing_slug_paths(root: &Path, rest: &str) -> Vec<PathBuf> {
 }
 
 pub fn load_cursor_sessions() -> Vec<Session> {
+    let mut sessions = load_cursor_transcripts();
+    // The CLI store knows the exact directory a chat ran in and can match an
+    // undecoded slug; hooks only know the IDE window's roots, so they fill
+    // whatever is still unpinned afterwards.
+    crate::cursor_cli::merge_cli_sessions(&mut sessions);
+    crate::cursor_hooks::merge_registered_transcripts(&mut sessions);
+    sessions
+}
+
+fn load_cursor_transcripts() -> Vec<Session> {
     let base = cursor_projects_dir();
     if !base.exists() {
         return Vec::new();
@@ -745,14 +787,14 @@ pub fn load_cursor_sessions() -> Vec<Session> {
                             .to_string();
                         txt_ids.insert(sid.clone());
                         let jsonl_alt = transcripts.join(&sid).join(format!("{sid}.jsonl"));
-                        let iso = mtime_iso(&path).unwrap_or_default();
-                        let date = mtime_date(&path).unwrap_or_default();
                         let first = cursor_first_prompt_txt(&path);
                         let file = if jsonl_alt.exists() {
                             jsonl_alt.to_string_lossy().to_string()
                         } else {
                             path.to_string_lossy().to_string()
                         };
+                        let iso = mtime_iso(Path::new(&file)).unwrap_or_default();
+                        let date = mtime_date(Path::new(&file)).unwrap_or_default();
                         sessions.push(Session {
                             source: "cursor".into(),
                             id: sid,
@@ -1038,6 +1080,33 @@ pub fn load_sessions(source: Option<&str>) -> Vec<Session> {
 /// Matching pairs are one Agent row (`also_ide`) so search does not duplicate.
 pub fn merge_cursor_sessions(agents: Vec<Session>, ide: Vec<Session>) -> Vec<Session> {
     let mut agents = agents;
+    let mut ide = ide;
+    // A readable IDE transcript takes precedence over CLI metadata alone,
+    // but the store still knows the workspace, title, and creation time the
+    // IDE header may lack.
+    agents.retain(|s| {
+        if !s.is_cursor_store_only() {
+            return true;
+        }
+        let Some(readable) = ide
+            .iter_mut()
+            .find(|i| i.id.eq_ignore_ascii_case(&s.id) && i.messages > 0)
+        else {
+            return true;
+        };
+        // The store's cwd is where the chat ran; the IDE row carries the
+        // window root, which resume would otherwise flag as a fallback.
+        if Path::new(&s.project).is_absolute() || readable.project.is_empty() {
+            readable.project = s.project.clone();
+        }
+        if readable.summary.is_empty() {
+            readable.summary = s.summary.clone();
+        }
+        if readable.created.is_empty() {
+            readable.created = s.created.clone();
+        }
+        false
+    });
     let mut agent_indexes: HashMap<String, Vec<usize>> = HashMap::new();
     for (index, session) in agents.iter().enumerate() {
         agent_indexes
@@ -1050,13 +1119,40 @@ pub fn merge_cursor_sessions(agents: Vec<Session>, ide: Vec<Session>) -> Vec<Ses
         let key = ide_session.id.to_ascii_lowercase();
         if let Some(indexes) = agent_indexes.get(&key) {
             for &index in indexes {
+                // A CLI store proves a CLI chat; an IDE header alone (no
+                // bubbles, or the transcript is gone) must not turn it into
+                // a sidebar chat that resume refuses.
+                if agents[index].is_cursor_store_only() {
+                    continue;
+                }
                 agents[index].also_ide = true;
                 if !ide_session.summary.is_empty() {
                     agents[index].summary = ide_session.summary.clone();
                 }
-                if !ide_session.project.is_empty() {
+                // The CLI store already pinned an absolute workspace when it
+                // exists; resume prefers that copy, so keep it.
+                if !ide_session.project.is_empty()
+                    && !Path::new(&agents[index].project).is_absolute()
+                {
                     agents[index].project = ide_session.project.clone();
                 }
+                // Only a composer with messages carries real activity: a
+                // header the sidebar merely touched must not move the
+                // transcript's dates or override the CLI store's creation time.
+                // Creation is the earliest known time; the CLI store's
+                // createdAtMs, set moments earlier, is never pushed later.
+                if ide_session.messages > 0
+                    && !ide_session.created.is_empty()
+                    && (agents[index].created.is_empty()
+                        || parse_any_timestamp(&ide_session.created)
+                            < parse_any_timestamp(&agents[index].created))
+                {
+                    agents[index].created = ide_session.created.clone();
+                }
+                // The transcript's own mtime is its activity time; a
+                // composer's lastUpdatedAt also moves when the sidebar merely
+                // reopens or renames the chat, so it never overrides it.
+                agents[index].messages = agents[index].messages.max(ide_session.messages);
             }
         } else if ide_session.messages > 0 {
             ide_only.push(ide_session);
@@ -1422,8 +1518,13 @@ pub fn parse_cursor_jsonl(filepath: &str) -> Vec<Message> {
         let ctx = crate::parser::extract_context(&content_raw);
         if !role.is_empty() && !text.trim().is_empty() {
             messages.push(Message {
-                uuid: String::new(),
-                timestamp: String::new(),
+                uuid: ["/uuid", "/bubbleId", "/id", "/message/id"]
+                    .iter()
+                    .filter_map(|p| entry.pointer(p).and_then(Value::as_str))
+                    .find(|s| !s.is_empty())
+                    .unwrap_or("")
+                    .to_owned(),
+                timestamp: cursor_entry_timestamp(&entry),
                 role,
                 content: text,
                 session_id: String::new(),
@@ -1517,6 +1618,24 @@ pub fn parse_cursor_txt(filepath: &str) -> Vec<Message> {
 }
 
 pub fn parse_session(session: &Session, extract_meta: bool) -> (Vec<Message>, Option<SessionMeta>) {
+    parse_session_inner(session, extract_meta, false)
+}
+
+/// Like `parse_session`, but also recovers missing Cursor message timestamps
+/// from the IDE database. Used where message times matter (inspect durations,
+/// deep-search recency and `--timeframe`); costs one IDE read per session.
+pub fn parse_session_recovering_timestamps(
+    session: &Session,
+    extract_meta: bool,
+) -> (Vec<Message>, Option<SessionMeta>) {
+    parse_session_inner(session, extract_meta, true)
+}
+
+fn parse_session_inner(
+    session: &Session,
+    extract_meta: bool,
+    recover_timestamps: bool,
+) -> (Vec<Message>, Option<SessionMeta>) {
     if session.source == "claude" {
         return parse_claude_jsonl(&session.file, extract_meta);
     }
@@ -1547,11 +1666,16 @@ pub fn parse_session(session: &Session, extract_meta: bool) -> (Vec<Message>, Op
         return (messages, None);
     }
     if session.source == "cursor" {
-        let messages = if session.file.ends_with(".txt") {
+        let mut messages = if session.is_cursor_store_only() {
+            Vec::new()
+        } else if session.file.ends_with(".txt") {
             parse_cursor_txt(&session.file)
         } else {
             parse_cursor_jsonl(&session.file)
         };
+        if recover_timestamps {
+            crate::cursor_ide::enrich_transcript_timestamps(session, &mut messages);
+        }
         if extract_meta {
             return (
                 messages,
@@ -1562,7 +1686,7 @@ pub fn parse_session(session: &Session, extract_meta: bool) -> (Vec<Message>, Op
                         Some(session.summary.clone())
                     },
                     custom_title: None,
-                    model: None,
+                    model: crate::cursor_hooks::registered_model(session),
                     total_tokens: 0,
                 }),
             );
@@ -1845,7 +1969,8 @@ mod tests {
             resume_command(&claude),
             Some(ResumeAction::Exec {
                 bin: "claude".into(),
-                args: vec!["--resume".into(), "c1".into()]
+                args: vec!["--resume".into(), "c1".into()],
+                workdir: existing_absolute_dir(&claude.project),
             })
         );
         let codex = make_session("x1", "2026-01-01", "codex", "/p", "", "");
@@ -1853,7 +1978,8 @@ mod tests {
             resume_command(&codex),
             Some(ResumeAction::Exec {
                 bin: "codex".into(),
-                args: vec!["resume".into(), "x1".into()]
+                args: vec!["resume".into(), "x1".into()],
+                workdir: existing_absolute_dir(&codex.project),
             })
         );
     }
@@ -1870,36 +1996,6 @@ mod tests {
             "",
         );
         assert!(resume_command(&s).is_none());
-        assert!(resume_working_dir(&s).is_none());
-    }
-
-    #[test]
-    fn cursor_cli_chat_cwd_picks_newest_existing_workspace() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let chats = tmp.path().join("chats");
-        let ws_old = tmp.path().join("ws-old");
-        let ws_new = tmp.path().join("ws-new");
-        fs::create_dir_all(&ws_old).unwrap();
-        fs::create_dir_all(&ws_new).unwrap();
-        let id = "cc9ae34e-117f-435c-9a83-f8958c7b09e1";
-        let write = |hash: &str, cwd: &str, updated: i64| {
-            let dir = chats.join(hash).join(id);
-            fs::create_dir_all(&dir).unwrap();
-            fs::write(
-                dir.join("meta.json"),
-                format!(r#"{{"schemaVersion":1,"cwd":{cwd:?},"updatedAtMs":{updated}}}"#),
-            )
-            .unwrap();
-        };
-        write("aaaa", ws_old.to_str().unwrap(), 1);
-        write("bbbb", ws_new.to_str().unwrap(), 2);
-        write("cccc", "/no/such/workspace", 3); // newest, but the workspace is gone
-        assert_eq!(cursor_cli_chat_cwd_in(&chats, id), Some(ws_new));
-        assert_eq!(cursor_cli_chat_cwd_in(&chats, "other-id"), None);
-        assert_eq!(
-            cursor_cli_chat_cwd_in(&tmp.path().join("missing"), id),
-            None
-        );
     }
 
     #[test]
@@ -1940,16 +2036,23 @@ mod tests {
         // `src` exists relative to the package root, where cargo runs tests.
         // An undecoded Cursor slug looks exactly like this.
         let s = make_session("id", "2026-01-01", "codex", "src", "", "");
-        assert!(resume_working_dir(&s).is_none());
+        assert!(exec_workdir(&s).is_none());
         let cwd = std::env::current_dir().unwrap();
         assert!(!project_matches_cwd(&cwd.join("src"), "src"));
         assert!(project_matches_cwd(&cwd, cwd.to_str().unwrap()));
     }
 
+    fn exec_workdir(session: &Session) -> Option<PathBuf> {
+        match resume_command(session) {
+            Some(ResumeAction::Exec { workdir, .. }) => workdir,
+            _ => None,
+        }
+    }
+
     #[test]
-    fn resume_working_dir_requires_existing_folder() {
+    fn resume_workdir_requires_existing_folder() {
         let missing = make_session("id", "2026-01-01", "codex", "/no/such/ws", "", "");
-        assert!(resume_working_dir(&missing).is_none());
+        assert!(exec_workdir(&missing).is_none());
         let dir = tempfile::TempDir::new().unwrap();
         let present = make_session(
             "id",
@@ -1959,7 +2062,32 @@ mod tests {
             "",
             "",
         );
-        assert_eq!(resume_working_dir(&present).as_deref(), Some(dir.path()));
+        assert_eq!(exec_workdir(&present).as_deref(), Some(dir.path()));
+        for source in ["claude", "codex"] {
+            for (mut session, expected) in [
+                (missing.clone(), None),
+                (present.clone(), Some(dir.path().to_path_buf())),
+            ] {
+                session.source = source.into();
+                let Some(ResumeAction::Exec { workdir, .. }) = resume_command(&session) else {
+                    panic!("expected exec for {source}");
+                };
+                assert_eq!(workdir, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn cursor_project_slug_matches_cursor_naming() {
+        assert_eq!(
+            cursor_project_slug("/Users/me/Documents/GitHub/chat-history"),
+            "Users-me-Documents-GitHub-chat-history"
+        );
+        // Runs of punctuation collapse to one hyphen; nothing leads or trails.
+        assert_eq!(
+            cursor_project_slug("/private/tmp/claude-501/-Users-me/x y/"),
+            "private-tmp-claude-501-Users-me-x-y"
+        );
     }
 
     #[test]
@@ -2028,6 +2156,70 @@ mod tests {
             lookup_session(&sessions, "abc-1"),
             SessionLookup::Found(s) if s.id == "abc-123"
         ));
+    }
+
+    #[test]
+    fn header_only_ide_rows_do_not_move_dates_and_superseded_stores_keep_facts() {
+        // A sidebar-touched header (no bubbles) must not move the transcript.
+        let mut transcript = make_session("id", "2026-08-01", "cursor", "/repo", "", "");
+        transcript.file = "/t/id.jsonl".into();
+        transcript.modified = "2026-08-01T10:00:00Z".into();
+        transcript.created = "2026-07-30T10:00:00Z".into();
+        let mut touched = make_session("id", "2026-09-08", "cursor-ide", "/repo", "", "");
+        touched.modified = "2026-09-08T10:00:00Z".into();
+        touched.created = "2026-09-08T09:00:00Z".into();
+        let merged = merge_cursor_sessions(vec![transcript.clone()], vec![touched.clone()]);
+        assert_eq!(merged[0].modified, "2026-08-01T10:00:00Z");
+        assert_eq!(merged[0].date, "2026-08-01");
+        assert_eq!(merged[0].created, "2026-07-30T10:00:00Z");
+        assert!(merged[0].also_ide);
+        // With bubbles the IDE's creation time counts only when earlier than
+        // what is known; lastUpdatedAt still never moves the transcript.
+        touched.messages = 3;
+        let merged = merge_cursor_sessions(vec![transcript.clone()], vec![touched.clone()]);
+        assert_eq!(merged[0].modified, "2026-08-01T10:00:00Z");
+        assert_eq!(merged[0].created, "2026-07-30T10:00:00Z");
+        touched.created = "2026-07-01T09:00:00Z".into();
+        let merged = merge_cursor_sessions(vec![transcript], vec![touched.clone()]);
+        assert_eq!(merged[0].created, "2026-07-01T09:00:00Z");
+        // A store-only row superseded by a readable IDE row hands over the
+        // workspace, title, and creation time the IDE header lacks.
+        let mut store = make_session(
+            "id",
+            "2026-08-01",
+            "cursor",
+            "/Users/me/proj",
+            "",
+            "CLI title",
+        );
+        store.file = "/home/.cursor/chats/h/id/store.db".into();
+        store.created = "2026-07-30T10:00:00Z".into();
+        let mut bare = touched.clone();
+        bare.project = "/Users/me".into(); // the IDE window root, not the chat's cwd
+        bare.created.clear();
+        let merged = merge_cursor_sessions(vec![store], vec![bare]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].source, "cursor-ide");
+        assert_eq!(merged[0].project, "/Users/me/proj");
+        assert_eq!(merged[0].summary, "CLI title");
+        assert_eq!(merged[0].created, "2026-07-30T10:00:00Z");
+    }
+
+    #[test]
+    fn merge_cursor_keeps_a_pinned_workspace_and_fills_an_empty_one() {
+        let mut pinned = make_session("id", "2026-01-01", "cursor", "/repo/sub", "", "");
+        pinned.file = "/t/id.jsonl".into();
+        let mut blank = pinned.clone();
+        blank.project.clear();
+        let ide = make_session("id", "2026-01-01", "cursor-ide", "/repo", "", "IDE title");
+        let merged = merge_cursor_sessions(vec![pinned, blank], vec![ide]);
+        assert_eq!(merged[0].project, "/repo/sub", "CLI copy's workspace stays");
+        assert_eq!(merged[1].project, "/repo", "empty project takes the IDE's");
+        assert!(
+            merged
+                .iter()
+                .all(|s| s.also_ide && s.summary == "IDE title")
+        );
     }
 
     #[test]
@@ -2603,6 +2795,57 @@ mod tests {
         );
         std::fs::write(tmp.path(), data).unwrap();
         assert_eq!(cursor_first_prompt_jsonl(tmp.path()), "fix the login bug");
+    }
+
+    #[test]
+    fn cursor_jsonl_preserves_native_timestamps_without_inventing_missing_ones() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        fs::write(tmp.path(), concat!(
+            "{\"role\":\"user\",\"id\":\"u1\",\"timestamp\":\"2026-09-01T10:00:00Z\",\"message\":{\"content\":\"user prompt\"}}\n",
+            "{\"role\":\"assistant\",\"timestamp\":\"invalid\",\"message\":{\"id\":\"a1\",\"createdAt\":1788307200123,\"content\":\"assistant reply\"}}\n",
+            "{\"role\":\"user\",\"message\":{\"content\":\"no timestamp\"}}\n"
+        )).unwrap();
+        let messages = parse_cursor_jsonl(tmp.path().to_str().unwrap());
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].uuid, "u1");
+        assert_eq!(messages[0].timestamp, "2026-09-01T10:00:00Z");
+        assert_eq!(messages[1].uuid, "a1");
+        assert_eq!(messages[1].timestamp, "2026-09-02T00:00:00.123Z");
+        assert!(messages[2].timestamp.is_empty());
+        assert!(cursor_timestamp(&serde_json::json!(0)).is_empty());
+        assert!(cursor_timestamp(&serde_json::json!(i64::MAX)).is_empty());
+    }
+
+    #[test]
+    fn cursor_timestamps_round_trip_milliseconds_and_preserve_iso_strings() {
+        for ms in [
+            1,
+            1788307200000,
+            1788307200001,
+            1788307200123,
+            1788307200999,
+        ] {
+            let timestamp = cursor_timestamp(&serde_json::json!(ms));
+            assert_eq!(
+                parse_any_timestamp(&timestamp).unwrap().timestamp_millis(),
+                ms
+            );
+        }
+        assert_eq!(
+            cursor_timestamp(&serde_json::json!(1788307200000i64)),
+            "2026-09-02T00:00:00Z"
+        );
+        let iso = "2026-09-02T05:30:00.123456+05:30";
+        assert_eq!(cursor_timestamp(&serde_json::json!(iso)), iso);
+        for invalid in [
+            Value::Null,
+            serde_json::json!(-1),
+            serde_json::json!(0),
+            serde_json::json!(i64::MAX),
+            serde_json::json!("invalid"),
+        ] {
+            assert!(cursor_timestamp(&invalid).is_empty());
+        }
     }
 
     #[test]

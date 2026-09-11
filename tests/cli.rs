@@ -2493,6 +2493,10 @@ fn cursor_transcript_with_cli_store_resumes_in_its_workspace() {
         .join("0123abcd")
         .join(id);
     fs::create_dir_all(&store).unwrap();
+    let conn = rusqlite::Connection::open(store.join("store.db")).unwrap();
+    conn.execute_batch("CREATE TABLE blobs (id TEXT PRIMARY KEY, data BLOB);")
+        .unwrap();
+    drop(conn);
     fs::write(
         store.join("meta.json"),
         format!(
