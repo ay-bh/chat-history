@@ -166,7 +166,6 @@ fn merge_records(sessions: &mut Vec<Session>, records: Vec<HookRecord>) {
                 .map(|r| (*r).clone())
                 .unwrap_or_default()
         };
-        let project = root_for("");
         // A file the scan already listed only gains the hook's workspace.
         // Any other usable file is one more copy of the conversation, listed
         // like scanned copies are; `inspect`/`resume`/`find` pick one copy.
@@ -186,15 +185,21 @@ fn merge_records(sessions: &mut Vec<Session>, records: Vec<HookRecord>) {
             continue;
         }
         // A transcript supersedes the store-only row the CLI merge (which
-        // runs first) may have listed for this id; keep its title and times.
+        // runs first) may have listed for this id; keep its title, times,
+        // and cwd. The hook's workspace_roots are the IDE window, often a
+        // parent of where the Agent CLI ran.
         let mut summary = String::new();
         let mut created = String::new();
+        let mut project = root_for("");
         sessions.retain(|s| {
             let superseded =
                 s.is_cursor_store_only() && s.id.eq_ignore_ascii_case(&record.conversation_id);
             if superseded {
                 summary = s.summary.clone();
                 created = s.created.clone();
+                if Path::new(&s.project).is_absolute() || project.is_empty() {
+                    project = s.project.clone();
+                }
             }
             !superseded
         });
@@ -332,6 +337,38 @@ mod tests {
             assert_eq!(sessions.len(), 1);
             assert_eq!(sessions[0].project, after);
         }
+    }
+
+    #[test]
+    fn hook_replacement_keeps_the_store_workspace() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = tmp.path().join("hooks.db");
+        let file = tmp.path().join("elsewhere.jsonl");
+        std::fs::write(
+            &file,
+            "{\"role\":\"user\",\"message\":{\"content\":\"q\"}}\n",
+        )
+        .unwrap();
+        let event = serde_json::json!({"conversation_id":"hook-id", "transcript_path":file,
+            "workspace_roots":["/repo"]});
+        record_hook_at(event.to_string().as_bytes(), &db).unwrap();
+        let store = Session {
+            source: "cursor".into(),
+            id: "hook-id".into(),
+            summary: "CLI title".into(),
+            created: "2026-09-02T10:00:00.000Z".into(),
+            project: "/repo/my.app".into(),
+            file: tmp.path().join("store.db").to_string_lossy().into_owned(),
+            ..Session::default()
+        };
+        let mut sessions = vec![store];
+        merge_records(&mut sessions, read_records(&db, true));
+        assert_eq!(sessions.len(), 1);
+        assert!(!sessions[0].is_cursor_store_only());
+        assert_eq!(sessions[0].first_prompt, "q");
+        assert_eq!(sessions[0].summary, "CLI title");
+        assert_eq!(sessions[0].created, "2026-09-02T10:00:00.000Z");
+        assert_eq!(sessions[0].project, "/repo/my.app");
     }
 
     #[test]
