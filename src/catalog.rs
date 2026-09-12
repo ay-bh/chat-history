@@ -22,6 +22,8 @@ fn timestamp(time: SystemTime) -> i128 {
     }
 }
 
+// Non-Unix deliberately stops at size + mtime: hashing every source would
+// make warm listings scale with total transcript and SQLite database bytes.
 #[derive(Serialize, PartialEq, Eq)]
 struct Stamp {
     len: u64,
