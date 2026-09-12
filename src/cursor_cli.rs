@@ -6,6 +6,7 @@ use crate::session::{
     Session, cursor_project_slug, cursor_timestamp, existing_absolute_dir, iso_date, ms_to_iso,
     mtime_iso, user_home,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -24,10 +25,13 @@ pub(crate) fn merge_cli_sessions(sessions: &mut Vec<Session>) {
 }
 
 /// One `~/.cursor/chats/<workspace-hash>/<id>` directory with a usable store.
+#[derive(Deserialize, Serialize)]
 struct CliChat {
+    #[serde(skip)]
     dir: PathBuf,
     project: String,
     updated: i64,
+    #[serde(skip)]
     workspace_exists: bool,
     title: String,
     created: String,
@@ -50,6 +54,16 @@ fn read_copy(dir: &Path) -> Result<CliChat, Skip> {
     if !fs::metadata(&store).is_ok_and(|m| m.is_file() && m.len() > 0) {
         return Err(Skip::NoStore);
     }
+    let path = dir.join("meta.json");
+    let mut chat = crate::catalog::read("cursor", "cli-meta", &path, false, || read_meta(dir).ok())
+        .ok_or(Skip::BadMeta)?;
+    // These depend on live filesystem state, not on meta.json's contents.
+    chat.dir = dir.to_path_buf();
+    chat.workspace_exists = existing_absolute_dir(&chat.project).is_some();
+    Ok(chat)
+}
+
+fn read_meta(dir: &Path) -> Result<CliChat, Skip> {
     let meta: Value = fs::read_to_string(dir.join("meta.json"))
         .ok()
         .and_then(|raw| serde_json::from_str(&raw).ok())
@@ -70,7 +84,7 @@ fn read_copy(dir: &Path) -> Result<CliChat, Skip> {
         .to_owned();
     Ok(CliChat {
         dir: dir.to_path_buf(),
-        workspace_exists: existing_absolute_dir(&project).is_some(),
+        workspace_exists: false,
         updated: meta.get("updatedAtMs").and_then(Value::as_i64).unwrap_or(0),
         title: meta
             .get("title")
