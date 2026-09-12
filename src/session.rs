@@ -8,6 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct Session {
@@ -398,7 +399,13 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
 
 pub(crate) fn mtime_iso(path: &Path) -> Option<String> {
     let meta = crate::catalog::metadata(path).ok()?;
-    let dt = DateTime::<Utc>::from(meta.modified().ok()?);
+    system_time_iso(meta.modified().ok()?)
+}
+
+fn system_time_iso(time: SystemTime) -> Option<String> {
+    let duration = time.duration_since(UNIX_EPOCH).ok()?;
+    let seconds = i64::try_from(duration.as_secs()).ok()?;
+    let dt = DateTime::<Utc>::from_timestamp(seconds, duration.subsec_nanos())?;
     Some(dt.format("%Y-%m-%dT%H:%M:%SZ").to_string())
 }
 
@@ -3269,5 +3276,17 @@ mod tests {
             parse_any_timestamp(&ts).is_some(),
             "mtime_iso output should be parseable"
         );
+    }
+
+    #[test]
+    fn system_time_iso_rejects_unrepresentable_times() {
+        assert_eq!(
+            system_time_iso(UNIX_EPOCH).as_deref(),
+            Some("1970-01-01T00:00:00Z")
+        );
+        assert!(system_time_iso(UNIX_EPOCH - std::time::Duration::from_secs(1)).is_none());
+        let too_late = UNIX_EPOCH
+            + std::time::Duration::from_secs(DateTime::<Utc>::MAX_UTC.timestamp() as u64 + 1);
+        assert!(system_time_iso(too_late).is_none());
     }
 }

@@ -30,8 +30,6 @@ struct Stamp {
     changed: i128,
     #[cfg(unix)]
     identity: (u64, u64, u32),
-    #[cfg(not(unix))]
-    content: u64,
 }
 
 fn stamp(path: &Path) -> std::io::Result<Stamp> {
@@ -57,28 +55,7 @@ fn stamp(path: &Path) -> std::io::Result<Stamp> {
             use std::os::unix::fs::MetadataExt;
             (meta.dev(), meta.ino(), meta.mode())
         },
-        // Without Unix ctime, restored-mtime edits require checking bytes.
-        // Hash the entire file: a prefix misses late title/bubble changes.
-        #[cfg(not(unix))]
-        content: content_fingerprint(path)?,
     })
-}
-
-#[cfg(any(not(unix), test))]
-fn content_fingerprint(path: &Path) -> std::io::Result<u64> {
-    use std::io::Read;
-    let mut file = fs::File::open(path)?;
-    let mut hash = 0xcbf29ce484222325u64;
-    let mut buffer = [0u8; 64 * 1024];
-    loop {
-        let n = file.read(&mut buffer)?;
-        if n == 0 {
-            return Ok(hash);
-        }
-        for byte in &buffer[..n] {
-            hash = (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3);
-        }
-    }
 }
 
 impl Stamp {
@@ -423,7 +400,7 @@ mod tests {
     }
 
     #[test]
-    fn persists_hits_and_refreshes_same_size_edits_with_restored_mtime() {
+    fn persists_hits_and_refreshes_edits() {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().join("cache");
         let path = tmp.path().join("source");
@@ -432,15 +409,26 @@ mod tests {
         assert_eq!(cached_text(&dir, &path, &calls), "first");
         assert_eq!(cached_text(&dir, &path, &calls), "first");
         assert_eq!(calls.get(), 1);
+        fs::write(&path, "other").unwrap();
+        assert_eq!(cached_text(&dir, &path, &calls), "other");
+        assert_eq!(calls.get(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_ctime_catches_same_size_edits_with_restored_mtime() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("cache");
+        let path = tmp.path().join("source");
+        fs::write(&path, "first").unwrap();
+        let calls = Cell::new(0);
+        assert_eq!(cached_text(&dir, &path, &calls), "first");
         let modified = fs::metadata(&path).unwrap().modified().unwrap();
         fs::write(&path, "other").unwrap();
-        #[cfg(unix)]
         fs::File::open(&path)
             .unwrap()
             .set_modified(modified)
             .unwrap();
-        #[cfg(not(unix))]
-        let _ = modified;
         assert_eq!(cached_text(&dir, &path, &calls), "other");
         assert_eq!(calls.get(), 2);
     }
@@ -705,13 +693,12 @@ mod tests {
     }
 
     #[test]
-    fn pre_epoch_mtimes_are_cacheable_and_content_hash_catches_restored_mtime_edits() {
+    fn pre_epoch_mtimes_are_cacheable() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("source");
         fs::write(&path, "same prefix FIRST").unwrap();
         let old = UNIX_EPOCH - Duration::from_secs(60);
         fs::File::open(&path).unwrap().set_modified(old).unwrap();
-        let first = content_fingerprint(&path).unwrap();
         let serialized = fingerprint(&path, false).unwrap();
         assert!(serialized.contains("-60000000000"));
         let calls = Cell::new(0);
@@ -719,10 +706,6 @@ mod tests {
         cached_text(&dir, &path, &calls);
         cached_text(&dir, &path, &calls);
         assert_eq!(calls.get(), 1);
-        fs::write(&path, "same prefix OTHER").unwrap();
-        fs::File::open(&path).unwrap().set_modified(old).unwrap();
-        assert_ne!(content_fingerprint(&path).unwrap(), first);
-        assert_eq!(cached_text(&dir, &path, &calls), "same prefix OTHER");
     }
 
     #[cfg(unix)]
