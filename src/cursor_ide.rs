@@ -309,15 +309,22 @@ pub fn load_cursor_ide_sessions() -> Vec<Session> {
 }
 
 fn load_cursor_ide_sessions_from(db: &Path) -> Vec<Session> {
+    crate::catalog::read("cursor-ide", "sessions", db, true, || {
+        read_cursor_ide_sessions_from(db)
+    })
+    .unwrap_or_default()
+}
+
+fn read_cursor_ide_sessions_from(db: &Path) -> Option<Vec<Session>> {
     if !db.exists() {
-        return Vec::new();
+        return None;
     }
     let Some(conn) = open_ro(db) else {
         eprintln!(
             "Warning: cannot read Cursor history database {}. Check file permissions and CURSOR_USER_DIR.",
             db.display()
         );
-        return Vec::new();
+        return None;
     };
     let mut sessions = Vec::new();
     // Required columns identify the supported storage family; the message
@@ -334,7 +341,7 @@ fn load_cursor_ide_sessions_from(db: &Path) -> Vec<Session> {
                 "Warning: unsupported Cursor history database {}: {reason}. Agent transcript files are still searched; check CURSOR_USER_DIR or update chat-history.",
                 db.display()
             );
-            return sessions;
+            return None;
         }
     };
     let optional_int = |row: &rusqlite::Row, name: &str| {
@@ -350,7 +357,7 @@ fn load_cursor_ide_sessions_from(db: &Path) -> Vec<Session> {
         ))
     });
     let Ok(rows) = rows else {
-        return sessions;
+        return None;
     };
     let counts = bubble_counts(&conn);
     let file = db.to_string_lossy().to_string();
@@ -421,7 +428,7 @@ fn load_cursor_ide_sessions_from(db: &Path) -> Vec<Session> {
             also_ide: false,
         });
     }
-    sessions
+    Some(sessions)
 }
 
 /// Enrich only unambiguous matches. Do not reorder, replace, or drop transcript

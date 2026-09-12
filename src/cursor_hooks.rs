@@ -87,30 +87,34 @@ fn read_records(db: &Path, warn: bool) -> Vec<HookRecord> {
     if !db.is_file() {
         return Vec::new();
     }
-    let read = || -> Result<Vec<HookRecord>, String> {
-        let conn = crate::cursor_ide::open_ro(db)
-            .ok_or("cannot open it (permissions, or a lock held longer than 2s)")?;
-        let mut stmt = conn
-            .prepare("SELECT metadata FROM transcripts ORDER BY conversation_id, path")
-            .map_err(|e| e.to_string())?;
-        let rows = stmt
-            .query_map([], |row| row.get::<_, String>(0))
-            .map_err(|e| e.to_string())?;
-        Ok(rows
-            .filter_map(Result::ok)
-            .filter_map(|raw| serde_json::from_str(&raw).ok())
-            .collect())
-    };
-    read().unwrap_or_else(|error| {
-        // The listing already warned; a later lookup stays quiet.
-        if warn {
-            eprintln!(
-                "Warning: cannot read Cursor hook registry {}: {error}",
-                db.display()
-            );
-        }
-        Vec::new()
+    crate::catalog::read("cursor", "hooks", db, true, || {
+        let read = || -> Result<Vec<HookRecord>, String> {
+            let conn = crate::cursor_ide::open_ro(db)
+                .ok_or("cannot open it (permissions, or a lock held longer than 2s)")?;
+            let mut stmt = conn
+                .prepare("SELECT metadata FROM transcripts ORDER BY conversation_id, path")
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(|e| e.to_string())?;
+            Ok(rows
+                .filter_map(Result::ok)
+                .filter_map(|raw| serde_json::from_str(&raw).ok())
+                .collect())
+        };
+        read()
+            .map_err(|error| {
+                // The listing already warned; a later lookup stays quiet.
+                if warn {
+                    eprintln!(
+                        "Warning: cannot read Cursor hook registry {}: {error}",
+                        db.display()
+                    );
+                }
+            })
+            .ok()
     })
+    .unwrap_or_default()
 }
 
 pub(crate) fn merge_registered_transcripts(sessions: &mut Vec<Session>) {
@@ -203,13 +207,13 @@ fn merge_records(sessions: &mut Vec<Session>, records: Vec<HookRecord>) {
             }
             !superseded
         });
-        let modified = mtime_iso(&path).unwrap_or_default();
-        let date = iso_date(&modified);
         let first_prompt = if path.extension().is_some_and(|e| e == "txt") {
             crate::session::cursor_first_prompt_txt(&path)
         } else {
             crate::session::cursor_first_prompt_jsonl(&path)
         };
+        let modified = mtime_iso(&path).unwrap_or_default();
+        let date = iso_date(&modified);
         sessions.push(Session {
             source: "cursor".into(),
             id: record.conversation_id,

@@ -152,6 +152,18 @@ Example (index search, not `--json`):
 
 Noise filtered automatically: warmups, handshake fluff, clear-only sessions, structural config dumps. Transcripts capped at 4MB each.
 
+### Metadata cache
+
+Session discovery automatically caches extracted metadata in `~/.chat-history/cache/catalog-v1.db`. Repeated commands reuse titles, first-prompt previews, and other session metadata from unchanged inputs. Full transcript bodies and search results are not cached; deep search still reads transcripts directly. On one local profile this dropped a warm Claude extract from about 300ms to 10ms; a cold all-sources listing was about 1.3s, then about 400ms once the OS page cache was warm.
+
+Directory discovery and workspace/store checks run on every invocation, so new or deleted transcripts, late hook transcripts, and missing workspaces remain visible immediately. File size and modification time invalidate cached metadata; Unix also checks target file identity and change time. Files modified within two seconds of the scan's start, or with future timestamps, bypass caching to avoid stale hits on coarse filesystem clocks. On platforms without Unix change times, a same-size edit that deliberately restores the previous modification time may remain cached. Listing dates reuse the metadata read during validation.
+
+Cursor IDE and hook-registry snapshots also track SQLite WAL and rollback-journal changes. A changed database refreshes that database's metadata snapshot; checkpoints can conservatively trigger a refresh too. SQLite's `data_version` is connection-local and cannot validate a snapshot across separate CLI processes.
+
+Skipped or failed scans preserve warm rows. An unvisited entry is evicted only when a complete, successful listing of its parent confirms the file is absent. Cache rows are never used to resurrect sessions missing from live discovery.
+
+The cache uses WAL so readers can reuse committed metadata while another process writes, with a one-second busy timeout for contention. Simultaneous cold misses can still extract independently. An unavailable, corrupt, or persistently locked cache falls back to reading the sources. Set `CHAT_HISTORY_NO_CACHE=1` to bypass it, or `CHAT_HISTORY_CACHE_DIR` to choose a different cache directory. Deleting the cache directory causes it to rebuild on the next command. New cache directories and databases are private to your user on Unix.
+
 ### Cursor compatibility
 
 Cursor's on-disk SQLite and transcript schemas are internal and can change. The IDE reader supports `composerHeaders` plus `cursorDiskKV`; absent optional header columns are tolerated. An incompatible or unreadable IDE database produces a warning on stderr while other history sources remain available. Set `CURSOR_USER_DIR` to select a different Cursor profile.

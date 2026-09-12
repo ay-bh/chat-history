@@ -2,15 +2,15 @@ use crate::parser::{
     clean_first_prompt, clean_prompt, extract_text, is_clear_metadata, is_warmup_message,
 };
 use chrono::{DateTime, FixedOffset, NaiveDate, Utc};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct Session {
     pub source: String,
     pub id: String,
@@ -74,14 +74,14 @@ pub struct SessionMeta {
     pub total_tokens: u64,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct IndexFile {
     #[serde(default)]
     entries: Vec<IndexEntry>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct IndexEntry {
     #[serde(default)]
@@ -398,10 +398,14 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
 }
 
 pub(crate) fn mtime_iso(path: &Path) -> Option<String> {
-    let meta = fs::metadata(path).ok()?;
-    let mtime = meta.modified().ok()?;
-    let dur = mtime.duration_since(SystemTime::UNIX_EPOCH).ok()?;
-    let dt = DateTime::<Utc>::from_timestamp(dur.as_secs() as i64, 0)?;
+    let meta = crate::catalog::metadata(path).ok()?;
+    system_time_iso(meta.modified().ok()?)
+}
+
+fn system_time_iso(time: SystemTime) -> Option<String> {
+    let duration = time.duration_since(UNIX_EPOCH).ok()?;
+    let seconds = i64::try_from(duration.as_secs()).ok()?;
+    let dt = DateTime::<Utc>::from_timestamp(seconds, duration.subsec_nanos())?;
     Some(dt.format("%Y-%m-%dT%H:%M:%SZ").to_string())
 }
 
@@ -455,11 +459,7 @@ pub(crate) fn cursor_entry_timestamp(entry: &Value) -> String {
 }
 
 fn mtime_date(path: &Path) -> Option<String> {
-    let meta = fs::metadata(path).ok()?;
-    let mtime = meta.modified().ok()?;
-    let dur = mtime.duration_since(SystemTime::UNIX_EPOCH).ok()?;
-    let dt = DateTime::<Utc>::from_timestamp(dur.as_secs() as i64, 0)?;
-    Some(dt.format("%Y-%m-%d").to_string())
+    mtime_iso(path).map(|iso| iso_date(&iso))
 }
 
 fn claude_first_prompt(path: &Path) -> String {
@@ -499,10 +499,14 @@ fn claude_first_prompt(path: &Path) -> String {
 }
 
 pub(crate) fn cursor_first_prompt_jsonl(path: &Path) -> String {
-    let file = match fs::File::open(path) {
-        Ok(f) => f,
-        Err(_) => return String::new(),
-    };
+    crate::catalog::read("cursor", "first-jsonl", path, false, || {
+        cursor_first_prompt_jsonl_uncached(path)
+    })
+    .unwrap_or_default()
+}
+
+fn cursor_first_prompt_jsonl_uncached(path: &Path) -> Option<String> {
+    let file = fs::File::open(path).ok()?;
     let reader = BufReader::new(file);
     for line in reader.lines() {
         let Ok(line) = line else { continue };
@@ -527,17 +531,21 @@ pub(crate) fn cursor_first_prompt_jsonl(path: &Path) -> String {
         // the actual query.
         let cleaned = clean_first_prompt(&text);
         if !cleaned.is_empty() && !is_warmup_message(&cleaned) && !is_clear_metadata(&cleaned) {
-            return cleaned.chars().take(300).collect();
+            return Some(cleaned.chars().take(300).collect());
         }
     }
-    String::new()
+    Some(String::new())
 }
 
 pub(crate) fn cursor_first_prompt_txt(path: &Path) -> String {
-    let content = match fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(_) => return String::new(),
-    };
+    crate::catalog::read("cursor", "first-txt", path, false, || {
+        cursor_first_prompt_txt_uncached(path)
+    })
+    .unwrap_or_default()
+}
+
+fn cursor_first_prompt_txt_uncached(path: &Path) -> Option<String> {
+    let content = fs::read_to_string(path).ok()?;
     for (i, line) in content.lines().enumerate() {
         if i == 0 {
             continue;
@@ -556,10 +564,10 @@ pub(crate) fn cursor_first_prompt_txt(path: &Path) -> String {
             ]
             .contains(&s)
         {
-            return s.chars().take(300).collect();
+            return Some(s.chars().take(300).collect());
         }
     }
-    String::new()
+    Some(String::new())
 }
 
 pub fn load_claude_sessions() -> Vec<Session> {
@@ -575,13 +583,17 @@ pub fn load_claude_sessions() -> Vec<Session> {
         .flatten()
         .flatten()
     {
-        let data = match fs::read_to_string(&idx_path) {
-            Ok(d) => d,
-            Err(_) => continue,
-        };
-        let index: IndexFile = match serde_json::from_str(&data) {
-            Ok(i) => i,
-            Err(_) => continue,
+        let Some(index) =
+            crate::catalog::read::<IndexFile>("claude", "legacy-index", &idx_path, false, || {
+                let mut index: IndexFile =
+                    serde_json::from_str(&fs::read_to_string(&idx_path).ok()?).ok()?;
+                for entry in &mut index.entries {
+                    entry.first_prompt = entry.first_prompt.chars().take(300).collect();
+                }
+                Some(index)
+            })
+        else {
+            continue;
         };
         for entry in index.entries {
             indexed_ids.insert(entry.session_id.clone());
@@ -629,17 +641,26 @@ pub fn load_claude_sessions() -> Vec<Session> {
                     if indexed_ids.contains(&sid) || sid.starts_with("agent-") {
                         continue;
                     }
+                    let (cwd, branch, summary, first) =
+                        crate::catalog::read("claude", "transcript", &path, false, || {
+                            fs::File::open(&path).ok()?;
+                            let (cwd, branch) = read_cwd_branch_from_jsonl(&path);
+                            Some((
+                                cwd,
+                                branch,
+                                claude_ai_title(&path).unwrap_or_default(),
+                                claude_first_prompt(&path),
+                            ))
+                        })
+                        .unwrap_or_default();
                     let iso = mtime_iso(&path).unwrap_or_default();
                     let date = mtime_date(&path).unwrap_or_default();
-                    let (cwd, branch) = read_cwd_branch_from_jsonl(&path);
                     let project = cwd.unwrap_or_else(|| {
                         dir.file_name()
                             .unwrap_or_default()
                             .to_string_lossy()
                             .replace('-', "/")
                     });
-                    let summary = claude_ai_title(&path).unwrap_or_default();
-                    let first = claude_first_prompt(&path);
                     sessions.push(Session {
                         source: "claude".into(),
                         id: sid,
@@ -833,9 +854,9 @@ fn load_cursor_transcripts() -> Vec<Session> {
                             .unwrap_or_default()
                             .to_string_lossy()
                             .to_string();
+                        let first = cursor_first_prompt_jsonl(&subagent_path);
                         let iso = mtime_iso(&subagent_path).unwrap_or_default();
                         let date = mtime_date(&subagent_path).unwrap_or_default();
-                        let first = cursor_first_prompt_jsonl(&subagent_path);
                         sessions.push(Session {
                             source: "cursor".into(),
                             id: sid,
@@ -860,9 +881,9 @@ fn load_cursor_transcripts() -> Vec<Session> {
                 if !jf.exists() {
                     continue;
                 }
+                let first = cursor_first_prompt_jsonl(&jf);
                 let iso = mtime_iso(&jf).unwrap_or_default();
                 let date = mtime_date(&jf).unwrap_or_default();
-                let first = cursor_first_prompt_jsonl(&jf);
                 sessions.push(Session {
                     source: "cursor".into(),
                     id: dirname,
@@ -884,6 +905,7 @@ fn load_cursor_transcripts() -> Vec<Session> {
     sessions
 }
 
+#[derive(Deserialize, Serialize)]
 struct CodexMeta {
     id: String,
     created: String,
@@ -1002,7 +1024,15 @@ pub fn load_codex_sessions() -> Vec<Session> {
         .flatten()
         .flatten()
     {
-        let Some(meta) = read_codex_meta(&path) else {
+        let Some((meta, first)) = crate::catalog::read("codex", "transcript", &path, false, || {
+            let meta = read_codex_meta(&path)?;
+            let first = if meta.is_subagent {
+                String::new()
+            } else {
+                codex_first_prompt(&path)
+            };
+            Some((meta, first))
+        }) else {
             continue;
         };
         if meta.is_subagent {
@@ -1014,7 +1044,6 @@ pub fn load_codex_sessions() -> Vec<Session> {
             .get(..10)
             .map(str::to_string)
             .unwrap_or_else(|| mtime_date(&path).unwrap_or_default());
-        let first = codex_first_prompt(&path);
         sessions.push(Session {
             source: "codex".into(),
             id: meta.id,
@@ -1048,6 +1077,15 @@ pub fn normalize_source_filter(source: Option<&str>) -> Option<String> {
 }
 
 pub fn load_sessions(source: Option<&str>) -> Vec<Session> {
+    let src = normalize_source_filter(source);
+    let sources: Vec<&str> = match src.as_deref() {
+        Some(s) => vec![s],
+        None => vec!["claude", "cursor", "cursor-ide", "codex"],
+    };
+    crate::catalog::with_catalog(&sources, || load_selected_sources(src.as_deref()))
+}
+
+fn load_selected_sources(source: Option<&str>) -> Vec<Session> {
     let src = normalize_source_filter(source);
     let load_all = src.is_none();
     let mut all = Vec::new();
@@ -3238,5 +3276,19 @@ mod tests {
             parse_any_timestamp(&ts).is_some(),
             "mtime_iso output should be parseable"
         );
+    }
+
+    #[test]
+    fn system_time_iso_rejects_unrepresentable_times() {
+        assert_eq!(
+            system_time_iso(UNIX_EPOCH).as_deref(),
+            Some("1970-01-01T00:00:00Z")
+        );
+        assert!(system_time_iso(UNIX_EPOCH - std::time::Duration::from_secs(1)).is_none());
+        if let Some(too_late) = UNIX_EPOCH.checked_add(std::time::Duration::from_secs(
+            DateTime::<Utc>::MAX_UTC.timestamp() as u64 + 1,
+        )) {
+            assert!(system_time_iso(too_late).is_none());
+        }
     }
 }
