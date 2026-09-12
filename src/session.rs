@@ -3285,8 +3285,10 @@ mod tests {
             Some("1970-01-01T00:00:00Z")
         );
         assert!(system_time_iso(UNIX_EPOCH - std::time::Duration::from_secs(1)).is_none());
-        let too_late = UNIX_EPOCH
-            + std::time::Duration::from_secs(DateTime::<Utc>::MAX_UTC.timestamp() as u64 + 1);
-        assert!(system_time_iso(too_late).is_none());
+        if let Some(too_late) = UNIX_EPOCH.checked_add(std::time::Duration::from_secs(
+            DateTime::<Utc>::MAX_UTC.timestamp() as u64 + 1,
+        )) {
+            assert!(system_time_iso(too_late).is_none());
+        }
     }
 }
