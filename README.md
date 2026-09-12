@@ -1,8 +1,8 @@
 # chat-history
 
-CLI for **agents** to search, inspect, and export **Claude Code**, **Cursor**, and **OpenAI Codex** conversation history.
+CLI for **agents** to search, inspect, and export **Claude Code**, **OpenAI Codex**, and **Cursor** conversation history.
 
-Most usage is via an agent skill (`SKILL.md`) that tells Claude Code / Cursor / Codex when and how to call this tool — not interactive human browsing.
+Most usage is via an agent skill (`SKILL.md`) that tells Claude Code / Codex / Cursor when and how to call this tool — not interactive human browsing.
 
 <img src="docs/assets/usage.png" alt="Agent using chat-history to summarize past project work" width="420" />
 
@@ -18,9 +18,9 @@ cargo install chat-history
 
 The first time you run `chat-history` / `ch`, it quietly installs the bundled agent skill to:
 
-- `~/.cursor/skills/chat-history/SKILL.md`
 - `~/.claude/skills/chat-history/SKILL.md`
 - `$CODEX_HOME/skills/chat-history/SKILL.md` (or `~/.codex/...`)
+- `~/.cursor/skills/chat-history/SKILL.md`
 
 On Windows, the same paths are under `%USERPROFILE%`. Later CLI upgrades refresh **managed** copies automatically (those written by this CLI, tracked via a `.chat-history-managed` sidecar). User-edited skills are left alone. Skills installed by older versions without that sidecar are left alone by the quiet path — run `install-skill` once after upgrading to adopt them.
 
@@ -69,7 +69,7 @@ chat-history inspect <partial-uuid>
 chat-history view --last --plain
 chat-history view <id> --tools
 chat-history export <id> -o session.md
-chat-history resume <id>                  # Claude / Codex / Cursor Agent CLI chats — IDE chats print a hint
+chat-history resume <id>                  # Claude / Codex / Cursor chats with a CLI store; others print a hint
 chat-history find <id>                    # absolute path for further tooling
 
 # Shell completions (bash, zsh, fish, elvish, powershell)
@@ -84,7 +84,7 @@ These filters apply to session listing, `search`, and `--last` selection. Explic
 
 ```bash
 # Listing / search / --last filters
-chat-history --source claude              # claude | cursor | cursor-agent | cursor-ide | codex
+chat-history --source claude              # claude | codex | cursor | cursor-agent | cursor-ide
                                           # cursor = cursor-agent = transcripts + CLI metadata; cursor-ide = sidebar
 chat-history --project chat-history
 chat-history --branch feature-xyz
@@ -113,7 +113,9 @@ All JSON output uses a `{ "query", "count", "results" }` envelope. Deep-search r
 
 Scopes: `all` (default), `errors`, `similar`, `tools`, `files`. Use `--timeframe today|week|month|Nd` and `--limit N` (default 15) to constrain results.
 
-Human-readable results include an 8-char UUID prefix — pass that to `inspect`, `view`, `export`, or `find` for any source, and to `resume` for `claude`, `codex`, and any Cursor chat whose id has a store under `~/.cursor/chats`. Any other Cursor row — `cursor-ide` without a store, or an Agent transcript whose CLI store is gone — prints the chat's **title** and `DIR:` so you can open it in the Cursor sidebar: without its store the Agent CLI would start a blank chat that reuses the id.
+`--timeframe` excludes untimestamped deep-search messages; Cursor recovers missing message times from IDE data when possible.
+
+Human-readable results include an 8-char UUID prefix. Pass it to `find` for any row; `inspect`, `view`, and `export` require a transcript. `resume` works for Claude, Codex, and Cursor chats with a store under `~/.cursor/chats`; other Cursor rows print the chat's **title** and `DIR:` so you can open it in the sidebar.
 
 Example (index search, not `--json`):
 
@@ -128,8 +130,9 @@ Example (index search, not `--json`):
 
 ### Interpreting output
 
-- Display tags: `claude` = Claude Code, `cursor-ide` = Cursor IDE sidebar, `cursor-agent` = Agent CLI / jsonl-only, `codex` = Codex
+- Display tags: `claude` = Claude Code, `codex` = Codex, `cursor-agent` = Agent transcripts / CLI chats, `cursor-ide` = Cursor IDE sidebar
 - Cursor IDE **Agent mode** writes SQLite **and** a jsonl with the same composer id. Search lists that pair **once** as `cursor-ide`. `--source cursor` / `cursor-agent` includes transcripts and CLI chat metadata; `--source cursor-ide` is SQLite.
+- Cursor rows marked `[metadata only]` support `find`, `resume`, and title search, but not `inspect`, `view`, `export`, or message search.
 - Header line: source, date, short id, score, `DIR:` spawn directory (`$HOME` shown as `~`), and (index search) `INDEX_FIELD:`
 - Title / match text is on the following indented line
 - `★ N.N` = relevance (higher is better)
@@ -144,37 +147,23 @@ Example (index search, not `--json`):
 | Source | Path |
 |---|---|
 | Claude Code | `~/.claude/projects/*/*.jsonl` (+ optional legacy `sessions-index.json`) |
+| Codex | `$CODEX_HOME/sessions/YYYY/MM/DD/rollout-*.jsonl` (default `~/.codex`) |
 | Cursor Agent | `~/.cursor/projects/*/agent-transcripts/` (`--source cursor`, alias `cursor-agent`) |
 | Cursor CLI metadata | `~/.cursor/chats/*/*/{meta.json,store.db}` (same source; discovers CLI-only sessions) |
-| Cursor IDE | `.../Cursor/User/globalStorage/state.vscdb` (override with `CURSOR_USER_DIR`; `--source cursor-ide`). IDE Agent chats also get a jsonl in the Agent path above; they still list as `cursor-ide`. |
+| Cursor IDE | `.../Cursor/User/globalStorage/state.vscdb` (`CURSOR_USER_DIR`; `--source cursor-ide`) |
 | Cursor subagents | `.../agent-transcripts/*/subagents/*.jsonl` |
-| Codex | `$CODEX_HOME/sessions/YYYY/MM/DD/rollout-*.jsonl` (default `~/.codex`) |
 
-Noise filtered automatically: warmups, handshake fluff, clear-only sessions, structural config dumps. Transcripts capped at 4MB each.
+Cursor Agent chats found in both transcript and IDE data are shown once as `cursor-ide`. Noise is filtered automatically, and transcripts are capped at 4MB each.
 
 ### Metadata cache
 
-Session discovery automatically caches extracted metadata in `~/.chat-history/cache/catalog-v1.db`. Repeated commands reuse titles, first-prompt previews, and other session metadata from unchanged inputs. Full transcript bodies and search results are not cached; deep search still reads transcripts directly. On one local profile this dropped a warm Claude extract from about 300ms to 10ms; a cold all-sources listing was about 1.3s, then about 400ms once the OS page cache was warm.
+Session discovery caches titles, first-prompt previews, and other extracted metadata from unchanged sources in `~/.chat-history/cache/catalog-v1.db`. Full transcripts and deep-search results are not cached. Discovery and workspace/store checks remain live, so added or deleted transcripts still appear immediately. On one local profile, a warm Claude extraction fell from about 300ms to 10ms.
 
-Directory discovery and workspace/store checks run on every invocation, so new or deleted transcripts, late hook transcripts, and missing workspaces remain visible immediately. File size and modification time invalidate cached metadata; Unix also checks target file identity and change time. Files modified within two seconds of the scan's start, or with future timestamps, bypass caching to avoid stale hits on coarse filesystem clocks. On platforms without Unix change times, a same-size edit that deliberately restores the previous modification time may remain cached. Listing dates reuse the metadata read during validation.
-
-Cursor IDE and hook-registry snapshots also track SQLite WAL and rollback-journal changes. A changed database refreshes that database's metadata snapshot; checkpoints can conservatively trigger a refresh too. SQLite's `data_version` is connection-local and cannot validate a snapshot across separate CLI processes.
-
-Skipped or failed scans preserve warm rows. An unvisited entry is evicted only when a complete, successful listing of its parent confirms the file is absent. Cache rows are never used to resurrect sessions missing from live discovery.
-
-The cache uses WAL so readers can reuse committed metadata while another process writes, with a one-second busy timeout for contention. Simultaneous cold misses can still extract independently. An unavailable, corrupt, or persistently locked cache falls back to reading the sources. Set `CHAT_HISTORY_NO_CACHE=1` to bypass it, or `CHAT_HISTORY_CACHE_DIR` to choose a different cache directory. Deleting the cache directory causes it to rebuild on the next command. New cache directories and databases are private to your user on Unix.
-
-### Cursor compatibility
-
-Cursor's on-disk SQLite and transcript schemas are internal and can change. The IDE reader supports `composerHeaders` plus `cursorDiskKV`; absent optional header columns are tolerated. An incompatible or unreadable IDE database produces a warning on stderr while other history sources remain available. Set `CURSOR_USER_DIR` to select a different Cursor profile.
-
-Native transcript timestamps are preserved when available. Missing message timestamps can be recovered from SQLite by a matching message ID or a unique matching role and text, without replacing or reordering transcript content. `inspect` and deep search recover them (so a hit scores the same with or without `--timeframe`); `view` and `export` do not need them and skip the IDE read. Ambiguous or missing times remain unknown and are excluded by `search --timeframe`; session/file dates are not substituted for message times. The search index's title entry carries the session's activity time for every source, so a title hit can satisfy `--timeframe` on its own. IDE creation and modification times are kept separately; date listing filters continue to use the activity date.
-
-CLI metadata discovery supports schema version 1 (verified against Cursor Agent 2026.08.25). Both `meta.json` and a nonempty `store.db` are required. CLI-only rows are labeled `[metadata only]` in the session list: `find` and `resume` work, title search works when Cursor recorded a title (print-mode chats usually have none), and `inspect`, `view`, and `export` report that a transcript is unavailable. A store whose workspace directory was deleted is explained by `resume` rather than reported as missing. A `meta.json` with a schema version other than 1 is used anyway with a one-line warning, since every field is read defensively. Under `--source cursor` / `cursor-agent` the IDE database is not used for listing (pairing, precedence, and tags apply to unfiltered listings and explicit-id commands); message-time recovery for deep search and `inspect` still reads it. An existing readable transcript takes precedence. If the same chat id exists under two workspace hashes, the copy `resume` would open is listed (an existing workspace first, then the newest). The CLI's `store.db` is a content-addressed blob store: message bodies are JSON, but ordering lives in protobuf frames, and it is not decoded yet, so CLI-only message search/export remains unsupported until a transcript is available. In practice the CLI writes an `agent-transcripts` jsonl for its own chats as well, so metadata-only rows appear only when that transcript is missing. Resume also requires the recorded workspace to exist. A store Cursor flagged as an empty conversation is hidden from the listing; resume still uses it when a transcript proves the chat happened.
+The cache tracks file metadata and SQLite WAL/journal changes. Unavailable, corrupt, or locked caches fall back to reading the sources. Set `CHAT_HISTORY_NO_CACHE=1` to bypass it or `CHAT_HISTORY_CACHE_DIR` to move it; deleting the cache rebuilds it on the next command. New cache directories and databases are user-private on Unix.
 
 ### Optional Cursor hook
 
-For new sessions, Cursor's documented [stop hook](https://cursor.com/docs/hooks) can register transcript locations outside the default directory layout and record the workspace and last observed model. After installing a version of `chat-history` with `cursor-hook`, add this entry to your existing `~/.cursor/hooks.json` (merge it with any existing hooks):
+To register new Cursor IDE transcripts outside the default directory layout, add this [stop hook](https://cursor.com/docs/hooks) to your existing `~/.cursor/hooks.json`:
 
 ```json
 {
@@ -185,9 +174,7 @@ For new sessions, Cursor's documented [stop hook](https://cursor.com/docs/hooks)
 }
 ```
 
-The command must be on Cursor's PATH; an absolute executable path also works. The IDE fires it (verified with Cursor 3.16.17); the Agent CLI's print mode does not (verified with Cursor Agent 2026.08.25), so CLI chats are discovered from `~/.cursor/chats` instead. No hook configuration is installed automatically. The command reads one JSON payload from stdin, returns `{}`, and warns on stderr without blocking Cursor if recording fails. It runs independently of normal history scans and skill installation.
-
-The local registry at `~/.chat-history/cursor-hooks.db` stores the conversation ID, transcript path, workspace roots, model identifiers, and Cursor version. It does not store prompts, tool output, or user email. A null transcript path is ignored; a path registered before Cursor flushes the transcript is discovered once the file exists. Existing history scanning remains enabled and duplicate records are merged. Hooks do not recover old missing transcripts or copy remote/cloud history onto this machine.
+The hook is opt-in and does not backfill old or cloud history. It records transcript paths, workspace roots, model identifiers, and Cursor version in `~/.chat-history/cursor-hooks.db`; it does not store prompts, tool output, or email. Cursor Agent CLI chats are discovered separately from `~/.cursor/chats`.
 
 ## Search scoring (summary)
 
