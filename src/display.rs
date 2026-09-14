@@ -340,19 +340,10 @@ pub fn print_search_results(results: &[SearchResult], query: &str) {
             .snippet
             .clone()
             .unwrap_or_else(|| snippet_around_match(&r.message.content, query, 200));
+        // Search previews stay on one logical line; inspect/view retain the
+        // original formatting, as does structured search output.
+        let snippet = snippet.split_whitespace().collect::<Vec<_>>().join(" ");
         println!("        {}: {}", role_str, snippet);
-        for other in &r.additional_matches {
-            let role = if other.message.role == "user" {
-                "You"
-            } else {
-                "Assistant"
-            };
-            let snippet = other
-                .snippet
-                .clone()
-                .unwrap_or_else(|| snippet_around_match(&other.message.content, query, 200));
-            println!("          also {role}: {snippet}");
-        }
         if !r.message.tool_uses.is_empty() {
             let tools: String = r
                 .message
@@ -374,6 +365,19 @@ pub fn print_search_results(results: &[SearchResult], query: &str) {
                 .collect::<Vec<_>>()
                 .join(", ");
             println!("       {}files: {}{}", c!("dim"), files, c!("reset"));
+        }
+        for other in &r.additional_matches {
+            let role = if other.message.role == "user" {
+                "You"
+            } else {
+                "Assistant"
+            };
+            let snippet = other
+                .snippet
+                .clone()
+                .unwrap_or_else(|| snippet_around_match(&other.message.content, query, 200));
+            let snippet = snippet.split_whitespace().collect::<Vec<_>>().join(" ");
+            println!("          also {role}: {snippet}");
         }
         println!();
     }
