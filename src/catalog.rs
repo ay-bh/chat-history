@@ -93,6 +93,11 @@ fn fingerprint_at(path: &Path, sqlite: bool, now: SystemTime) -> Option<String> 
     serde_json::to_string(&stamps).ok()
 }
 
+/// Shared freshness policy for the disposable transcript search index.
+pub(crate) fn fingerprint(path: &Path, sqlite: bool) -> Option<String> {
+    fingerprint_at(path, sqlite, SystemTime::now())
+}
+
 /// Listing dates reuse the metadata already read for cache validation.
 pub(crate) fn metadata(path: &Path) -> std::io::Result<fs::Metadata> {
     if let Some(meta) = ACTIVE.with(|slot| slot.borrow().as_ref()?.metadata.get(path).cloned()) {

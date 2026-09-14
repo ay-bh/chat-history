@@ -55,7 +55,7 @@ chat-history
 chat-history --from yesterday -s
 chat-history -L                         # current workspace only
 
-# Search — use --json; add --deep for full-transcript, all-scope search
+# Search — BM25 searches metadata and transcripts together; use --json for agents
 chat-history search "auth error" --deep --json
 chat-history search "timeout" --scope errors --json
 chat-history search "trade" --scope similar --json
@@ -105,19 +105,22 @@ Date formats: `YYYY-MM-DD`, `today`, `yesterday`, `"3 days ago"`, `"last week"`,
 
 | Flag | Why |
 |---|---|
-| `--deep` | Force full transcript search for the default `all` scope. Specialized scopes already scan transcript content. Snippets are match-centered, not message prefixes. |
+| `--engine bm25` | Default: rank metadata and transcript passages together, with an automatically refreshed local index. |
+| `--engine legacy` | Previous metadata-first search; add `--deep` to bypass its metadata shortcut. |
+| `--deep` | Accepted for compatibility; BM25 already searches full transcripts. Snippets are match-centered. |
 | `--json` | Machine-readable search output. This flag is available on `search`, not `inspect` or `view`. |
-| (default index) | Fast metadata-only search (title/summary, first prompt, branch, project). Weak results (★ < 5.0) fall through to deep search, except curated summary/title hits at ★ 4.5+. |
+| `--rebuild-index` | Reparse all sessions into the BM25 index. |
+| `--cache-dir PATH` / `--no-cache` | Store the BM25 index elsewhere, or build it in memory for this search. |
 
-All JSON output uses a `{ "query", "count", "results" }` envelope. Deep-search result items include `session_id`, `source`, `also_ide`, `date`, `summary`, `project`, `score`, `role`, `snippet`, `tools`, and `files`. Index result items include `matched_field` instead of `role`, `tools`, and `files`, and the envelope includes `"search_type": "index"`. Items also carry `metadata_only`, true for Cursor CLI sessions without a readable transcript.
+All JSON output uses a `{ "query", "count", "results" }` envelope. BM25 and legacy deep-search result items include `session_id`, `source`, `also_ide`, `date`, `summary`, `project`, `score`, `role`, `snippet`, `tools`, and `files`. Legacy metadata-index result items include `matched_field` instead of `role`, `tools`, and `files`, and the envelope includes `"search_type": "index"`. Items also carry `metadata_only`, true for Cursor CLI sessions without a readable transcript.
 
 Scopes: `all` (default), `errors`, `similar`, `tools`, `files`. Use `--timeframe today|week|month|Nd` and `--limit N` (default 15) to constrain results.
 
-`--timeframe` excludes untimestamped deep-search messages; Cursor recovers missing message times from IDE data when possible.
+`--timeframe` excludes untimestamped messages and first-prompt previews; Cursor recovers missing message times from IDE data when possible. Titles use session activity timestamps. BM25 honors this filter without `--deep`; the legacy metadata shortcut retains its historical behavior.
 
 Human-readable results include an 8-char UUID prefix. Pass it to `find` for any row; `inspect`, `view`, and `export` require a transcript. `resume` works for Claude, Codex, and Cursor chats with a store under `~/.cursor/chats`; other Cursor rows print the chat's **title** and `DIR:` so you can open it in the sidebar.
 
-Example (index search, not `--json`):
+Example (`--engine legacy` metadata search, not `--json`):
 
 ```
   1.  cursor-ide    2026-07-30 3f9c1a2e ★ 7.5 DIR: ~/proj INDEX_FIELD: summary
@@ -157,7 +160,7 @@ Cursor Agent chats found in both transcript and IDE data are shown once as `curs
 
 ### Metadata cache
 
-Session discovery caches titles, first-prompt previews, and other extracted metadata from unchanged sources in `~/.chat-history/cache/catalog-v1.db`. Full transcripts and deep-search results are not cached. Discovery and workspace/store checks remain live, so added or deleted transcripts still appear immediately. On one local profile, a warm Claude extraction fell from about 300ms to 10ms.
+Session discovery caches titles, first-prompt previews, and other extracted metadata from unchanged sources in `~/.chat-history/cache/catalog-v1.db`. This metadata cache does not store transcripts. BM25 uses a separate, disposable `search-v1.db` containing message text and full-text postings; it refreshes only changed sessions. Search results themselves are not cached. Discovery and workspace/store checks remain live, so added or deleted transcripts still appear immediately. On one local profile, a warm Claude extraction fell from about 300ms to 10ms.
 
 The cache tracks file metadata and SQLite WAL/journal changes. Unavailable, corrupt, or locked caches fall back to reading the sources. Set `CHAT_HISTORY_NO_CACHE=1` to bypass it or `CHAT_HISTORY_CACHE_DIR` to move it; deleting the cache rebuilds it on the next command. New cache directories and databases are user-private on Unix.
 
@@ -176,11 +179,19 @@ To register new Cursor IDE transcripts outside the default directory layout, add
 
 The hook is opt-in and does not backfill old or cloud history. It records transcript paths, workspace roots, model identifiers, and Cursor version in `~/.chat-history/cursor-hooks.db`; it does not store prompts, tool output, or email. Cursor Agent CLI chats are discovered separately from `~/.cursor/chats`.
 
-## Search scoring (summary)
+## Search scoring
 
-**Index (default):** field-weighted — summary 3×, first prompt 2×, branch/project 1× — with recency multipliers (3× today / 2× week / 1.5× month). AND across query words.
+**BM25 (default):** Unicode token and prefix matching over overlapping transcript passages, titles, first prompts, project paths, and branches. Rare terms contribute more; repeated mentions saturate. Each result is an original message, with duplicates removed and at most three hits per session. Recency breaks score ties. JSON retains small positive scores at full precision; scores are not confidence values and cannot be compared across engines or queries.
 
-**Deep (`--deep`):** parallel transcript parse with tech-term boosts, word/prefix/phrase scoring, separator normalization (`_`/`-`/`/` → spaces), importance/semantic boosts, dedup, and a per-session cap of 3 matches.
+The first search indexes discovered history; later searches validate source fingerprints. Filters do not change the indexed collection statistics. `--scope similar` keeps the previous user-message similarity implementation. Queries are plain text; filename and identifier components stay adjacent and share the index’s Unicode analyzer; this is prefix search, not arbitrary infix or typo matching.
+
+Select the previous ranking with `--engine legacy` or `CHAT_HISTORY_SEARCH_ENGINE=legacy`. Explicit flags override environment values. `CHAT_HISTORY_CACHE_DIR` selects the cache location, `CHAT_HISTORY_NO_CACHE=1` bypasses both disk caches, and `CHAT_HISTORY_REBUILD_INDEX=true` forces a search-index refresh. A search-local `--cache-dir` overrides the BM25 directory only; `--no-cache` builds BM25 in memory. Unavailable, corrupt, or write-locked search caches fall back to in-memory BM25 with a stderr warning.
+
+[Architecture, research sources, and validation](docs/search-architecture.md). [Implementation review and fixes](docs/search-review.md).
+
+**Legacy metadata:** field-weighted — summary 3×, first prompt 2×, branch/project 1× — with recency multipliers (3× today / 2× week / 1.5× month). AND across query words.
+
+**Legacy deep (`--engine legacy --deep`):** parallel transcript parse with tech-term boosts, word/prefix/phrase scoring, separator normalization (`_`/`-`/`/` → spaces), importance/semantic boosts, dedup, and a per-session cap of 3 matches.
 
 ## Credits
 

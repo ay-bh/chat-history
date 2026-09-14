@@ -632,7 +632,7 @@ fn search_index_finds_session() {
     setup_fixture(&tmp);
     Command::cargo_bin("chat-history")
         .unwrap()
-        .args(["search", "docker"])
+        .args(["search", "docker", "--engine", "legacy"])
         .env("CLAUDE_CONFIG_DIR", tmp.path())
         .env("HOME", tmp.path())
         .assert()
@@ -648,7 +648,7 @@ fn search_json_format() {
     setup_fixture(&tmp);
     let output = Command::cargo_bin("chat-history")
         .unwrap()
-        .args(["search", "docker", "--json"])
+        .args(["search", "docker", "--json", "--engine", "legacy"])
         .env("CLAUDE_CONFIG_DIR", tmp.path())
         .env("HOME", tmp.path())
         .output()

@@ -307,9 +307,13 @@ pub fn print_search_results(results: &[SearchResult], query: &str) {
     for (i, r) in results.iter().enumerate() {
         let tag = src_tag(&r.session.source, r.session.also_ide);
         let score = format!(
-            "{}★ {:.1}{}",
+            "{}★ {}{}",
             c!("yellow"),
-            r.message.final_score,
+            if r.message.final_score.abs() < 0.05 {
+                format!("{:.2e}", r.message.final_score)
+            } else {
+                format!("{:.2}", r.message.final_score)
+            },
             c!("reset")
         );
         let role_str = if r.message.role == "user" {
@@ -372,7 +376,7 @@ pub fn print_search_results_json(results: &[SearchResult], query: &str) {
                 "date": r.session.date,
                 "summary": r.session.summary,
                 "project": r.session.project,
-                "score": (r.message.final_score * 10.0).round() / 10.0,
+                "score": r.message.final_score,
                 "role": r.message.role,
                 "snippet": snippet_around_match(&r.message.content, query, 300),
                 "tools": r.message.tool_uses,

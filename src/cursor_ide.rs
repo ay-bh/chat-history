@@ -30,7 +30,7 @@ pub fn cursor_user_dir() -> PathBuf {
     }
 }
 
-fn global_vscdb() -> PathBuf {
+pub(crate) fn global_vscdb() -> PathBuf {
     cursor_user_dir().join("globalStorage/state.vscdb")
 }
 

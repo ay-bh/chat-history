@@ -44,7 +44,7 @@ impl Session {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Message {
     #[allow(dead_code)]
     pub uuid: String,
@@ -1788,6 +1788,7 @@ pub fn filter_sessions(
             }
             if let Some(src) = normalize_source_filter(source).as_deref()
                 && s.source != src
+                && !(src == "cursor-ide" && s.also_ide)
             {
                 return false;
             }

@@ -130,7 +130,7 @@ pub fn index_quality_ok(results: &[IndexResult]) -> bool {
     }
 }
 
-fn parse_timeframe_duration(tf: &str) -> chrono::Duration {
+pub(crate) fn parse_timeframe_duration(tf: &str) -> chrono::Duration {
     let lower = tf.to_lowercase();
     match lower.as_str() {
         "today" | "1d" => chrono::Duration::days(1),
@@ -151,18 +151,12 @@ fn parse_timestamp(ts: &str) -> Option<DateTime<FixedOffset>> {
     crate::session::parse_any_timestamp(ts)
 }
 
-pub fn scored_search(
+/// Resolve exact session identities before either lexical engine runs.
+pub(crate) fn direct_session_search(
     sessions: &[Session],
     query: &str,
-    scope: &str,
-    limit: usize,
     timeframe: Option<&str>,
-) -> Vec<SearchResult> {
-    // On a UUID-shaped query try a direct session-id lookup first; on miss,
-    // fall through to content search so a UUID that was discussed inside a
-    // conversation is still findable.
-    // With --timeframe the stub has no message time to filter on, so the
-    // query goes through content search like everything else.
+) -> Option<Vec<SearchResult>> {
     let tf_cutoff: Option<DateTime<FixedOffset>> = timeframe.map(|tf| {
         let dur = parse_timeframe_duration(tf);
         (Utc::now() - dur).fixed_offset()
@@ -181,10 +175,10 @@ pub fn scored_search(
         };
         if let Some(mut msg) = messages.into_iter().find(|m| in_window(&m.timestamp)) {
             msg.final_score = 100.0;
-            return vec![SearchResult {
+            return Some(vec![SearchResult {
                 session: s.clone(),
                 message: msg,
-            }];
+            }]);
         }
         let activity = if s.modified.is_empty() {
             &s.created
@@ -209,14 +203,32 @@ pub fn scored_search(
                 relevance_score: 0.0,
                 final_score: 100.0,
             };
-            return vec![SearchResult {
+            return Some(vec![SearchResult {
                 session: s.clone(),
                 message: stub,
-            }];
+            }]);
         }
         // Outside the window, content search may still find the id quoted in
         // another, recent conversation.
     }
+
+    None
+}
+
+pub fn scored_search(
+    sessions: &[Session],
+    query: &str,
+    scope: &str,
+    limit: usize,
+    timeframe: Option<&str>,
+) -> Vec<SearchResult> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    if let Some(results) = direct_session_search(sessions, query, timeframe) {
+        return results;
+    }
+    let tf_cutoff = timeframe.map(|tf| (Utc::now() - parse_timeframe_duration(tf)).fixed_offset());
 
     let boosts = semantic_boosts(query);
     let raw_words: Vec<String> = {
