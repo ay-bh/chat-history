@@ -33,6 +33,7 @@ Search, inspect, and export Claude Code, Cursor, and Codex conversation history.
 ## Choosing the best hit
 
 - Scores rank lexical relevance (BM25 by default), not intent. They are not confidence values or comparable across queries or engines. Use scores only to shortlist; decide from snippets and `inspect`.
+- BM25 groups matches by conversation: `--limit` counts conversations, `snippet` follows the strongest matching passage, and `additional_matches` contains up to two more excerpts. Read these before inspecting the session. Use `--group-by message` if individual matching messages are needed; legacy and `--scope similar` retain their previous message-row default.
 - The conversation you are currently in can match its own query and score highest. Ignore hits whose session is the current one.
 - When candidates are close, `inspect` each before picking — don't answer from the top score alone.
 

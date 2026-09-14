@@ -100,6 +100,9 @@ enum Commands {
         /// Ranking engine; legacy retains the previous metadata/deep search behavior
         #[arg(long, env = "CHAT_HISTORY_SEARCH_ENGINE", default_value = "bm25", value_parser = ["bm25", "legacy"])]
         engine: String,
+        /// Group hits by session or message (BM25 defaults to session; legacy/similar to message)
+        #[arg(long, env = "CHAT_HISTORY_SEARCH_GROUP_BY", value_parser = ["session", "message"])]
+        group_by: Option<String>,
         /// Reparse all sessions and replace the BM25 index contents
         #[arg(long, env = "CHAT_HISTORY_REBUILD_INDEX")]
         rebuild_index: bool,
@@ -109,7 +112,7 @@ enum Commands {
         /// Build BM25 in memory; also enabled by CHAT_HISTORY_NO_CACHE
         #[arg(long)]
         no_cache: bool,
-        /// Maximum number of results
+        /// Maximum results (sessions when grouped, otherwise messages)
         #[arg(long, default_value_t = 15)]
         limit: usize,
         /// Only messages newer than today, week, month, or Nd (e.g. 7d)
@@ -419,6 +422,7 @@ fn main() {
             scope,
             deep,
             engine,
+            group_by,
             rebuild_index,
             cache_dir,
             no_cache,
@@ -462,6 +466,11 @@ fn main() {
                 scope: &scope,
                 limit,
                 timeframe: timeframe.as_deref(),
+                group_by_session: group_by
+                    .as_deref()
+                    .map_or(engine == "bm25" && scope != "similar", |value| {
+                        value == "session"
+                    }),
             };
             let result = if engine == "legacy" || scope == "similar" {
                 LegacyBackend.search(&request)

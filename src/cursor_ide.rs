@@ -42,6 +42,76 @@ pub(crate) fn open_ro(path: &Path) -> Option<Connection> {
     Some(conn)
 }
 
+fn sqlite_identity(path: &Path) -> Option<String> {
+    let meta = std::fs::metadata(path).ok()?;
+    #[cfg(unix)]
+    let identity = {
+        use std::os::unix::fs::MetadataExt;
+        format!("{}:{}", meta.dev(), meta.ino())
+    };
+    #[cfg(not(unix))]
+    let identity = format!("{}:{:?}", meta.len(), meta.modified().ok());
+    Some(identity)
+}
+
+/// Hash only this conversation's rows in one read snapshot. Stream raw bytes
+/// through the key index; do not sort or deserialize large bubble payloads.
+pub(crate) fn conversation_fingerprint(path: &Path, id: &str) -> Option<String> {
+    let identity = sqlite_identity(path)?;
+    thread_local! {
+        static SOURCE: RefCell<Option<(PathBuf, String, Connection)>> = const { RefCell::new(None) };
+    }
+    SOURCE.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        if slot
+            .as_ref()
+            .is_none_or(|(old_path, old_identity, _)| old_path != path || *old_identity != identity)
+        {
+            *slot = open_ro(path).map(|conn| (path.to_path_buf(), identity, conn));
+        }
+        let (_, _, conn) = slot.as_ref()?;
+        let tx = conn.unchecked_transaction().ok()?;
+        let mut hash = blake3::Hasher::new();
+        let (lower, upper) = bubble_key_bounds(id);
+        for (sql, values) in [
+            (
+                "SELECT key, value FROM cursorDiskKV WHERE key >= ?1 AND key < ?2 ORDER BY key",
+                vec![lower, upper],
+            ),
+            (
+                "SELECT key, value FROM cursorDiskKV WHERE key = ?1",
+                vec![format!("composerData:{id}")],
+            ),
+            (
+                "SELECT composerId, value FROM composerHeaders WHERE composerId = ?1",
+                vec![id.to_owned()],
+            ),
+        ] {
+            hash.update(sql.as_bytes());
+            let mut stmt = tx.prepare_cached(sql).ok()?;
+            let mut rows = stmt.query(rusqlite::params_from_iter(values)).ok()?;
+            while let Some(row) = rows.next().ok()? {
+                for column in 0..2 {
+                    use rusqlite::types::ValueRef;
+                    let value = row.get_ref(column).ok()?;
+                    match value {
+                        ValueRef::Text(bytes) | ValueRef::Blob(bytes) => {
+                            hash.update(&(bytes.len() as u64).to_le_bytes());
+                            hash.update(bytes);
+                        }
+                        // The reader treats non-text/blob payloads as empty.
+                        _ => {
+                            hash.update(&0u64.to_le_bytes());
+                        }
+                    }
+                }
+            }
+        }
+        tx.commit().ok()?;
+        Some(hash.finalize().to_hex().to_string())
+    })
+}
+
 pub fn workspace_path(value: &Value) -> String {
     value
         .pointer("/workspaceIdentifier/uri/fsPath")
@@ -438,9 +508,9 @@ pub fn enrich_transcript_timestamps(session: &Session, messages: &mut [Message])
         return;
     }
     let db = global_vscdb();
-    if !db.is_file() {
+    let Some(identity) = sqlite_identity(&db) else {
         return;
-    }
+    };
     // Deep search enriches many sessions from a rayon pool: keep one
     // read-only connection per worker thread instead of reopening the
     // (multi-GB) database for every transcript. The bubbles come from the
@@ -449,17 +519,20 @@ pub fn enrich_transcript_timestamps(session: &Session, messages: &mut [Message])
     // conversation headers carry.
     ENRICH_SOURCE.with(|cell| {
         let mut slot = cell.borrow_mut();
-        if slot.as_ref().is_none_or(|(path, _)| *path != db) {
-            *slot = open_ro(&db).map(|conn| (db.clone(), conn));
+        if slot
+            .as_ref()
+            .is_none_or(|(path, old_identity, _)| *path != db || *old_identity != identity)
+        {
+            *slot = open_ro(&db).map(|conn| (db.clone(), identity, conn));
         }
-        if let Some((_, conn)) = slot.as_ref() {
+        if let Some((_, _, conn)) = slot.as_ref() {
             merge_message_timestamps(messages, &load_bubbles_as_messages(conn, session));
         }
     });
 }
 
 thread_local! {
-    static ENRICH_SOURCE: RefCell<Option<(PathBuf, Connection)>> = const { RefCell::new(None) };
+    static ENRICH_SOURCE: RefCell<Option<(PathBuf, String, Connection)>> = const { RefCell::new(None) };
 }
 
 fn merge_message_timestamps(messages: &mut [Message], bubbles: &[Message]) {

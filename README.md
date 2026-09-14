@@ -107,6 +107,7 @@ Date formats: `YYYY-MM-DD`, `today`, `yesterday`, `"3 days ago"`, `"last week"`,
 |---|---|
 | `--engine bm25` | Default: rank metadata and transcript passages together, with an automatically refreshed local index. |
 | `--engine legacy` | Previous metadata-first search; add `--deep` to bypass its metadata shortcut. |
+| `--group-by session\|message` | BM25 defaults to conversations with additional matches; choose message rows explicitly. |
 | `--deep` | Accepted for compatibility; BM25 already searches full transcripts. Snippets are match-centered. |
 | `--json` | Machine-readable search output. This flag is available on `search`, not `inspect` or `view`. |
 | `--rebuild-index` | Reparse all sessions into the BM25 index. |
@@ -181,13 +182,15 @@ The hook is opt-in and does not backfill old or cloud history. It records transc
 
 ## Search scoring
 
-**BM25 (default):** Unicode token and prefix matching over overlapping transcript passages, titles, first prompts, project paths, and branches. Rare terms contribute more; repeated mentions saturate, and exact terms receive additional weight over prefix-only matches. Each result is an original message, with duplicates removed and at most three hits per session. Recency breaks score ties. JSON retains small positive scores at full precision; scores are not confidence values and cannot be compared across engines or queries.
+**BM25 (default):** Unicode token and prefix matching over overlapping transcript passages, titles, first prompts, project paths, and branches. Rare terms contribute more; repeated mentions saturate, and exact terms receive additional weight over prefix-only matches. Matching all query chunks and matching their ordered phrase add small ranking bonuses while partial matches remain eligible. Recency breaks score ties. JSON retains small positive scores at full precision; scores are not confidence values and cannot be compared across engines or queries.
 
-The first search indexes discovered history; later searches validate source fingerprints. Filters do not change the indexed collection statistics. `--scope similar` keeps the previous user-message similarity implementation. Queries are plain text; filename and identifier components stay adjacent and share the index’s Unicode analyzer; this is prefix search, not arbitrary infix or typo matching.
+BM25 returns one row per conversation, with a match-aware excerpt from its strongest passage and up to two additional matching messages. `--limit` counts conversations. JSON preserves the primary result fields and adds `additional_matches` with each extra match's score, role, snippet, tools and files. Use `--group-by message` for individual message rows (at most three per conversation). `CHAT_HISTORY_SEARCH_GROUP_BY=session|message` sets this preference; explicit flags override it. Legacy and `--scope similar` keep their previous message-row default.
+
+The first search indexes discovered history; later searches validate source fingerprints. When Cursor's shared database changes, search hashes the rows for each conversation and reparses only conversations whose dependencies changed. Reading these rows still has a cost; unchanged database observations reuse their hashes. Filters do not change the indexed collection statistics. `--scope similar` keeps the previous user-message similarity implementation. Queries are plain text; filename and identifier components stay adjacent and share the index’s Unicode analyzer; this is prefix search, not arbitrary infix or typo matching.
 
 Select the previous ranking with `--engine legacy` or `CHAT_HISTORY_SEARCH_ENGINE=legacy`. Explicit flags override environment values. `CHAT_HISTORY_CACHE_DIR` selects the cache location, `CHAT_HISTORY_NO_CACHE=1` bypasses both disk caches, and `CHAT_HISTORY_REBUILD_INDEX=true` forces a search-index refresh. A search-local `--cache-dir` overrides the BM25 directory only; `--no-cache` builds BM25 in memory. Unavailable, corrupt, or write-locked search caches fall back to in-memory BM25 with a stderr warning.
 
-See the [real-history binary comparison](docs/search-evaluation.md) for measured relevance and latency, including the remaining cost of large Cursor refreshes.
+See the [real-history binary comparison](docs/search-evaluation.md) and [follow-up improvements and semantic experiment](docs/search-improvements.md) for measured relevance, latency and remaining limitations.
 
 [Architecture, research sources, and validation](docs/search-architecture.md). [Implementation review and fixes](docs/search-review.md).
 

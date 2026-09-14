@@ -48,7 +48,7 @@ def main():
             for name in names:
                 binary, flags = engines[name]
                 env = dict(os.environ)
-                for key in ("CHAT_HISTORY_SEARCH_ENGINE", "CHAT_HISTORY_REBUILD_INDEX", "CHAT_HISTORY_NO_CACHE"):
+                for key in ("CHAT_HISTORY_SEARCH_ENGINE", "CHAT_HISTORY_SEARCH_GROUP_BY", "CHAT_HISTORY_REBUILD_INDEX", "CHAT_HISTORY_NO_CACHE"):
                     env.pop(key, None)
                 env["CHAT_HISTORY_CACHE_DIR"] = str(args.cache_root.resolve() / name)
                 command = [str(binary), "search", case["query"], "--json", "--limit", str(args.limit),
@@ -63,9 +63,14 @@ def main():
                     record = dict(error=str(error), ms=(time.perf_counter() - start) * 1000)
                 targets = case.get("targets", [case["target"]] if case.get("target") else [])
                 results = record.get("data", {}).get("results", [])
+                # Keep row rank for UI comparisons and collapsed rank for fair
+                # conversation retrieval comparisons across grouping policies.
+                session_ids = list(dict.fromkeys(hit["session_id"] for hit in results))
                 record.update(engine=name, round=round_index, case=case, command=command,
                               target_rank=next((i + 1 for i, hit in enumerate(results)
-                                                if hit["session_id"] in targets), None))
+                                                if hit["session_id"] in targets), None),
+                              target_session_rank=next((i + 1 for i, sid in enumerate(session_ids)
+                                                        if sid in targets), None))
                 records.append(record)
                 # Save each result so interrupted or timed-out runs remain inspectable.
                 args.output.write_text(json.dumps(records, indent=2) + "\n")

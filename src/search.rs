@@ -19,6 +19,36 @@ pub struct IndexResult {
 pub struct SearchResult {
     pub session: Session,
     pub message: Message,
+    /// Match-aware excerpt from the ranked passage, when the backend provides it.
+    pub snippet: Option<String>,
+    /// Up to two further matches when the request groups by conversation.
+    pub additional_matches: Vec<SearchMatch>,
+}
+
+pub struct SearchMatch {
+    pub message: Message,
+    pub snippet: Option<String>,
+}
+
+/// Preserve first-hit order while collapsing message results into conversations.
+pub fn group_results(results: Vec<SearchResult>, limit: usize) -> Vec<SearchResult> {
+    let mut groups: HashMap<(String, String), usize> = HashMap::new();
+    let mut grouped: Vec<SearchResult> = Vec::new();
+    for hit in results {
+        let key = (hit.session.source.clone(), hit.session.id.to_lowercase());
+        if let Some(&index) = groups.get(&key) {
+            if grouped[index].additional_matches.len() < 2 {
+                grouped[index].additional_matches.push(SearchMatch {
+                    message: hit.message,
+                    snippet: hit.snippet,
+                });
+            }
+        } else if grouped.len() < limit {
+            groups.insert(key, grouped.len());
+            grouped.push(hit);
+        }
+    }
+    grouped
 }
 
 pub fn index_search(sessions: &[Session], query: &str, limit: usize) -> Vec<IndexResult> {
@@ -178,6 +208,8 @@ pub(crate) fn direct_session_search(
             return Some(vec![SearchResult {
                 session: s.clone(),
                 message: msg,
+                snippet: None,
+                additional_matches: Vec::new(),
             }]);
         }
         let activity = if s.modified.is_empty() {
@@ -206,6 +238,8 @@ pub(crate) fn direct_session_search(
             return Some(vec![SearchResult {
                 session: s.clone(),
                 message: stub,
+                snippet: None,
+                additional_matches: Vec::new(),
             }]);
         }
         // Outside the window, content search may still find the id quoted in
@@ -484,7 +518,12 @@ pub fn scored_search(
     final_results.truncate(limit);
     final_results
         .into_iter()
-        .map(|(session, message)| SearchResult { session, message })
+        .map(|(session, message)| SearchResult {
+            session,
+            message,
+            snippet: None,
+            additional_matches: Vec::new(),
+        })
         .collect()
 }
 

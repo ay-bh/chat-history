@@ -47,8 +47,127 @@ fn search(
             scope: "all",
             limit,
             timeframe: None,
+            group_by_session: false,
         })
         .unwrap()
+}
+
+#[test]
+fn grouping_fills_distinct_sessions_and_keeps_additional_matches() {
+    let tmp = TempDir::new().unwrap();
+    let corpus = vec![
+        transcript(
+            &tmp,
+            "busy",
+            &["groupneedle one", "groupneedle two", "groupneedle three"],
+        ),
+        transcript(
+            &tmp,
+            "other",
+            &["Another longer groupneedle discussion with additional context"],
+        ),
+    ];
+    let mut index = Bm25Backend::open(None).unwrap();
+    index.sync(&corpus, false).unwrap();
+    let request = SearchRequest {
+        sessions: &corpus,
+        query: "groupneedle",
+        scope: "all",
+        limit: 2,
+        timeframe: None,
+        group_by_session: true,
+    };
+    let hits = index.search(&request).unwrap();
+    assert_eq!(hits.len(), 2);
+    assert_ne!(hits[0].session.id, hits[1].session.id);
+    let busy = hits.iter().find(|hit| hit.session.id == "busy").unwrap();
+    assert_eq!(busy.additional_matches.len(), 2);
+    let hits = index
+        .search(&SearchRequest {
+            limit: 1,
+            ..request
+        })
+        .unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].additional_matches.len(), 2);
+}
+
+#[test]
+fn complete_query_coverage_beats_a_short_partial_mention() {
+    let tmp = TempDir::new().unwrap();
+    let mut corpus = vec![
+        transcript(&tmp, "complete", &["quasar auth"]),
+        transcript(&tmp, "partial", &["quasar"]),
+    ];
+    for i in 0..12 {
+        corpus.push(transcript(
+            &tmp,
+            &format!("common-{i}"),
+            &["auth client implementation details"],
+        ));
+    }
+    let mut index = Bm25Backend::open(None).unwrap();
+    index.sync(&corpus, false).unwrap();
+    // Reversed word order deliberately avoids the phrase bonus.
+    let hits = search(&mut index, &corpus, "auth quasar", 10);
+    assert_eq!(hits[0].session.id, "complete");
+    assert!(hits.iter().any(|hit| hit.session.id == "partial"));
+}
+
+#[test]
+fn ordered_phrases_win_ties_without_removing_partial_matches() {
+    let tmp = TempDir::new().unwrap();
+    let corpus = vec![
+        transcript(
+            &tmp,
+            "a-reversed",
+            &["rotation credential implementation details"],
+        ),
+        transcript(
+            &tmp,
+            "z-phrase",
+            &["credential rotation implementation details"],
+        ),
+        transcript(
+            &tmp,
+            "partial",
+            &["credential inspection implementation details"],
+        ),
+    ];
+    let mut index = Bm25Backend::open(None).unwrap();
+    index.sync(&corpus, false).unwrap();
+    let hits = search(&mut index, &corpus, "credential rotation", 10);
+    assert_eq!(hits[0].session.id, "z-phrase");
+    assert!(hits.iter().any(|hit| hit.session.id == "partial"));
+    assert_eq!(
+        search(&mut index, &corpus, "rotation credential", 10)[0]
+            .session
+            .id,
+        "a-reversed"
+    );
+}
+
+#[test]
+fn snippets_follow_the_ranked_passage_and_index_analyzer() {
+    let tmp = TempDir::new().unwrap();
+    let text = format!(
+        "cache introduction {} The café decoder fixes needleprotocol failures.",
+        "ordinary background words ".repeat(250)
+    );
+    let corpus = vec![transcript(&tmp, "excerpt", &[&text])];
+    let mut index = Bm25Backend::open(None).unwrap();
+    index.sync(&corpus, false).unwrap();
+    for query in ["cache needleprotocol", "cafe"] {
+        let hits = search(&mut index, &corpus, query, 1);
+        assert_eq!(hits[0].message.content, text);
+        let excerpt = hits[0]
+            .snippet
+            .as_deref()
+            .expect("backend must retain a match-aware excerpt");
+        assert!(excerpt.contains("café"), "{excerpt}");
+        assert!(excerpt.contains("needleprotocol"), "{excerpt}");
+        assert!(excerpt.len() < text.len() / 2);
+    }
 }
 
 #[test]
@@ -303,7 +422,8 @@ fn unicode_identifiers_prefixes_short_queries_and_literal_syntax() {
                 query: &excessive,
                 scope: "all",
                 limit: 10,
-                timeframe: None
+                timeframe: None,
+                group_by_session: false,
             })
             .is_err()
     );
@@ -399,6 +519,7 @@ fn unknown_prompt_timestamps_are_not_replaced_by_session_activity() {
         scope: "all",
         limit: 10,
         timeframe: Some("today"),
+        group_by_session: false,
     };
     assert!(index.search(&request).unwrap().is_empty());
     request.query = "titlemarker";
@@ -425,6 +546,7 @@ fn scopes_keep_only_matching_message_kinds() {
                 scope,
                 limit: 10,
                 timeframe: None,
+                group_by_session: false,
             })
             .unwrap();
         assert!(!hits.is_empty(), "{scope}");
@@ -512,6 +634,7 @@ fn command(tmp: &TempDir) -> assert_cmd::Command {
         .env("CLAUDE_CONFIG_DIR", tmp.path())
         .env_remove("CODEX_HOME")
         .env_remove("CHAT_HISTORY_SEARCH_ENGINE")
+        .env_remove("CHAT_HISTORY_SEARCH_GROUP_BY")
         .env_remove("CHAT_HISTORY_NO_CACHE")
         .env_remove("CHAT_HISTORY_CACHE_DIR");
     cmd
@@ -524,6 +647,67 @@ fn cli_fixture(tmp: &TempDir) {
         &dir.join("11111111-2222-3333-4444-555555555555.jsonl"),
         &["Investigate uniquecli authentication failures during login."],
     );
+}
+
+#[test]
+fn cli_grouping_preserves_json_contract_and_message_opt_out() {
+    let tmp = TempDir::new().unwrap();
+    cli_fixture(&tmp);
+    write_messages(
+        &tmp.path()
+            .join("projects/demo/11111111-2222-3333-4444-555555555555.jsonl"),
+        &[
+            "uniquecli authentication details",
+            "uniquecli transaction details",
+            "uniquecli recovery details",
+        ],
+    );
+    for args in [
+        vec![],
+        vec!["--engine", "legacy", "--deep", "--group-by", "session"],
+    ] {
+        let out = command(&tmp)
+            .args(["search", "uniquecli", "--json"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        let data: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(data["count"], 1);
+        assert_eq!(
+            data["results"][0]["additional_matches"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(
+            data["results"][0]["snippet"]
+                .as_str()
+                .unwrap()
+                .contains("uniquecli")
+        );
+    }
+    let out = command(&tmp)
+        .env("CHAT_HISTORY_SEARCH_GROUP_BY", "session")
+        .args(["search", "uniquecli", "--json", "--group-by", "message"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let data: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(data["count"], 3);
+    assert!(
+        data["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|hit| hit["additional_matches"].as_array().unwrap().is_empty())
+    );
+    command(&tmp)
+        .args(["search", "uniquecli"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("also You:"));
 }
 
 #[test]
@@ -589,6 +773,93 @@ fn corrupt_cache_falls_back_without_changing_search_results() {
     );
     assert_eq!(broken.stdout, memory.stdout);
     assert!(String::from_utf8_lossy(&broken.stderr).contains("in-memory BM25"));
+}
+
+#[test]
+#[cfg(unix)]
+fn cursor_fingerprints_follow_atomic_database_replacement() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("state.vscdb");
+    let replacement = tmp.path().join("replacement.vscdb");
+    for (file, text) in [
+        (&path, "old database marker"),
+        (&replacement, "new replacement marker"),
+    ] {
+        let db = rusqlite::Connection::open(file).unwrap();
+        db.execute_batch(
+            "CREATE TABLE composerHeaders(composerId TEXT PRIMARY KEY, value TEXT);
+            CREATE TABLE cursorDiskKV(key TEXT PRIMARY KEY, value TEXT);",
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO composerHeaders VALUES ('replacement', '{}')",
+            [],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO cursorDiskKV VALUES ('bubbleId:replacement:one', ?1)",
+            [json!({"type":1,"text":text,"createdAt":"2026-01-01T00:00:00Z"}).to_string()],
+        )
+        .unwrap();
+    }
+    let corpus = vec![Session {
+        source: "cursor-ide".into(),
+        id: "replacement".into(),
+        file: path.to_string_lossy().into(),
+        ..Session::default()
+    }];
+    let mut index = Bm25Backend::open(None).unwrap();
+    index.sync(&corpus, false).unwrap();
+    fs::rename(replacement, path).unwrap();
+    assert_eq!(index.sync(&corpus, false).unwrap().updated, 1);
+    assert!(search(&mut index, &corpus, "old", 10).is_empty());
+    assert_eq!(search(&mut index, &corpus, "new", 10).len(), 1);
+}
+
+#[test]
+fn cursor_refresh_ignores_unrelated_writes_but_detects_same_size_wal_edits() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("state.vscdb");
+    let db = rusqlite::Connection::open(&path).unwrap();
+    db.execute_batch(
+        "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;
+        CREATE TABLE composerHeaders(composerId TEXT PRIMARY KEY, value TEXT);
+        CREATE TABLE cursorDiskKV(key TEXT PRIMARY KEY, value TEXT);
+        CREATE TABLE unrelated(value TEXT);",
+    )
+    .unwrap();
+    let mut corpus = Vec::new();
+    for id in ["first", "second"] {
+        db.execute("INSERT INTO composerHeaders VALUES (?1, '{}')", [id])
+            .unwrap();
+        db.execute("INSERT INTO cursorDiskKV VALUES (?1, ?2)", rusqlite::params![format!("bubbleId:{id}:one"), json!({"type":1,"text":format!("{id} beforemarker"),"createdAt":"2026-01-01T00:00:00Z"}).to_string()]).unwrap();
+        corpus.push(Session {
+            source: "cursor-ide".into(),
+            id: id.into(),
+            file: path.to_string_lossy().into(),
+            ..Session::default()
+        });
+    }
+    let mut index = Bm25Backend::open(None).unwrap();
+    index.sync(&corpus, false).unwrap();
+    db.execute("INSERT INTO unrelated VALUES ('settings changed')", [])
+        .unwrap();
+    assert_eq!(index.sync(&corpus, false).unwrap().unchanged, 2);
+    db.execute("UPDATE cursorDiskKV SET value=replace(value, 'beforemarker', 'after_marker') WHERE key='bubbleId:first:one'", []).unwrap();
+    let stats = index.sync(&corpus, false).unwrap();
+    assert_eq!((stats.updated, stats.unchanged), (1, 1));
+    assert_eq!(
+        search(&mut index, &corpus, "after_marker", 10)[0]
+            .session
+            .id,
+        "first"
+    );
+    assert_eq!(
+        search(&mut index, &corpus, "beforemarker", 10)[0]
+            .session
+            .id,
+        "second"
+    );
 }
 
 #[test]
@@ -723,6 +994,7 @@ fn concurrent_profiles_search_their_own_consistent_snapshot() {
                             scope: "all",
                             limit: 10,
                             timeframe: None,
+                            group_by_session: false,
                         },
                         Some(directory),
                         false,
@@ -802,6 +1074,7 @@ fn prompt_preview_must_match_the_message_whose_timestamp_it_uses() {
             scope: "all",
             limit: 10,
             timeframe: Some("today"),
+            group_by_session: false,
         })
         .unwrap();
     assert!(hits.is_empty());

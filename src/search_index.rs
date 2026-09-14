@@ -1,11 +1,14 @@
 //! Replaceable lexical retrieval over a disposable, incrementally refreshed index.
 //! Source transcripts remain authoritative. See docs/search-architecture.md.
 use crate::parser::{clean_first_prompt, is_noise};
-use crate::search::{SearchResult, direct_session_search, parse_timeframe_duration, scored_search};
+use crate::search::{
+    SearchMatch, SearchResult, direct_session_search, parse_timeframe_duration, scored_search,
+};
 use crate::session::{Message, Session, parse_any_timestamp, parse_session_recovering_timestamps};
 use chrono::Utc;
 use rayon::prelude::*;
 use rusqlite::{Connection, params};
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -29,6 +32,7 @@ pub struct SearchRequest<'a> {
     pub scope: &'a str,
     pub limit: usize,
     pub timeframe: Option<&'a str>,
+    pub group_by_session: bool,
 }
 
 /// Engines return the same result contract; CLI rendering knows no index details.
@@ -40,13 +44,25 @@ pub struct LegacyBackend;
 
 impl SearchBackend for LegacyBackend {
     fn search(&mut self, request: &SearchRequest<'_>) -> Result<Vec<SearchResult>> {
-        Ok(scored_search(
+        if request.limit == 0 {
+            return Ok(Vec::new());
+        }
+        let results = scored_search(
             request.sessions,
             request.query,
             request.scope,
-            request.limit,
+            if request.group_by_session {
+                usize::MAX
+            } else {
+                request.limit
+            },
             request.timeframe,
-        ))
+        );
+        Ok(if request.group_by_session {
+            crate::search::group_results(results, request.limit)
+        } else {
+            results
+        })
     }
 }
 
@@ -141,23 +157,82 @@ pub fn search_corpus(
     Ok(results)
 }
 
-fn fingerprint(session: &Session) -> Option<String> {
+#[derive(Clone, Deserialize, Serialize)]
+struct CursorStamp {
+    path: PathBuf,
+    observed: Option<String>,
+    digest: String,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+struct Fingerprint {
+    version: u32,
+    signature: Option<String>,
+    cursor: Option<CursorStamp>,
+}
+
+impl Fingerprint {
+    fn matches(&self, other: &Self) -> bool {
+        self.version == other.version
+            && self.signature.is_some()
+            && self.signature == other.signature
+    }
+}
+
+fn fingerprint(session: &Session, previous: Option<&Fingerprint>) -> Option<Fingerprint> {
     let path = Path::new(&session.file);
     let sqlite = session.file.ends_with(".db") || session.file.ends_with(".vscdb");
-    let source = crate::catalog::fingerprint(path, sqlite)?;
-    let enrichment = if session.source == "cursor" {
-        let db = crate::cursor_ide::global_vscdb();
-        let stamp = match fs::metadata(&db) {
-            Ok(_) => Some(crate::catalog::fingerprint(&db, true)?),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+    let ide = session.source == "cursor-ide";
+    // SQLite conversation bytes, rather than the entire file's mtime, are the
+    // authoritative dependency for IDE rows. Files retain conservative stats.
+    let source = if ide {
+        None
+    } else {
+        Some(crate::catalog::fingerprint(path, sqlite)?)
+    };
+    let cursor = if ide || (session.source == "cursor" && !session.is_cursor_store_only()) {
+        let db = if ide {
+            path.to_path_buf()
+        } else {
+            crate::cursor_ide::global_vscdb()
+        };
+        let (observed, digest) = match fs::metadata(&db) {
+            Ok(_) => {
+                let observed = crate::catalog::fingerprint(&db, true);
+                let cached = previous
+                    .and_then(|p| p.cursor.as_ref())
+                    .filter(|p| p.path == db && observed.is_some() && p.observed == observed);
+                if let Some(cached) = cached {
+                    (observed, cached.digest.clone())
+                } else {
+                    let digest = crate::cursor_ide::conversation_fingerprint(&db, &session.id)?;
+                    let after = crate::catalog::fingerprint(&db, true);
+                    let observed = if observed == after { observed } else { None };
+                    (observed, digest)
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && !ide => (None, "missing".into()),
             Err(_) => return None,
         };
-        Some((db, stamp))
+        Some(CursorStamp {
+            path: db,
+            observed,
+            digest,
+        })
     } else {
         None
     };
-    // Metadata-only edits and changes of enrichment profile invalidate too.
-    serde_json::to_string(&(EXTRACTION_VERSION, session, source, enrichment)).ok()
+    let signature = serde_json::to_string(&(
+        session,
+        source,
+        cursor.as_ref().map(|c| (&c.path, &c.digest)),
+    ))
+    .ok()?;
+    Some(Fingerprint {
+        version: EXTRACTION_VERSION,
+        signature: Some(signature),
+        cursor,
+    })
 }
 
 impl Bm25Backend {
@@ -277,6 +352,14 @@ impl Bm25Backend {
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<rusqlite::Result<_>>()?;
         let live: HashSet<String> = corpus.iter().map(session_key).collect();
+        let fingerprints: HashMap<_, Fingerprint> = existing
+            .iter()
+            .filter_map(|(key, value)| {
+                serde_json::from_str(value)
+                    .ok()
+                    .map(|stamp| (key.clone(), stamp))
+            })
+            .collect();
         let mut stats = SyncStats::default();
         // Parse changed sessions in bounded batches; never hold the whole parsed
         // corpus in memory. Publish all changes in one transaction.
@@ -290,33 +373,53 @@ impl Bm25Backend {
                 .par_iter()
                 .map(|session| {
                     let key = session_key(session);
-                    let before = fingerprint(session);
-                    let parsed =
-                        if !rebuild && before.is_some() && existing.get(&key) == before.as_ref() {
-                            None
-                        } else {
-                            let (messages, _) = parse_session_recovering_timestamps(session, false);
-                            let after = fingerprint(session);
-                            Some((messages, before, after))
-                        };
-                    (session, key, parsed)
+                    let previous = fingerprints.get(&key);
+                    let before = fingerprint(session, previous);
+                    let parsed = if !rebuild
+                        && before
+                            .as_ref()
+                            .zip(previous)
+                            .is_some_and(|(a, b)| a.matches(b))
+                    {
+                        None
+                    } else {
+                        let (messages, _) = parse_session_recovering_timestamps(session, false);
+                        let after = fingerprint(session, before.as_ref());
+                        Some((messages, after))
+                    };
+                    (session, key, before, parsed)
                 })
                 .collect();
-            for (offset, (session, key, parsed)) in prepared.into_iter().enumerate() {
+            for (offset, (session, key, before, parsed)) in prepared.into_iter().enumerate() {
                 let i = batch_number * PARSE_BATCH_SIZE + offset;
-                let Some((messages, before, after)) = parsed else {
+                let Some((messages, after)) = parsed else {
+                    let observed = serde_json::to_string(before.as_ref().unwrap())?;
+                    if existing.get(&key) != Some(&observed) {
+                        tx.execute(
+                            "UPDATE sessions SET fingerprint = ?2 WHERE key = ?1",
+                            params![key, observed],
+                        )?;
+                    }
                     stats.unchanged += 1;
                     progress(i + 1, corpus.len());
                     continue;
                 };
                 // Racy or unsuccessful reads can serve this query but must be retried.
-                let stable = before.is_some() && before == after && !messages.is_empty();
+                let stable = before
+                    .as_ref()
+                    .zip(after.as_ref())
+                    .is_some_and(|(a, b)| a.matches(b))
+                    && (!messages.is_empty() || session.is_cursor_store_only());
                 // Keep the extraction version even when the source needs retrying.
-                let stamp = if stable {
-                    after.unwrap()
-                } else {
-                    serde_json::to_string(&(EXTRACTION_VERSION, Option::<()>::None))?
-                };
+                let mut stamp = after.unwrap_or(Fingerprint {
+                    version: EXTRACTION_VERSION,
+                    signature: None,
+                    cursor: None,
+                });
+                if !stable {
+                    stamp.signature = None;
+                }
+                let stamp = serde_json::to_string(&stamp)?;
                 let mut extracted = Vec::new();
                 let metadata = metadata_message(session);
                 if !metadata.content.is_empty() {
@@ -355,7 +458,13 @@ impl Bm25Backend {
                 let same_version = existing
                     .get(&key)
                     .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
-                    .is_some_and(|value| value[0].as_u64() == Some(u64::from(EXTRACTION_VERSION)));
+                    .is_some_and(|value| {
+                        value
+                            .get("version")
+                            .or_else(|| value.get(0))
+                            .and_then(|v| v.as_u64())
+                            == Some(u64::from(EXTRACTION_VERSION))
+                    });
                 let same_messages = if !rebuild && same_version {
                     let mut stmt = tx.prepare_cached(
                     "SELECT ordinal, payload FROM messages WHERE session_key = ?1 ORDER BY ordinal",
@@ -515,9 +624,19 @@ fn insert_message(
 /// Plain user text, never an executable FTS expression. Let the same Unicode61
 /// analyzer handle both sides. Quoted chunks preserve adjacent identifier/path
 /// components instead of broadening `src/foo.rs` into `src OR foo OR rs`.
-fn match_query(query: &str) -> Result<Option<String>> {
+struct LexicalQuery {
+    broad: String,
+    complete: Option<String>,
+    phrase: Option<String>,
+}
+
+fn match_query(query: &str) -> Result<Option<LexicalQuery>> {
     if crate::scoring::is_uuid(query) {
-        return Ok(Some(format!("\"{}\"", query.trim().to_lowercase())));
+        return Ok(Some(LexicalQuery {
+            broad: format!("\"{}\"", query.trim().to_lowercase()),
+            complete: None,
+            phrase: None,
+        }));
     }
     let terms: BTreeSet<String> = query
         .split_whitespace()
@@ -533,22 +652,24 @@ fn match_query(query: &str) -> Result<Option<String>> {
     if terms.is_empty() {
         return Ok(None);
     }
-    Ok(Some(
-        terms
-            .iter()
-            .map(|term| {
-                let literal = format!("\"{}\"", term.replace('"', "\"\""));
-                if term.chars().filter(|c| c.is_alphanumeric()).count() >= 2 {
-                    // Exact words contribute their own IDF in addition to the
-                    // broader prefix. Otherwise WAL can lose to wall/Waltham.
-                    format!("({literal} OR {literal}*)")
-                } else {
-                    literal
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(" OR "),
-    ))
+    let clauses = terms
+        .iter()
+        .map(|term| {
+            let literal = format!("\"{}\"", term.replace('"', "\"\""));
+            if term.chars().filter(|c| c.is_alphanumeric()).count() >= 2 {
+                // Exact words contribute their own IDF in addition to the
+                // broader prefix. Otherwise WAL can lose to wall/Waltham.
+                format!("({literal} OR {literal}*)")
+            } else {
+                literal
+            }
+        })
+        .collect::<Vec<_>>();
+    Ok(Some(LexicalQuery {
+        broad: clauses.join(" OR "),
+        complete: (clauses.len() > 1).then(|| clauses.join(" AND ")),
+        phrase: (clauses.len() > 1).then(|| format!("\"{}\"", query.replace('"', "\"\""))),
+    }))
 }
 
 impl SearchBackend for Bm25Backend {
@@ -587,27 +708,50 @@ impl SearchBackend for Bm25Backend {
         // Apply filters before consuming ranked candidates. No fixed oversampling
         // limit: duplicates or a busy session must not starve later sessions.
         let mut stmt = tx.prepare(
-            "SELECT m.id, m.session_key, -bm25(passages_fts, 1.0, 3.0, 2.0, 0.5, 0.5)
+            "WITH complete AS MATERIALIZED (
+                SELECT rowid FROM passages_fts WHERE ?4 IS NOT NULL AND passages_fts MATCH ?4
+             ), phrase AS MATERIALIZED (
+                SELECT rowid FROM passages_fts WHERE ?5 IS NOT NULL AND passages_fts MATCH ?5
+             )
+             SELECT m.id, m.session_key,
+                    -bm25(passages_fts, 1.0, 3.0, 2.0, 0.5, 0.5)
+                    * (1.0 + 0.25 * (complete.rowid IS NOT NULL)
+                           + 0.15 * (phrase.rowid IS NOT NULL)) AS score, p.id
              FROM passages_fts
              JOIN passages p ON p.id = passages_fts.rowid
              JOIN messages m ON m.id = p.message_id
              JOIN allowed_sessions a ON a.key = m.session_key
+             LEFT JOIN complete ON complete.rowid = p.id
+             LEFT JOIN phrase ON phrase.rowid = p.id
              WHERE passages_fts MATCH ?1
                AND (?2 IS NULL OR m.timestamp >= ?2)
                AND (?3 != 'errors' OR m.errors = 1)
                AND (?3 != 'tools' OR m.tools = 1)
                AND (?3 != 'files' OR m.files = 1)
-             ORDER BY bm25(passages_fts, 1.0, 3.0, 2.0, 0.5, 0.5),
+             ORDER BY score DESC,
                       m.timestamp DESC, m.session_key, m.ordinal, p.id",
         )?;
-        let mut rows = stmt.query(params![query, cutoff, request.scope])?;
+        let mut rows = stmt.query(params![
+            query.broad,
+            cutoff,
+            request.scope,
+            query.complete,
+            query.phrase
+        ])?;
         // Keep full message JSON out of SQLite's candidate sorter. A long
         // message can have thousands of matching passages but is hydrated once.
         let mut hydrate = tx.prepare_cached("SELECT payload FROM messages WHERE id = ?1")?;
+        // Compute excerpts only for accepted hits, keeping text out of the
+        // candidate sorter. FTS uses the same analyzer and winning passage.
+        let mut excerpt = tx.prepare_cached(
+            "SELECT snippet(passages_fts, -1, '', '', ' … ', 40)
+             FROM passages_fts WHERE rowid = ?1 AND passages_fts MATCH ?2",
+        )?;
         let mut seen_messages = HashSet::new();
         let mut seen_content = HashSet::new();
         let mut counts: HashMap<(String, String), usize> = HashMap::new();
-        let mut results = Vec::new();
+        let mut groups: HashMap<(String, String), usize> = HashMap::new();
+        let mut results: Vec<SearchResult> = Vec::new();
         while let Some(row) = rows.next()? {
             let id: i64 = row.get(0)?;
             if !seen_messages.insert(id) {
@@ -616,6 +760,12 @@ impl SearchBackend for Bm25Backend {
             let key: String = row.get(1)?;
             let session = selected[&key];
             let logical_session = (session.source.clone(), session.id.to_lowercase());
+            if request.group_by_session
+                && results.len() == request.limit
+                && !groups.contains_key(&logical_session)
+            {
+                continue;
+            }
             if counts.get(&logical_session).copied().unwrap_or(0) >= 3 {
                 continue;
             }
@@ -635,12 +785,28 @@ impl SearchBackend for Bm25Backend {
             let score: f64 = row.get(2)?;
             message.relevance_score = score;
             message.final_score = score;
-            *counts.entry(logical_session).or_default() += 1;
-            results.push(SearchResult {
-                session: session.clone(),
-                message,
-            });
-            if results.len() == request.limit {
+            let passage_id: i64 = row.get(3)?;
+            let snippet = excerpt.query_row(params![passage_id, query.broad], |r| r.get(0))?;
+            *counts.entry(logical_session.clone()).or_default() += 1;
+            if request.group_by_session
+                && let Some(&group) = groups.get(&logical_session)
+            {
+                results[group].additional_matches.push(SearchMatch {
+                    message,
+                    snippet: Some(snippet),
+                });
+            } else {
+                groups.insert(logical_session, results.len());
+                results.push(SearchResult {
+                    session: session.clone(),
+                    message,
+                    snippet: Some(snippet),
+                    additional_matches: Vec::new(),
+                });
+            }
+            if results.len() == request.limit
+                && (!request.group_by_session || counts.values().all(|count| *count >= 3))
+            {
                 break;
             }
         }

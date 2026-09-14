@@ -3,6 +3,10 @@
 Evaluated on 2026-09-14, macOS arm64. This is a local engineering evaluation,
 not an independent relevance benchmark or a claim about every user's history.
 
+This report describes the first BM25 comparison through `b0ce038`. See the
+[follow-up evaluation](search-improvements.md) for conversation grouping,
+match-aware excerpts, selective Cursor refresh and the neural retrieval trial.
+
 ## Binaries and method
 
 - Baseline: release binary built from `ce77c67`, before the BM25 upgrade.

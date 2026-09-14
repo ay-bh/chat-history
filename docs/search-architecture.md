@@ -62,8 +62,8 @@ flowchart TD
     E --> H[BM25 backend]
     G --> H
     G --> L[Legacy backend]
-    H --> I[Deduplicate messages and cap each session]
-    I --> J[Existing SearchResult and renderers]
+    H --> I[Deduplicate and group ranked messages]
+    I --> J[Match-aware excerpts and shared renderers]
     L --> J
 ```
 
@@ -96,6 +96,11 @@ overlap, aligned to whitespace boundaries. A single longer span stays intact so
 chunking never invents a word prefix. Ranking sorts message IDs and scores; it
 loads original payloads only for selected candidate messages. Hydration returns
 the original message once, using its strongest matching passage.
+The backend obtains an FTS5 `snippet()` from that passage using the same query
+analyzer. Excerpts are calculated only after accepting a message; neither full
+payloads nor snippet text enter the candidate sorter. The original message stays
+intact for API consumers. `SearchResult` carries an optional excerpt and up to
+two `SearchMatch` children; renderers retain a fallback for the legacy engine.
 Titles/project/branch and first-prompt previews have separate metadata records.
 First prompts use the timestamp of a matching source user message (including
 truncated previews), never an unrelated first message or session modification time. Title metadata uses session activity time.
@@ -115,10 +120,23 @@ are treated as an unavailable cache, not an empty corpus.
   two-second racy-file policy. SQLite WAL/journal files are included. Non-Unix
   filesystems lack the additional ctime/inode checks; same-size edits with restored
   mtimes can require `--rebuild-index` there.
-- Cursor transcript fingerprints also include the IDE database used to recover
-  missing timestamps. Session metadata and enrichment profile are fingerprinted.
+- Cursor dependencies use a per-conversation BLAKE3 digest of raw bubble,
+  composer-data and composer-header rows, read in one SQLite snapshot. Indexed
+  range and point queries stream these values without deserializing JSON or
+  sorting large payloads. IDE sessions depend on these rows; Agent JSONL sessions
+  also depend on the database for timestamp recovery. Session metadata and the
+  enrichment profile remain fingerprinted.
+- Stable database/WAL observations allow digest reuse. After a shared-database
+  change, hashes are recomputed and only changed conversations are parsed.
+  Updating the observation alone does not replace postings. This still reads
+  conversation bytes; it is not a change feed. Cached read connections reopen
+  when the database file identity changes, including atomic replacement on Unix.
+- Fingerprints are versioned objects. Older serialized arrays cause a one-time
+  conservative refresh; identical extracted payloads can still retain postings.
 - Stable unchanged sessions skip transcript parsing. Changed sources are checked
-  before and after parsing. Unstable or empty reads are retried next invocation.
+  before and after parsing. Unstable or failed reads are retried next invocation.
+  Empty transcript parses also retry, except for deliberately metadata-only CLI
+  stores whose empty message list is legitimate.
 - Changed sources parse in parallel batches of at most eight sessions using the
   existing Rayon pool. Index writes stay serial and transactional. This bounds
   the number of parsed transcripts held at once, though an individual transcript
@@ -157,17 +175,28 @@ stemming, typo correction or arbitrary infix matching. More than 64 distinct
 chunks is an actionable input error.
 
 Field weights are content 1, title 3, first prompt 2, project/branch 0.5. Use
-BM25's length normalization over passages; no legacy score thresholds or boost
-chain are applied. Newer timestamps break equal-score ties, followed by stable
+BM25's length normalization over passages. The positive BM25 score is multiplied
+by `1 + 0.25 * complete + 0.15 * phrase`: complete means all distinct query chunks
+match the passage (exact or prefix); phrase means the original query's analyzed
+token sequence occurs in order. Both bonuses apply only to multi-chunk queries.
+Separate FTS match sets provide these signals without excluding partial matches.
+These are explicit initial policy weights, not learned or proven optimal values.
+Newer timestamps break equal-score ties, followed by stable
 session/ordinal ordering. JSON preserves the numeric score without rounding tiny
 values to zero. Scores are ranking signals, not probabilities.
 
 Source selection and timestamp/scope predicates are applied before consuming the
 ranked stream. Duplicate passage IDs and identical trimmed message text/role/
 tool/file tuples are collapsed without erasing numbers, case, quotes or suffixes.
-At most three messages per source/session ID are accepted across file copies. Iteration continues
-until the requested result count is filled or matches are exhausted; there is no
-fixed candidate cutoff that lets one busy session starve other sessions.
+At most three messages per source/session ID are accepted across file copies.
+BM25 defaults to one result per logical conversation, with the highest-ranked
+message first and up to two additional matches. The limit counts conversations;
+`--group-by message` restores individual message rows. No fixed candidate cutoff
+lets one busy session starve other sessions. Grouped retrieval continues through
+the stream to find children for selected groups, stopping when each selected
+group has three matches or the stream is exhausted. Sparse groups can therefore
+require traversing the full ranked stream, although accepted hydration is capped
+at three messages per group (duplicate payload checks can add hydration).
 `--source cursor-ide` includes canonical Agent transcript rows marked `also_ide`.
 `--source cursor-agent` also retains CLI stores represented by readable IDE rows;
 that selection performs a separate cached Agent membership discovery.
@@ -178,11 +207,14 @@ that selection performs a separate cached Agent membership discovery.
   legacy metadata shortcut. `CHAT_HISTORY_SEARCH_ENGINE=legacy` restores that
   behavior, and an explicit `--engine` takes precedence.
 - Default JSON now always has the former deep-search result fields. Legacy
-  metadata results still have `matched_field` and `search_type: index`.
+  metadata results still have `matched_field` and `search_type: index`. Message
+  results also expose `additional_matches`; ungrouped rows use an empty array.
+  `CHAT_HISTORY_SEARCH_GROUP_BY` controls grouping with explicit flag precedence.
+  Legacy and similarity searches retain their previous defaults.
 - Relevance ordering and counts intentionally change. Short messages remain
   eligible; multiple terms need not all match. A metadata match cannot suppress
-  transcript retrieval. Existing substring and phrase bonuses are available via
-  the legacy engine, not reproduced as an uncalibrated BM25 multiplier.
+  transcript retrieval. Legacy substring and importance heuristics remain in the
+  legacy engine; BM25's coverage and phrase weights are separately defined above.
 - Cold indexing has an up-front parsing/storage cost. Warm searches still stat
   the discovered sources; they are not constant-time with respect to session count.
 - Extremely broad queries may sort many matching passages. More specialized
@@ -197,6 +229,10 @@ that selection performs a separate cached Agent membership discovery.
 Unicode/prefix/path queries, literal query syntax, passage collapse, per-session
 limits, filtering and score stability, timestamp provenance, scopes, persistent
 refresh/rebuild/deletion, WAL-only edits, cache failures, UUIDs and CLI selection.
+Follow-up tests cover winning-passage excerpts, coverage and phrase ordering,
+group filling and JSON children, unrelated Cursor writes, same-size WAL changes,
+and atomic database replacement. See [follow-up measurements](search-improvements.md)
+for verification after each improvement and a local dense/hybrid/reranker trial.
 The original CLI and Cursor reliability suites exercise the new default; the two
 metadata-output contract tests explicitly select the legacy engine.
 

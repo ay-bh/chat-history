@@ -21,6 +21,7 @@ name = "ch"
 path = "src/main.rs"
 
 [dependencies]
+blake3 = "1.8"
 chrono = { version = "0.4.31", features = ["serde"] }
 clap = { version = "4", features = ["derive", "env"] }
 clap_complete = "4"

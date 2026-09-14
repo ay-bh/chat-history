@@ -336,8 +336,23 @@ pub fn print_search_results(results: &[SearchResult], query: &str) {
             dir_label(&r.session.project)
         );
         print_title_line(&title, &r.session);
-        let snippet = snippet_around_match(&r.message.content, query, 200);
+        let snippet = r
+            .snippet
+            .clone()
+            .unwrap_or_else(|| snippet_around_match(&r.message.content, query, 200));
         println!("        {}: {}", role_str, snippet);
+        for other in &r.additional_matches {
+            let role = if other.message.role == "user" {
+                "You"
+            } else {
+                "Assistant"
+            };
+            let snippet = other
+                .snippet
+                .clone()
+                .unwrap_or_else(|| snippet_around_match(&other.message.content, query, 200));
+            println!("          also {role}: {snippet}");
+        }
         if !r.message.tool_uses.is_empty() {
             let tools: String = r
                 .message
@@ -378,9 +393,16 @@ pub fn print_search_results_json(results: &[SearchResult], query: &str) {
                 "project": r.session.project,
                 "score": r.message.final_score,
                 "role": r.message.role,
-                "snippet": snippet_around_match(&r.message.content, query, 300),
+                "snippet": r.snippet.clone().unwrap_or_else(|| snippet_around_match(&r.message.content, query, 300)),
                 "tools": r.message.tool_uses,
                 "files": r.message.files_referenced,
+                "additional_matches": r.additional_matches.iter().map(|hit| serde_json::json!({
+                    "score": hit.message.final_score,
+                    "role": hit.message.role,
+                    "snippet": hit.snippet.clone().unwrap_or_else(|| snippet_around_match(&hit.message.content, query, 300)),
+                    "tools": hit.message.tool_uses,
+                    "files": hit.message.files_referenced,
+                })).collect::<Vec<_>>(),
             })
         })
         .collect();
