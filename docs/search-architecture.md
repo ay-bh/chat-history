@@ -119,6 +119,14 @@ are treated as an unavailable cache, not an empty corpus.
   missing timestamps. Session metadata and enrichment profile are fingerprinted.
 - Stable unchanged sessions skip transcript parsing. Changed sources are checked
   before and after parsing. Unstable or empty reads are retried next invocation.
+- Changed sources parse in parallel batches of at most eight sessions using the
+  existing Rayon pool. Index writes stay serial and transactional. This bounds
+  the number of parsed transcripts held at once, though an individual transcript
+  can still be large.
+- After a source changes, identical extracted message payloads retain their
+  postings. This avoids rewriting every Cursor transcript when unrelated data
+  changes in its shared IDE database. Complete payloads and ordinals are compared;
+  rebuild requests and extraction-version changes still regenerate passages.
 - Sessions absent from the discovery snapshot are removed from this disposable
   index. An unavailable source may therefore be indexed again when it returns;
   its original files are never changed.
@@ -140,8 +148,10 @@ quoted, including embedded quotation marks. Unicode61 analyzes both indexed
 text and query chunks, preserving combining characters. Punctuation separates
 identifier/path components inside one adjacent token sequence, so a filename
 query does not become a broad OR over `src`, a basename and an extension.
-Chunks with at least two alphanumeric characters prefix-match their final token;
-single-character chunks use exact matching. Chunks are ORed for recall. There is
+Chunks with at least two alphanumeric characters match both the exact sequence
+and a prefix of their final token. Exact matches contribute their own IDF in
+addition to the prefix contribution, so `WAL` has an advantage over `wall` or
+`Waltham`. Single-character chunks use exact matching. Chunks are ORed for recall. There is
 no executable FTS syntax, stopword list, hardcoded technology vocabulary,
 stemming, typo correction or arbitrary infix matching. More than 64 distinct
 chunks is an actionable input error.

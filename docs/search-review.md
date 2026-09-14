@@ -55,4 +55,16 @@ The synthetic timing and relevance results are recorded in
 - The release benchmark was run separately and passed.
 - `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and `git diff --check` passed.
 - The bundled skill validator passed.
+
+## Follow-up: real-history evaluation
+
+The subsequent [60-case binary comparison](search-evaluation.md) found two
+issues that synthetic checks missed: prefix-only matches could outrank exact
+acronyms, and shared Cursor database changes triggered redundant FTS writes.
+Both now have regression tests that failed before the fixes. Changed-source
+parsing also uses bounded parallel batches after refresh latency measurements.
+The full suite now passes 410 tests, with the same three opt-in/ignored tests.
+Real-history relevance, selectivity, cold/warm latency and remaining refresh
+costs are reported separately; the earlier synthetic numbers are not substitutes
+for these measurements.
 - The judged-query fixture still returns BM25 Recall@5 8/8, MRR@5 1.000.

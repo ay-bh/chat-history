@@ -52,6 +52,77 @@ fn search(
 }
 
 #[test]
+fn exact_acronyms_outrank_short_prefix_only_mentions() {
+    let tmp = TempDir::new().unwrap();
+    let corpus = vec![
+        transcript(
+            &tmp,
+            "sqlite",
+            &[
+                "SQLite WAL checkpoints preserve committed database transactions while readers remain active.",
+            ],
+        ),
+        transcript(&tmp, "city", &["Waltham headquarters"]),
+        transcript(&tmp, "barrier", &["A wall"]),
+        transcript(&tmp, "walk", &["Walking around"]),
+    ];
+    let mut index = Bm25Backend::open(None).unwrap();
+    index.sync(&corpus, false).unwrap();
+    assert_eq!(
+        search(&mut index, &corpus, "WAL", 4)[0].session.id,
+        "sqlite"
+    );
+    assert_eq!(
+        search(&mut index, &corpus, "Walth", 4)[0].session.id,
+        "city"
+    );
+}
+
+#[test]
+fn source_refresh_with_identical_messages_keeps_existing_postings() {
+    let tmp = TempDir::new().unwrap();
+    let corpus = vec![transcript(
+        &tmp,
+        "same",
+        &["Existing checkpoint discussion"],
+    )];
+    let cache = tmp.path().join("cache");
+    let mut index = Bm25Backend::open(Some(&cache)).unwrap();
+    index.sync(&corpus, false).unwrap();
+    let conn = rusqlite::Connection::open(cache.join(INDEX_FILENAME)).unwrap();
+    conn.execute_batch(
+        "CREATE TRIGGER reject_rewrite BEFORE DELETE ON messages
+        BEGIN SELECT RAISE(ABORT, 'unchanged messages must retain postings'); END;",
+    )
+    .unwrap();
+    // Source timestamps change, but parsing yields the same messages.
+    write_messages(
+        std::path::Path::new(&corpus[0].file),
+        &["Existing checkpoint discussion"],
+    );
+    index.sync(&corpus, false).unwrap();
+    assert_eq!(search(&mut index, &corpus, "checkpoint", 4).len(), 1);
+    assert!(
+        index.sync(&corpus, true).is_err(),
+        "explicit rebuild must replace postings"
+    );
+    conn.execute("UPDATE sessions SET fingerprint = '[0,null]'", [])
+        .unwrap();
+    assert!(
+        index.sync(&corpus, false).is_err(),
+        "a changed extraction policy must replace postings"
+    );
+    conn.execute_batch("DROP TRIGGER reject_rewrite").unwrap();
+    write_messages(
+        std::path::Path::new(&corpus[0].file),
+        &["Changed transaction discussion"],
+    );
+    index.sync(&corpus, false).unwrap();
+    assert!(search(&mut index, &corpus, "checkpoint", 4).is_empty());
+    assert_eq!(search(&mut index, &corpus, "transaction", 4).len(), 1);
+}
+
+#[test]
 fn rare_terms_rank_above_generic_technology_mentions() {
     let tmp = TempDir::new().unwrap();
     let mut corpus = vec![transcript(

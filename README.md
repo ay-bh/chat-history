@@ -181,11 +181,13 @@ The hook is opt-in and does not backfill old or cloud history. It records transc
 
 ## Search scoring
 
-**BM25 (default):** Unicode token and prefix matching over overlapping transcript passages, titles, first prompts, project paths, and branches. Rare terms contribute more; repeated mentions saturate. Each result is an original message, with duplicates removed and at most three hits per session. Recency breaks score ties. JSON retains small positive scores at full precision; scores are not confidence values and cannot be compared across engines or queries.
+**BM25 (default):** Unicode token and prefix matching over overlapping transcript passages, titles, first prompts, project paths, and branches. Rare terms contribute more; repeated mentions saturate, and exact terms receive additional weight over prefix-only matches. Each result is an original message, with duplicates removed and at most three hits per session. Recency breaks score ties. JSON retains small positive scores at full precision; scores are not confidence values and cannot be compared across engines or queries.
 
 The first search indexes discovered history; later searches validate source fingerprints. Filters do not change the indexed collection statistics. `--scope similar` keeps the previous user-message similarity implementation. Queries are plain text; filename and identifier components stay adjacent and share the index’s Unicode analyzer; this is prefix search, not arbitrary infix or typo matching.
 
 Select the previous ranking with `--engine legacy` or `CHAT_HISTORY_SEARCH_ENGINE=legacy`. Explicit flags override environment values. `CHAT_HISTORY_CACHE_DIR` selects the cache location, `CHAT_HISTORY_NO_CACHE=1` bypasses both disk caches, and `CHAT_HISTORY_REBUILD_INDEX=true` forces a search-index refresh. A search-local `--cache-dir` overrides the BM25 directory only; `--no-cache` builds BM25 in memory. Unavailable, corrupt, or write-locked search caches fall back to in-memory BM25 with a stderr warning.
+
+See the [real-history binary comparison](docs/search-evaluation.md) for measured relevance and latency, including the remaining cost of large Cursor refreshes.
 
 [Architecture, research sources, and validation](docs/search-architecture.md). [Implementation review and fixes](docs/search-review.md).
 

@@ -4,6 +4,7 @@ use crate::parser::{clean_first_prompt, is_noise};
 use crate::search::{SearchResult, direct_session_search, parse_timeframe_duration, scored_search};
 use crate::session::{Message, Session, parse_any_timestamp, parse_session_recovering_timestamps};
 use chrono::Utc;
+use rayon::prelude::*;
 use rusqlite::{Connection, params};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
@@ -19,6 +20,7 @@ const EXTRACTION_VERSION: u32 = 1;
 const MAX_QUERY_TERMS: usize = 64;
 const MAX_PASSAGE_CHARS: usize = 1600;
 const PASSAGE_OVERLAP: usize = 200;
+const PARSE_BATCH_SIZE: usize = 8;
 
 pub struct SearchRequest<'a> {
     /// Sessions already selected by source, project, branch, date and sidechains.
@@ -276,69 +278,121 @@ impl Bm25Backend {
             .collect::<rusqlite::Result<_>>()?;
         let live: HashSet<String> = corpus.iter().map(session_key).collect();
         let mut stats = SyncStats::default();
-        // Parse only changed sessions, one at a time. A single transaction makes
-        // source rows, message payloads and FTS postings visible together.
+        // Parse changed sessions in bounded batches; never hold the whole parsed
+        // corpus in memory. Publish all changes in one transaction.
         let tx = self.conn.savepoint()?;
         for key in existing.keys().filter(|key| !live.contains(*key)) {
             tx.execute("DELETE FROM sessions WHERE key = ?1", [key])?;
             stats.removed += 1;
         }
-        for (i, session) in corpus.iter().enumerate() {
-            let key = session_key(session);
-            let before = fingerprint(session);
-            if !rebuild && before.is_some() && existing.get(&key) == before.as_ref() {
-                stats.unchanged += 1;
-                progress(i + 1, corpus.len());
-                continue;
-            }
-            let (messages, _) = parse_session_recovering_timestamps(session, false);
-            let after = fingerprint(session);
-            // Racy or unsuccessful reads can serve this query but must be retried.
-            let stable = before.is_some() && before == after && !messages.is_empty();
-            tx.execute("DELETE FROM sessions WHERE key = ?1", [&key])?;
-            tx.execute(
-                "INSERT INTO sessions VALUES (?1, ?2)",
-                params![
-                    key,
-                    if stable {
-                        after.unwrap()
-                    } else {
-                        String::new()
-                    }
-                ],
-            )?;
-            let metadata = metadata_message(session);
-            if !metadata.content.is_empty() {
-                insert_message(&tx, &key, session, &metadata, 0, true)?;
-            }
-            if !session.first_prompt.is_empty() {
-                let mut prompt = metadata.clone();
-                prompt.uuid = "index-prompt".into();
-                prompt.content = session.first_prompt.clone();
-                // A prompt is message text: session activity is not proof of
-                // when it was written. Do not launder unknown times via metadata.
-                let preview = clean_first_prompt(&session.first_prompt);
-                prompt.timestamp = messages
-                    .iter()
-                    .find(|m| {
-                        m.role == "user"
-                            && !preview.is_empty()
-                            && clean_first_prompt(&m.content).starts_with(&preview)
-                    })
-                    .map(|m| m.timestamp.clone())
-                    .unwrap_or_default();
-                insert_message(&tx, &key, session, &prompt, 1, true)?;
-            }
-            for (ordinal, mut message) in messages.into_iter().enumerate() {
-                if is_noise(&message.content_lower()) {
+        for (batch_number, batch) in corpus.chunks(PARSE_BATCH_SIZE).enumerate() {
+            let prepared: Vec<_> = batch
+                .par_iter()
+                .map(|session| {
+                    let key = session_key(session);
+                    let before = fingerprint(session);
+                    let parsed =
+                        if !rebuild && before.is_some() && existing.get(&key) == before.as_ref() {
+                            None
+                        } else {
+                            let (messages, _) = parse_session_recovering_timestamps(session, false);
+                            let after = fingerprint(session);
+                            Some((messages, before, after))
+                        };
+                    (session, key, parsed)
+                })
+                .collect();
+            for (offset, (session, key, parsed)) in prepared.into_iter().enumerate() {
+                let i = batch_number * PARSE_BATCH_SIZE + offset;
+                let Some((messages, before, after)) = parsed else {
+                    stats.unchanged += 1;
+                    progress(i + 1, corpus.len());
                     continue;
+                };
+                // Racy or unsuccessful reads can serve this query but must be retried.
+                let stable = before.is_some() && before == after && !messages.is_empty();
+                // Keep the extraction version even when the source needs retrying.
+                let stamp = if stable {
+                    after.unwrap()
+                } else {
+                    serde_json::to_string(&(EXTRACTION_VERSION, Option::<()>::None))?
+                };
+                let mut extracted = Vec::new();
+                let metadata = metadata_message(session);
+                if !metadata.content.is_empty() {
+                    extracted.push((0, metadata.clone(), true));
                 }
-                message.session_id = session.id.clone();
-                message.project_path = session.project.clone();
-                insert_message(&tx, &key, session, &message, ordinal + 2, false)?;
+                if !session.first_prompt.is_empty() {
+                    let mut prompt = metadata.clone();
+                    prompt.uuid = "index-prompt".into();
+                    prompt.content = session.first_prompt.clone();
+                    // A prompt is message text: session activity is not proof of
+                    // when it was written. Do not launder unknown times via metadata.
+                    let preview = clean_first_prompt(&session.first_prompt);
+                    prompt.timestamp = messages
+                        .iter()
+                        .find(|m| {
+                            m.role == "user"
+                                && !preview.is_empty()
+                                && clean_first_prompt(&m.content).starts_with(&preview)
+                        })
+                        .map(|m| m.timestamp.clone())
+                        .unwrap_or_default();
+                    extracted.push((1, prompt, true));
+                }
+                for (ordinal, mut message) in messages.into_iter().enumerate() {
+                    if is_noise(&message.content_lower()) {
+                        continue;
+                    }
+                    message.session_id = session.id.clone();
+                    message.project_path = session.project.clone();
+                    extracted.push((ordinal + 2, message, false));
+                }
+                // Cursor's shared database changes for unrelated chats and settings.
+                // Recheck extraction, but do not rewrite unchanged FTS postings.
+                // Compare complete payloads, not a lossy hash; policy changes and
+                // explicit rebuilds must still regenerate passages.
+                let same_version = existing
+                    .get(&key)
+                    .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
+                    .is_some_and(|value| value[0].as_u64() == Some(u64::from(EXTRACTION_VERSION)));
+                let same_messages = if !rebuild && same_version {
+                    let mut stmt = tx.prepare_cached(
+                    "SELECT ordinal, payload FROM messages WHERE session_key = ?1 ORDER BY ordinal",
+                )?;
+                    let mut rows = stmt.query([&key])?;
+                    let mut equal = true;
+                    for (ordinal, message, _) in &extracted {
+                        let Some(row) = rows.next()? else {
+                            equal = false;
+                            break;
+                        };
+                        if row.get::<_, usize>(0)? != *ordinal
+                            || row.get::<_, String>(1)? != serde_json::to_string(message)?
+                        {
+                            equal = false;
+                            break;
+                        }
+                    }
+                    equal && rows.next()?.is_none()
+                } else {
+                    false
+                };
+                if same_messages {
+                    tx.execute(
+                        "UPDATE sessions SET fingerprint = ?2 WHERE key = ?1",
+                        params![key, stamp],
+                    )?;
+                } else {
+                    tx.execute("DELETE FROM sessions WHERE key = ?1", [&key])?;
+                    tx.execute("INSERT INTO sessions VALUES (?1, ?2)", params![key, stamp])?;
+                    for (ordinal, message, metadata) in extracted {
+                        insert_message(&tx, &key, session, &message, ordinal, metadata)?;
+                    }
+                }
+                stats.updated += 1;
+                progress(i + 1, corpus.len());
             }
-            stats.updated += 1;
-            progress(i + 1, corpus.len());
         }
         tx.commit()?;
         Ok(stats)
@@ -483,12 +537,14 @@ fn match_query(query: &str) -> Result<Option<String>> {
         terms
             .iter()
             .map(|term| {
-                let suffix = if term.chars().filter(|c| c.is_alphanumeric()).count() >= 2 {
-                    "*"
+                let literal = format!("\"{}\"", term.replace('"', "\"\""));
+                if term.chars().filter(|c| c.is_alphanumeric()).count() >= 2 {
+                    // Exact words contribute their own IDF in addition to the
+                    // broader prefix. Otherwise WAL can lose to wall/Waltham.
+                    format!("({literal} OR {literal}*)")
                 } else {
-                    ""
-                };
-                format!("\"{}\"{suffix}", term.replace('"', "\"\""))
+                    literal
+                }
             })
             .collect::<Vec<_>>()
             .join(" OR "),
