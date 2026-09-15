@@ -8,6 +8,11 @@ use chat_history::skill_install::{ensure_skills, install_skill};
 use chat_history::{display, inspect, scoring, search};
 use clap::{Parser, Subcommand};
 
+fn cli_timeframe(value: &str) -> Result<String, String> {
+    search::parse_timeframe_duration(value)?;
+    Ok(value.to_string())
+}
+
 #[derive(Parser)]
 #[command(
     name = "chat-history",
@@ -116,7 +121,7 @@ enum Commands {
         #[arg(long, default_value_t = 15)]
         limit: usize,
         /// Only messages newer than today, week, month, or Nd (e.g. 7d)
-        #[arg(long)]
+        #[arg(long, value_parser = cli_timeframe)]
         timeframe: Option<String>,
         /// Structured JSON output (session_id, score, snippet, tools, files)
         #[arg(long = "json")]

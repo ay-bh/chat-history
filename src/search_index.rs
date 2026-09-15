@@ -1,29 +1,41 @@
 //! Replaceable lexical retrieval over a disposable, incrementally refreshed index.
 //! Source transcripts remain authoritative. See docs/search-architecture.md.
-use crate::parser::{clean_first_prompt, is_noise};
+use crate::parser::{
+    cap_excerpt, clean_first_prompt, is_noise, snippet_around_match, strip_terminal_controls,
+};
 use crate::search::{
     SearchMatch, SearchResult, direct_session_search, parse_timeframe_duration, scored_search,
 };
 use crate::session::{Message, Session, parse_any_timestamp, parse_session_recovering_timestamps};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use rayon::prelude::*;
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, ErrorCode, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::hash::BuildHasher;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub type SearchError = Box<dyn std::error::Error + Send + Sync>;
 pub type Result<T> = std::result::Result<T, SearchError>;
 pub const INDEX_FILENAME: &str = "search-v1.db";
 // Bump for parser, timestamp, chunking or tokenization changes that require
 // re-extracting unchanged sources without changing the relational schema.
-const EXTRACTION_VERSION: u32 = 1;
-const MAX_QUERY_TERMS: usize = 64;
+const EXTRACTION_VERSION: u32 = 2;
+const MAX_ANALYZER_TOKENS: usize = 128;
+const MAX_PHRASE_TOKENS: usize = 32;
 const MAX_PASSAGE_CHARS: usize = 1600;
 const PASSAGE_OVERLAP: usize = 200;
 const PARSE_BATCH_SIZE: usize = 8;
+const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+const WRITER_STALL: Duration = Duration::from_secs(10);
+const CACHE_MISMATCH_ATTEMPTS: usize = 3;
+const SNIPPET_CHARS: usize = 400;
+
+pub(crate) fn grouped_message_oversample(limit: usize) -> usize {
+    limit.saturating_mul(6)
+}
 
 pub struct SearchRequest<'a> {
     /// Sessions already selected by source, project, branch, date and sidechains.
@@ -52,7 +64,7 @@ impl SearchBackend for LegacyBackend {
             request.query,
             request.scope,
             if request.group_by_session {
-                usize::MAX
+                grouped_message_oversample(request.limit)
             } else {
                 request.limit
             },
@@ -89,6 +101,97 @@ pub fn default_index_dir() -> Option<PathBuf> {
         .or_else(|| crate::session::user_home().map(|p| p.join(".chat-history/cache")))
 }
 
+fn indexed_session_keys_match(conn: &Connection, corpus: &[Session]) -> Result<bool> {
+    let expected: HashSet<String> = corpus.iter().map(session_key).collect();
+    let mut stmt = conn.prepare("SELECT key FROM sessions")?;
+    let indexed = stmt
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<HashSet<_>>>()?;
+    Ok(expected.is_subset(&indexed))
+}
+
+fn source_gone(key: &str) -> bool {
+    let Ok((source, id, file)) = serde_json::from_str::<(String, String, String)>(key) else {
+        return true;
+    };
+    match fs::symlink_metadata(&file) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+        Err(_) => false,
+        Ok(_) if source == "cursor-ide" => crate::cursor_ide::open_ro(Path::new(&file))
+            .and_then(|c| {
+                c.query_row(
+                    "SELECT count(*) FROM cursorDiskKV WHERE key = ?1",
+                    [format!("composerData:{id}")],
+                    |r| r.get::<_, i64>(0),
+                )
+                .ok()
+            })
+            .is_some_and(|n| n == 0),
+        Ok(_) => false,
+    }
+}
+
+fn is_corrupt(error: &SearchError) -> bool {
+    error
+        .downcast_ref::<rusqlite::Error>()
+        .and_then(rusqlite::Error::sqlite_error_code)
+        .is_some_and(|code| matches!(code, ErrorCode::NotADatabase | ErrorCode::DatabaseCorrupt))
+}
+
+fn reset_in_place(dir: &Path) -> Result<()> {
+    let conn = Connection::open(dir.join(INDEX_FILENAME))?;
+    conn.busy_timeout(BUSY_TIMEOUT)?;
+    if conn
+        .query_row(
+            "SELECT count(*) FROM sqlite_schema WHERE name = 'sessions'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .is_ok_and(|n| n == 1)
+        && conn
+            .query_row("SELECT count(*) FROM sessions", [], |r| r.get::<_, i64>(0))
+            .is_ok()
+    {
+        return Ok(());
+    }
+    conn.set_db_config(
+        rusqlite::config::DbConfig::SQLITE_DBCONFIG_RESET_DATABASE,
+        true,
+    )?;
+    let vacuum = conn.execute_batch("VACUUM");
+    conn.set_db_config(
+        rusqlite::config::DbConfig::SQLITE_DBCONFIG_RESET_DATABASE,
+        false,
+    )?;
+    vacuum?;
+    Ok(())
+}
+
+fn sync_corpus(
+    backend: &mut Bm25Backend,
+    corpus: &[Session],
+    rebuild: bool,
+    last_progress: &mut std::time::Instant,
+) -> Result<SyncStats> {
+    backend.sync_with_progress(corpus, rebuild, |done, total| {
+        if last_progress.elapsed() >= Duration::from_millis(750) {
+            eprintln!("Updating search index: {done}/{total} sessions");
+            *last_progress = std::time::Instant::now();
+        }
+    })
+}
+
+fn memory_search(
+    corpus: &[Session],
+    request: &SearchRequest<'_>,
+    rebuild: bool,
+    last_progress: &mut std::time::Instant,
+) -> Result<Vec<SearchResult>> {
+    let mut backend = Bm25Backend::open(None)?;
+    sync_corpus(&mut backend, corpus, rebuild, last_progress)?;
+    backend.search(request)
+}
+
 /// CLI orchestration. Cache failures preserve BM25 semantics using an ephemeral
 /// index; malformed user queries remain errors rather than triggering a rebuild.
 pub fn search_corpus(
@@ -110,51 +213,76 @@ pub fn search_corpus(
     if match_query(request.query)?.is_none() {
         return Ok(Vec::new());
     }
-    let mut last_progress = std::time::Instant::now();
-    let mut prepare = |dir| -> Result<Bm25Backend> {
-        let mut backend = Bm25Backend::open(dir)?;
-        // Keep synchronization and retrieval in one snapshot. Another process
-        // may use a different provider profile and replace the cached corpus.
-        backend.conn.execute_batch("BEGIN")?;
-        backend.sync_with_progress(corpus, rebuild, |done, total| {
-            if last_progress.elapsed() >= Duration::from_millis(750) {
-                eprintln!("Updating search index: {done}/{total} sessions");
-                last_progress = std::time::Instant::now();
+    let mut last_progress = Instant::now();
+    let Some(dir) = directory else {
+        return memory_search(corpus, request, rebuild, &mut last_progress);
+    };
+    let mut reset_done = false;
+    for attempt in 0..CACHE_MISMATCH_ATTEMPTS {
+        let mut backend = match Bm25Backend::open(Some(dir)) {
+            Ok(backend) => backend,
+            Err(error) if is_corrupt(&error) && !reset_done => {
+                reset_done = true;
+                eprintln!("Warning: search cache is corrupt ({error}); resetting it in place.");
+                if let Err(e) = reset_in_place(dir) {
+                    eprintln!("Warning: search cache reset failed ({e}).");
+                }
+                continue;
             }
-        })?;
-        Ok(backend)
-    };
-    let mut backend = match prepare(directory) {
-        Ok(backend) => backend,
-        Err(error) if directory.is_some() => {
+            Err(error) => {
+                eprintln!(
+                    "Warning: search cache unavailable ({error}); searching with an in-memory BM25 index."
+                );
+                return memory_search(corpus, request, rebuild, &mut last_progress);
+            }
+        };
+        if let Err(error) = sync_corpus(&mut backend, corpus, rebuild, &mut last_progress) {
+            if error.to_string().starts_with("no such table")
+                && attempt + 1 < CACHE_MISMATCH_ATTEMPTS
+            {
+                drop(backend);
+                continue;
+            }
+            if is_corrupt(&error) && !reset_done {
+                reset_done = true;
+                drop(backend);
+                eprintln!("Warning: search cache is corrupt ({error}); resetting it in place.");
+                if let Err(e) = reset_in_place(dir) {
+                    eprintln!("Warning: search cache reset failed ({e}).");
+                }
+                continue;
+            }
             eprintln!(
-                "Warning: search cache unavailable ({error}); searching with an in-memory BM25 index."
+                "Warning: could not save search cache ({error}); searching with an in-memory BM25 index."
             );
-            prepare(None)?
+            return memory_search(corpus, request, rebuild, &mut last_progress);
         }
-        Err(error) => return Err(error),
-    };
-    let results = match backend.search(request) {
-        Ok(results) => results,
-        Err(error) if directory.is_some() => {
-            eprintln!(
-                "Warning: search cache query failed ({error}); searching with an in-memory BM25 index."
-            );
-            drop(backend);
-            backend = prepare(None)?;
-            backend.search(request)?
+        match backend.search(request) {
+            Ok(results) => match indexed_session_keys_match(&backend.conn, corpus) {
+                Ok(true) => return Ok(results),
+                Ok(false) if attempt + 1 < CACHE_MISMATCH_ATTEMPTS => {}
+                Ok(false) => {
+                    eprintln!(
+                        "Warning: search cache replaced during retrieval; searching with an in-memory BM25 index."
+                    );
+                    break;
+                }
+                Err(error) => {
+                    eprintln!(
+                        "Warning: search cache query failed ({error}); searching with an in-memory BM25 index."
+                    );
+                    return memory_search(corpus, request, rebuild, &mut last_progress);
+                }
+            },
+            Err(error) => {
+                eprintln!(
+                    "Warning: search cache query failed ({error}); searching with an in-memory BM25 index."
+                );
+                return memory_search(corpus, request, rebuild, &mut last_progress);
+            }
         }
-        Err(error) => return Err(error),
-    };
-    if let Err(error) = backend.conn.execute_batch("COMMIT") {
-        // Search already read a valid snapshot. A disposable cache write must
-        // not turn those results into a failed command (e.g. a full disk).
-        eprintln!(
-            "Warning: could not save search cache ({error}); returning current search results."
-        );
-        let _ = backend.conn.execute_batch("ROLLBACK");
     }
-    Ok(results)
+    memory_search(corpus, request, rebuild, &mut last_progress)
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -264,12 +392,36 @@ impl Bm25Backend {
         } else {
             Connection::open_in_memory()?
         };
-        conn.busy_timeout(Duration::from_secs(1))?;
+        conn.busy_timeout(BUSY_TIMEOUT)?;
         conn.pragma_update(None, "foreign_keys", true)?;
         if directory.is_some() {
-            let mode: String = conn.query_row("PRAGMA journal_mode", [], |r| r.get(0))?;
-            if mode != "wal" {
-                conn.pragma_update(None, "journal_mode", "WAL")?;
+            conn.pragma_update(None, "secure_delete", "ON")?;
+            conn.pragma_update(None, "journal_size_limit", 67_108_864)?;
+            let started = Instant::now();
+            loop {
+                let mode = conn
+                    .query_row("PRAGMA journal_mode", [], |r| r.get::<_, String>(0))
+                    .and_then(|m| {
+                        if m == "wal" {
+                            Ok(m)
+                        } else {
+                            conn.query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))
+                        }
+                    });
+                match mode {
+                    Ok(m) if m == "wal" => break,
+                    Err(e)
+                        if e.sqlite_error_code() == Some(ErrorCode::DatabaseBusy)
+                            && started.elapsed() < BUSY_TIMEOUT =>
+                    {
+                        std::thread::sleep(Duration::from_millis(10))
+                    }
+                    Ok(_) if started.elapsed() < BUSY_TIMEOUT => {
+                        std::thread::sleep(Duration::from_millis(10))
+                    }
+                    Ok(m) => return Err(format!("could not enable WAL (journal_mode={m})").into()),
+                    Err(e) => return Err(e.into()),
+                }
             }
         }
         let core_tables: i64 = conn.query_row(
@@ -288,8 +440,16 @@ impl Bm25Backend {
             |r| r.get(0),
         )?;
         if !initialized {
-            let tx = conn.unchecked_transaction()?;
-            tx.execute_batch(
+            let tx = begin_immediate(&conn)?;
+            let initialized: bool = tx.query_row(
+                "SELECT count(*) = 8 FROM sqlite_schema WHERE name IN (
+                 'sessions', 'messages', 'messages_session', 'passages', 'passages_message',
+                 'passages_fts', 'passages_insert', 'passages_delete')",
+                [],
+                |r| r.get(0),
+            )?;
+            if !initialized {
+                tx.execute_batch(
             "CREATE TABLE IF NOT EXISTS sessions (
                 key TEXT PRIMARY KEY, fingerprint TEXT NOT NULL
              );
@@ -322,12 +482,11 @@ impl Bm25Backend {
                 VALUES ('delete', old.id, old.content, old.title, old.prompt, old.project, old.branch);
              END;",
         )?;
-            // Creating external-content FTS/triggers does not index rows that
-            // already exist. Repair missing derived assets atomically on open.
-            tx.execute(
-                "INSERT INTO passages_fts(passages_fts) VALUES ('rebuild')",
-                [],
-            )?;
+                tx.execute(
+                    "INSERT INTO passages_fts(passages_fts) VALUES ('rebuild')",
+                    [],
+                )?;
+            }
             tx.commit()?;
         }
         conn.execute_batch("CREATE TEMP TABLE allowed_sessions (key TEXT PRIMARY KEY)")?;
@@ -346,166 +505,294 @@ impl Bm25Backend {
         rebuild: bool,
         mut progress: impl FnMut(usize, usize),
     ) -> Result<SyncStats> {
-        let existing: HashMap<String, String> = self
-            .conn
-            .prepare("SELECT key, fingerprint FROM sessions")?
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
-            .collect::<rusqlite::Result<_>>()?;
         let live: HashSet<String> = corpus.iter().map(session_key).collect();
+        let existing = read_existing(&self.conn)?;
         let fingerprints: HashMap<_, Fingerprint> = existing
             .iter()
-            .filter_map(|(key, value)| {
-                serde_json::from_str(value)
-                    .ok()
-                    .map(|stamp| (key.clone(), stamp))
+            .filter_map(|(k, v)| serde_json::from_str(v).ok().map(|s| (k.clone(), s)))
+            .collect();
+        let plan: Vec<(String, Option<Fingerprint>, bool)> = corpus
+            .par_iter()
+            .map(|session| {
+                let key = session_key(session);
+                let previous = fingerprints.get(&key);
+                let before = fingerprint(session, previous);
+                let skip = !rebuild
+                    && before
+                        .as_ref()
+                        .zip(previous)
+                        .is_some_and(|(a, b)| a.matches(b));
+                (key, before, !skip)
             })
             .collect();
-        let mut stats = SyncStats::default();
-        // Parse changed sessions in bounded batches; never hold the whole parsed
-        // corpus in memory. Publish all changes in one transaction.
-        let tx = self.conn.savepoint()?;
-        for key in existing.keys().filter(|key| !live.contains(*key)) {
-            tx.execute("DELETE FROM sessions WHERE key = ?1", [key])?;
-            stats.removed += 1;
+        let missing: Vec<&String> = existing.keys().filter(|k| !live.contains(*k)).collect();
+        let gone: Vec<&String> = missing
+            .par_iter()
+            .copied()
+            .filter(|k| source_gone(k))
+            .collect();
+        let removed: Vec<&String> = if gone.len() > 100 && gone.len() * 2 > existing.len() {
+            Vec::new()
+        } else {
+            gone
+        };
+        let todo: Vec<usize> = (0..corpus.len()).filter(|&i| plan[i].2).collect();
+        let mut stats = SyncStats {
+            unchanged: corpus.len() - todo.len(),
+            ..SyncStats::default()
+        };
+        if removed.is_empty() && todo.is_empty() {
+            return Ok(stats);
         }
-        for (batch_number, batch) in corpus.chunks(PARSE_BATCH_SIZE).enumerate() {
-            let prepared: Vec<_> = batch
-                .par_iter()
-                .map(|session| {
-                    let key = session_key(session);
-                    let previous = fingerprints.get(&key);
-                    let before = fingerprint(session, previous);
-                    let parsed = if !rebuild
-                        && before
-                            .as_ref()
-                            .zip(previous)
-                            .is_some_and(|(a, b)| a.matches(b))
-                    {
-                        None
-                    } else {
-                        let (messages, _) = parse_session_recovering_timestamps(session, false);
-                        let after = fingerprint(session, before.as_ref());
-                        Some((messages, after))
-                    };
-                    (session, key, before, parsed)
-                })
-                .collect();
-            for (offset, (session, key, before, parsed)) in prepared.into_iter().enumerate() {
-                let i = batch_number * PARSE_BATCH_SIZE + offset;
-                let Some((messages, after)) = parsed else {
-                    let observed = serde_json::to_string(before.as_ref().unwrap())?;
-                    if existing.get(&key) != Some(&observed) {
-                        tx.execute(
-                            "UPDATE sessions SET fingerprint = ?2 WHERE key = ?1",
-                            params![key, observed],
-                        )?;
-                    }
-                    stats.unchanged += 1;
-                    progress(i + 1, corpus.len());
-                    continue;
-                };
-                // Racy or unsuccessful reads can serve this query but must be retried.
-                let stable = before
-                    .as_ref()
-                    .zip(after.as_ref())
-                    .is_some_and(|(a, b)| a.matches(b))
-                    && (!messages.is_empty() || session.is_cursor_store_only());
-                // Keep the extraction version even when the source needs retrying.
-                let mut stamp = after.unwrap_or(Fingerprint {
-                    version: EXTRACTION_VERSION,
-                    signature: None,
-                    cursor: None,
-                });
-                if !stable {
-                    stamp.signature = None;
-                }
-                let stamp = serde_json::to_string(&stamp)?;
-                let mut extracted = Vec::new();
-                let metadata = metadata_message(session);
-                if !metadata.content.is_empty() {
-                    extracted.push((0, metadata.clone(), true));
-                }
-                if !session.first_prompt.is_empty() {
-                    let mut prompt = metadata.clone();
-                    prompt.uuid = "index-prompt".into();
-                    prompt.content = session.first_prompt.clone();
-                    // A prompt is message text: session activity is not proof of
-                    // when it was written. Do not launder unknown times via metadata.
-                    let preview = clean_first_prompt(&session.first_prompt);
-                    prompt.timestamp = messages
-                        .iter()
-                        .find(|m| {
-                            m.role == "user"
-                                && !preview.is_empty()
-                                && clean_first_prompt(&m.content).starts_with(&preview)
-                        })
-                        .map(|m| m.timestamp.clone())
-                        .unwrap_or_default();
-                    extracted.push((1, prompt, true));
-                }
-                for (ordinal, mut message) in messages.into_iter().enumerate() {
-                    if is_noise(&message.content_lower()) {
-                        continue;
-                    }
-                    message.session_id = session.id.clone();
-                    message.project_path = session.project.clone();
-                    extracted.push((ordinal + 2, message, false));
-                }
-                // Cursor's shared database changes for unrelated chats and settings.
-                // Recheck extraction, but do not rewrite unchanged FTS postings.
-                // Compare complete payloads, not a lossy hash; policy changes and
-                // explicit rebuilds must still regenerate passages.
-                let same_version = existing
-                    .get(&key)
-                    .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
-                    .is_some_and(|value| {
-                        value
-                            .get("version")
-                            .or_else(|| value.get(0))
-                            .and_then(|v| v.as_u64())
-                            == Some(u64::from(EXTRACTION_VERSION))
-                    });
-                let same_messages = if !rebuild && same_version {
-                    let mut stmt = tx.prepare_cached(
-                    "SELECT ordinal, payload FROM messages WHERE session_key = ?1 ORDER BY ordinal",
+        if !removed.is_empty() {
+            let tx = begin_immediate(&self.conn)?;
+            for key in &removed {
+                stats.removed += tx.execute(
+                    "DELETE FROM sessions WHERE key = ?1 AND fingerprint = ?2",
+                    params![key, existing[*key]],
                 )?;
-                    let mut rows = stmt.query([&key])?;
-                    let mut equal = true;
-                    for (ordinal, message, _) in &extracted {
-                        let Some(row) = rows.next()? else {
-                            equal = false;
-                            break;
-                        };
-                        if row.get::<_, usize>(0)? != *ordinal
-                            || row.get::<_, String>(1)? != serde_json::to_string(message)?
-                        {
-                            equal = false;
-                            break;
-                        }
-                    }
-                    equal && rows.next()?.is_none()
-                } else {
-                    false
-                };
-                if same_messages {
-                    tx.execute(
-                        "UPDATE sessions SET fingerprint = ?2 WHERE key = ?1",
-                        params![key, stamp],
-                    )?;
-                } else {
-                    tx.execute("DELETE FROM sessions WHERE key = ?1", [&key])?;
-                    tx.execute("INSERT INTO sessions VALUES (?1, ?2)", params![key, stamp])?;
-                    for (ordinal, message, metadata) in extracted {
-                        insert_message(&tx, &key, session, &message, ordinal, metadata)?;
-                    }
-                }
-                stats.updated += 1;
-                progress(i + 1, corpus.len());
+            }
+            tx.commit()?;
+            if stats.removed > 0 {
+                let tx = begin_immediate(&self.conn)?;
+                tx.execute(
+                    "INSERT INTO passages_fts(passages_fts) VALUES('optimize')",
+                    [],
+                )?;
+                tx.commit()?;
+                let _ = self.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)");
             }
         }
-        tx.commit()?;
+        let order = std::collections::hash_map::RandomState::new();
+        let mut todo = todo;
+        todo.sort_by_cached_key(|&i| order.hash_one(&plan[i].0));
+        let mut done = stats.unchanged;
+        for batch in todo.chunks(PARSE_BATCH_SIZE) {
+            let mut need = Vec::with_capacity(batch.len());
+            for &i in batch {
+                let current = current_fingerprint(&self.conn, &plan[i].0)?;
+                if published_elsewhere(&current, existing.get(&plan[i].0), plan[i].1.as_ref()) {
+                    stats.unchanged += 1;
+                    done += 1;
+                } else {
+                    need.push(i);
+                }
+            }
+            let prepared: Vec<_> = need
+                .par_iter()
+                .map(|&i| {
+                    let session = &corpus[i];
+                    let before = plan[i].1.clone();
+                    let (messages, _) = parse_session_recovering_timestamps(session, false);
+                    let after = fingerprint(session, before.as_ref());
+                    (i, extract_session(session, before, messages, after))
+                })
+                .collect();
+            let mut writes = Vec::new();
+            for (i, (stamp, extracted)) in prepared {
+                let key = &plan[i].0;
+                let current = current_fingerprint(&self.conn, key)?;
+                if !rebuild
+                    && current.as_deref() == Some(stamp.as_str())
+                    && same_messages(&self.conn, key, &extracted)?
+                {
+                    stats.unchanged += 1;
+                    done += 1;
+                    progress(done, corpus.len());
+                } else {
+                    writes.push((i, stamp, extracted, current));
+                }
+            }
+            if writes.is_empty() {
+                progress(done, corpus.len());
+                continue;
+            }
+            let tx = begin_immediate(&self.conn)?;
+            for (i, stamp, extracted, seen) in writes {
+                let key = &plan[i].0;
+                let current = current_fingerprint(&tx, key)?;
+                if current != seen
+                    && current
+                        .as_deref()
+                        .and_then(|c| serde_json::from_str::<Fingerprint>(c).ok())
+                        .zip(serde_json::from_str::<Fingerprint>(&stamp).ok())
+                        .is_some_and(|(c, s)| c.matches(&s))
+                {
+                    stats.unchanged += 1;
+                } else {
+                    publish_session(
+                        &tx,
+                        &corpus[i],
+                        key,
+                        current.as_deref(),
+                        &stamp,
+                        extracted,
+                        rebuild,
+                    )?;
+                    stats.updated += 1;
+                }
+                done += 1;
+                progress(done, corpus.len());
+            }
+            tx.commit()?;
+        }
         Ok(stats)
     }
+}
+
+fn read_existing(conn: &Connection) -> Result<HashMap<String, String>> {
+    Ok(conn
+        .prepare("SELECT key, fingerprint FROM sessions")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?)
+}
+
+/// BEGIN IMMEDIATE, waiting as long as other writers keep committing. SQLite's
+/// busy handler is not fair: under sustained contention one connection can lose
+/// every retry within busy_timeout although the system is making progress.
+fn begin_immediate(conn: &Connection) -> Result<Transaction<'_>> {
+    let mut last_version: Option<i64> = None;
+    let mut last_progress = Instant::now();
+    loop {
+        match Transaction::new_unchecked(conn, TransactionBehavior::Immediate) {
+            Ok(tx) => return Ok(tx),
+            Err(e) if e.sqlite_error_code() == Some(ErrorCode::DatabaseBusy) => {
+                let version: i64 = conn.query_row("PRAGMA data_version", [], |r| r.get(0))?;
+                if last_version != Some(version) {
+                    last_version = Some(version);
+                    last_progress = Instant::now();
+                } else if last_progress.elapsed() > WRITER_STALL {
+                    return Err(e.into());
+                }
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+}
+
+fn current_fingerprint(conn: &Connection, key: &str) -> Result<Option<String>> {
+    match conn
+        .prepare_cached("SELECT fingerprint FROM sessions WHERE key = ?1")?
+        .query_row([key], |r| r.get(0))
+    {
+        Ok(v) => Ok(Some(v)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn published_elsewhere(
+    current: &Option<String>,
+    planned: Option<&String>,
+    want: Option<&Fingerprint>,
+) -> bool {
+    current.as_ref() != planned
+        && current
+            .as_deref()
+            .and_then(|c| serde_json::from_str::<Fingerprint>(c).ok())
+            .zip(want)
+            .is_some_and(|(c, w)| c.matches(w))
+}
+
+type Extracted = Vec<(usize, Message, bool)>;
+
+fn extract_session(
+    session: &Session,
+    before: Option<Fingerprint>,
+    messages: Vec<Message>,
+    after: Option<Fingerprint>,
+) -> (String, Extracted) {
+    let stable = before
+        .as_ref()
+        .zip(after.as_ref())
+        .is_some_and(|(a, b)| a.matches(b))
+        && (!messages.is_empty() || session.is_cursor_store_only());
+    let mut stamp = after.unwrap_or(Fingerprint {
+        version: EXTRACTION_VERSION,
+        signature: None,
+        cursor: None,
+    });
+    if !stable {
+        stamp.signature = None;
+    }
+    let stamp = serde_json::to_string(&stamp).unwrap();
+    let mut extracted = Vec::new();
+    let metadata = metadata_message(session);
+    if !metadata.content.is_empty() {
+        extracted.push((0, metadata.clone(), true));
+    }
+    if !session.first_prompt.is_empty() {
+        let mut prompt = metadata.clone();
+        prompt.uuid = "index-prompt".into();
+        prompt.content = session.first_prompt.clone();
+        let preview = clean_first_prompt(&session.first_prompt);
+        prompt.timestamp = messages
+            .iter()
+            .find(|m| {
+                m.role == "user"
+                    && !preview.is_empty()
+                    && clean_first_prompt(&m.content).starts_with(&preview)
+            })
+            .map(|m| m.timestamp.clone())
+            .unwrap_or_default();
+        extracted.push((1, prompt, true));
+    }
+    for (ordinal, mut message) in messages.into_iter().enumerate() {
+        if is_noise(&message.content_lower()) {
+            continue;
+        }
+        message.session_id = session.id.clone();
+        message.project_path = session.project.clone();
+        extracted.push((ordinal + 2, message, false));
+    }
+    (stamp, extracted)
+}
+
+fn same_messages(conn: &Connection, key: &str, extracted: &Extracted) -> Result<bool> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT ordinal, payload FROM messages WHERE session_key = ?1 ORDER BY ordinal",
+    )?;
+    let mut rows = stmt.query([key])?;
+    for (ordinal, message, _) in extracted {
+        let Some(row) = rows.next()? else {
+            return Ok(false);
+        };
+        if row.get::<_, usize>(0)? != *ordinal
+            || row.get::<_, String>(1)? != serde_json::to_string(message)?
+        {
+            return Ok(false);
+        }
+    }
+    Ok(rows.next()?.is_none())
+}
+
+fn publish_session(
+    tx: &Connection,
+    session: &Session,
+    key: &str,
+    current: Option<&str>,
+    stamp: &str,
+    extracted: Extracted,
+    rebuild: bool,
+) -> Result<()> {
+    let same_version = current
+        .and_then(|value| serde_json::from_str::<Fingerprint>(value).ok())
+        .is_some_and(|value| value.version == EXTRACTION_VERSION);
+    if !rebuild && same_version && same_messages(tx, key, &extracted)? {
+        if current != Some(stamp) {
+            tx.execute(
+                "UPDATE sessions SET fingerprint = ?2 WHERE key = ?1",
+                params![key, stamp],
+            )?;
+        }
+        return Ok(());
+    }
+    tx.execute("DELETE FROM sessions WHERE key = ?1", [key])?;
+    tx.execute("INSERT INTO sessions VALUES (?1, ?2)", params![key, stamp])?;
+    for (ordinal, message, metadata) in extracted {
+        insert_message(tx, key, session, &message, ordinal, metadata)?;
+    }
+    Ok(())
 }
 
 fn metadata_message(session: &Session) -> Message {
@@ -630,29 +917,72 @@ struct LexicalQuery {
     phrase: Option<String>,
 }
 
+fn analyzer_tokens(text: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    for c in text.chars() {
+        if is_analyzer_token_char(c) {
+            current.extend(c.to_lowercase());
+        } else if !current.is_empty() {
+            tokens.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
+fn is_analyzer_token_char(c: char) -> bool {
+    c.is_alphanumeric()
+        || c == '_'
+        || matches!(
+            c,
+            '\u{0300}'..='\u{036F}'
+                | '\u{1AB0}'..='\u{1AFF}'
+                | '\u{20D0}'..='\u{20FF}'
+                | '\u{FE20}'..='\u{FE2F}'
+        )
+}
+
 fn match_query(query: &str) -> Result<Option<LexicalQuery>> {
-    if crate::scoring::is_uuid(query) {
+    let query = strip_terminal_controls(query);
+    if crate::scoring::is_uuid(&query) {
         return Ok(Some(LexicalQuery {
             broad: format!("\"{}\"", query.trim().to_lowercase()),
             complete: None,
             phrase: None,
         }));
     }
-    let terms: BTreeSet<String> = query
-        .split_whitespace()
-        .filter(|s| s.chars().any(char::is_alphanumeric))
-        .map(str::to_lowercase)
-        .collect();
-    if terms.len() > MAX_QUERY_TERMS {
-        return Err(format!(
-            "Search query has more than {MAX_QUERY_TERMS} terms; use a shorter query."
-        )
-        .into());
+    let mut terms = Vec::new();
+    let mut unique_analyzer = HashSet::new();
+    let mut analyzer_count = 0usize;
+    for chunk in query.split_whitespace() {
+        let toks = analyzer_tokens(chunk);
+        if toks.is_empty() {
+            continue;
+        }
+        analyzer_count = analyzer_count.saturating_add(toks.len());
+        if toks.len() <= MAX_PHRASE_TOKENS {
+            if unique_analyzer.len() < MAX_ANALYZER_TOKENS {
+                terms.push(chunk.to_lowercase());
+                unique_analyzer.extend(toks);
+            }
+        } else {
+            for tok in toks {
+                if unique_analyzer.insert(tok.clone()) && terms.len() < MAX_ANALYZER_TOKENS {
+                    terms.push(tok);
+                }
+            }
+        }
+        if unique_analyzer.len() >= MAX_ANALYZER_TOKENS {
+            break;
+        }
     }
     if terms.is_empty() {
         return Ok(None);
     }
-    let clauses = terms
+    let clauses: Vec<String> = terms
         .iter()
         .map(|term| {
             let literal = format!("\"{}\"", term.replace('"', "\"\""));
@@ -664,11 +994,12 @@ fn match_query(query: &str) -> Result<Option<LexicalQuery>> {
                 literal
             }
         })
-        .collect::<Vec<_>>();
+        .collect();
     Ok(Some(LexicalQuery {
         broad: clauses.join(" OR "),
         complete: (clauses.len() > 1).then(|| clauses.join(" AND ")),
-        phrase: (clauses.len() > 1).then(|| format!("\"{}\"", query.replace('"', "\"\""))),
+        phrase: (clauses.len() > 1 && analyzer_count <= MAX_PHRASE_TOKENS)
+            .then(|| format!("\"{}\"", query.replace('"', "\"\""))),
     }))
 }
 
@@ -689,9 +1020,19 @@ impl SearchBackend for Bm25Backend {
         let Some(query) = match_query(request.query)? else {
             return Ok(Vec::new());
         };
-        let cutoff = request
-            .timeframe
-            .map(|tf| (Utc::now() - parse_timeframe_duration(tf)).timestamp_millis());
+        let cutoff = match request.timeframe {
+            Some(tf) => Some(
+                parse_timeframe_duration(tf)
+                    .map(|dur| {
+                        Utc::now()
+                            .checked_sub_signed(dur)
+                            .unwrap_or(DateTime::<Utc>::MIN_UTC)
+                            .timestamp_millis()
+                    })
+                    .map_err(|e| -> SearchError { e.into() })?,
+            ),
+            None => None,
+        };
         let selected: HashMap<String, &Session> = request
             .sessions
             .iter()
@@ -773,7 +1114,10 @@ impl SearchBackend for Bm25Backend {
             let mut message: Message = serde_json::from_str(&payload)?;
             // Preserve code, digits, quotes, case and the full message. The
             // legacy fuzzy signature conflates E100/E200 and shared preambles.
+            // Dedup is per conversation so the same error text in another
+            // session remains a separate hit.
             let sig = (
+                logical_session.clone(),
                 message.role.clone(),
                 message.content.trim().to_owned(),
                 message.tool_uses.clone(),
@@ -786,7 +1130,19 @@ impl SearchBackend for Bm25Backend {
             message.relevance_score = score;
             message.final_score = score;
             let passage_id: i64 = row.get(3)?;
-            let snippet = excerpt.query_row(params![passage_id, query.broad], |r| r.get(0))?;
+            let snippet: String =
+                excerpt.query_row(params![passage_id, query.broad], |r| r.get(0))?;
+            let snippet = if snippet.trim().is_empty() {
+                let q = if request.query.len() > 4096 {
+                    &request.query[..request.query.floor_char_boundary(4096)]
+                } else {
+                    request.query
+                };
+                snippet_around_match(&message.content, q, 200)
+            } else {
+                snippet
+            };
+            let snippet = cap_excerpt(&snippet, SNIPPET_CHARS);
             *counts.entry(logical_session.clone()).or_default() += 1;
             if request.group_by_session
                 && let Some(&group) = groups.get(&logical_session)
@@ -811,5 +1167,41 @@ impl SearchBackend for Bm25Backend {
             }
         }
         Ok(results)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{grouped_message_oversample, match_query};
+
+    #[test]
+    fn grouped_oversample_stays_bounded() {
+        assert_eq!(grouped_message_oversample(2), 12);
+        assert!(grouped_message_oversample(15) < usize::MAX / 2);
+    }
+
+    #[test]
+    fn match_query_caps_analyzer_tokens_on_dotted_repeats() {
+        let parsed = match_query(&"sqlite.rust.".repeat(5000))
+            .unwrap()
+            .expect("repeated dotted text still has analyzer tokens");
+        assert!(parsed.phrase.is_none(), "{}", parsed.broad);
+        assert!(parsed.broad.len() < 200, "{}", parsed.broad);
+        assert!(parsed.broad.contains("sqlite"));
+        assert!(parsed.broad.contains("rust"));
+    }
+
+    #[test]
+    fn match_query_accepts_more_than_sixty_four_terms() {
+        let query = (0..100)
+            .map(|i| format!("term{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let parsed = match_query(&query)
+            .unwrap()
+            .expect("long term lists are capped, not rejected");
+        assert!(parsed.phrase.is_none());
+        assert!(parsed.broad.contains("term0"));
+        assert!(parsed.broad.contains("term99"));
     }
 }

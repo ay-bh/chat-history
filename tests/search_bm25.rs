@@ -1,4 +1,6 @@
-use chat_history::search_index::{Bm25Backend, INDEX_FILENAME, SearchBackend, SearchRequest};
+use chat_history::search_index::{
+    Bm25Backend, INDEX_FILENAME, LegacyBackend, SearchBackend, SearchRequest,
+};
 use chat_history::session::Session;
 use serde_json::json;
 use std::fs;
@@ -53,6 +55,40 @@ fn search(
 }
 
 #[test]
+fn ungrouped_search_returns_other_sessions_beside_a_long_match() {
+    let tmp = TempDir::new().unwrap();
+    let long = format!("hotterm {}", "hotterm ".repeat(20_000));
+    let mut corpus = vec![transcript(&tmp, "long", &[long.as_str()])];
+    for i in 0..10 {
+        corpus.push(transcript(
+            &tmp,
+            &format!("other-{i}"),
+            &[&format!("hotterm unique{i} short note")],
+        ));
+    }
+    let mut index = Bm25Backend::open(None).unwrap();
+    index.sync(&corpus, false).unwrap();
+    let hits = index
+        .search(&SearchRequest {
+            sessions: &corpus,
+            query: "hotterm",
+            scope: "all",
+            limit: 5,
+            timeframe: None,
+            group_by_session: false,
+        })
+        .unwrap();
+    assert_eq!(
+        hits.len(),
+        5,
+        "passage LIMIT must not hide other conversations: {:?}",
+        hits.iter()
+            .map(|h| h.session.id.as_str())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn grouping_fills_distinct_sessions_and_keeps_additional_matches() {
     let tmp = TempDir::new().unwrap();
     let corpus = vec![
@@ -90,6 +126,79 @@ fn grouping_fills_distinct_sessions_and_keeps_additional_matches() {
         .unwrap();
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].additional_matches.len(), 2);
+}
+
+#[test]
+fn identical_text_in_two_sessions_stays_two_conversations() {
+    let tmp = TempDir::new().unwrap();
+    let shared = "Service returned error SHAREDCODE during credential validation.";
+    let corpus = vec![
+        transcript(&tmp, "first-copy", &[shared]),
+        transcript(&tmp, "second-copy", &[shared]),
+    ];
+    let mut index = Bm25Backend::open(None).unwrap();
+    index.sync(&corpus, false).unwrap();
+    let hits = index
+        .search(&SearchRequest {
+            sessions: &corpus,
+            query: "SHAREDCODE",
+            scope: "all",
+            limit: 5,
+            timeframe: None,
+            group_by_session: true,
+        })
+        .unwrap();
+    let ids: std::collections::BTreeSet<_> =
+        hits.iter().map(|hit| hit.session.id.as_str()).collect();
+    assert_eq!(
+        ids,
+        ["first-copy", "second-copy"].into_iter().collect(),
+        "duplicate error text must not hide the other conversation: {ids:?}"
+    );
+    let ungrouped = index
+        .search(&SearchRequest {
+            sessions: &corpus,
+            query: "SHAREDCODE",
+            scope: "all",
+            limit: 5,
+            timeframe: None,
+            group_by_session: false,
+        })
+        .unwrap();
+    assert_eq!(ungrouped.len(), 2);
+}
+
+#[test]
+fn grouped_legacy_search_returns_the_requested_conversations() {
+    let tmp = TempDir::new().unwrap();
+    let names = [
+        "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel",
+    ];
+    let corpus: Vec<_> = names
+        .iter()
+        .map(|name| {
+            transcript(
+                &tmp,
+                &format!("legacy-{name}"),
+                &[&format!(
+                    "legacydrain unique {name} discussion about authentication flow"
+                )],
+            )
+        })
+        .collect();
+    let hits = LegacyBackend
+        .search(&SearchRequest {
+            sessions: &corpus,
+            query: "legacydrain",
+            scope: "all",
+            limit: 3,
+            timeframe: None,
+            group_by_session: true,
+        })
+        .unwrap();
+    assert_eq!(hits.len(), 3);
+    let ids: std::collections::BTreeSet<_> = hits.iter().map(|h| h.session.id.clone()).collect();
+    assert_eq!(ids.len(), 3);
 }
 
 #[test]
@@ -168,6 +277,34 @@ fn snippets_follow_the_ranked_passage_and_index_analyzer() {
         assert!(excerpt.contains("needleprotocol"), "{excerpt}");
         assert!(excerpt.len() < text.len() / 2);
     }
+}
+
+#[test]
+fn snippets_are_capped_to_400_characters() {
+    let tmp = TempDir::new().unwrap();
+    let text = format!("needleprotocol {}", "あ".repeat(5_000));
+    let corpus = vec![transcript(&tmp, "long-excerpt", &[&text])];
+    let mut index = Bm25Backend::open(None).unwrap();
+    index.sync(&corpus, false).unwrap();
+    let hits = search(&mut index, &corpus, "needleprotocol", 1);
+    let excerpt = hits[0].snippet.as_deref().expect("excerpt");
+    assert!(excerpt.contains("needleprotocol"), "{excerpt}");
+    assert!(
+        excerpt.chars().count() <= 400,
+        "{}",
+        excerpt.chars().count()
+    );
+}
+
+#[test]
+fn long_analyzer_queries_still_rank_the_source() {
+    let tmp = TempDir::new().unwrap();
+    let terms: Vec<String> = (0..100).map(|i| format!("rareterm{i}")).collect();
+    let corpus = vec![transcript(&tmp, "source", &[&terms.join(" ")])];
+    let mut index = Bm25Backend::open(None).unwrap();
+    index.sync(&corpus, false).unwrap();
+    let hits = search(&mut index, &corpus, &terms.join(" "), 5);
+    assert_eq!(hits[0].session.id, "source");
 }
 
 #[test]
@@ -415,18 +552,17 @@ fn unicode_identifiers_prefixes_short_queries_and_literal_syntax() {
         .map(|i| format!("term{i}"))
         .collect::<Vec<_>>()
         .join(" ");
-    assert!(
-        index
-            .search(&SearchRequest {
-                sessions: &corpus,
-                query: &excessive,
-                scope: "all",
-                limit: 10,
-                timeframe: None,
-                group_by_session: false,
-            })
-            .is_err()
-    );
+    let hits = index
+        .search(&SearchRequest {
+            sessions: &corpus,
+            query: &excessive,
+            scope: "all",
+            limit: 10,
+            timeframe: None,
+            group_by_session: false,
+        })
+        .expect("long queries are capped rather than rejected");
+    assert!(hits.is_empty());
 }
 
 #[test]
@@ -711,6 +847,65 @@ fn cli_grouping_preserves_json_contract_and_message_opt_out() {
 }
 
 #[test]
+fn human_search_keeps_tools_and_files_beside_additional_matches() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join("projects/demo");
+    fs::create_dir_all(&dir).unwrap();
+    let lines = [
+        json!({"type":"user","uuid":"m0","timestamp":"2026-01-01T00:00:00Z","message":{"role":"user","content":"toolbeside uniquecli uniquecli uniquecli uniquecli uniquecli"}}),
+        json!({"type":"assistant","uuid":"m1","timestamp":"2026-01-01T00:01:00Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"/tmp/toolbeside.rs"}},{"type":"text","text":"toolbeside uniquecli via Read"}]}}),
+        json!({"type":"user","uuid":"m2","timestamp":"2026-01-01T00:02:00Z","message":{"role":"user","content":"toolbeside uniquecli wrapup"}}),
+    ];
+    fs::write(
+        dir.join("11111111-2222-3333-4444-555555555555.jsonl"),
+        lines
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+    .unwrap();
+    let stdout = String::from_utf8(
+        command(&tmp)
+            .env("NO_COLOR", "1")
+            .args(["search", "toolbeside"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    let also = stdout
+        .find("also Assistant:")
+        .unwrap_or_else(|| panic!("assistant should be an extra match, got:\n{stdout}"));
+    let extra = &stdout[also..];
+    assert!(
+        extra.contains("tools: Read"),
+        "additional match must show its tools beside that hit, got:\n{stdout}"
+    );
+    assert!(
+        extra.contains("toolbeside.rs"),
+        "additional match must show its files beside that hit, got:\n{stdout}"
+    );
+    let json: serde_json::Value = serde_json::from_slice(
+        &command(&tmp)
+            .args(["search", "toolbeside", "--json"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    let extra_json = &json["results"][0]["additional_matches"];
+    assert!(
+        extra_json.as_array().unwrap().iter().any(|hit| hit["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t == "Read")),
+        "{extra_json}"
+    );
+}
+
+#[test]
 fn cli_defaults_to_bm25_and_supports_engine_environment_and_no_cache() {
     let tmp = TempDir::new().unwrap();
     cli_fixture(&tmp);
@@ -751,6 +946,18 @@ fn cli_defaults_to_bm25_and_supports_engine_environment_and_no_cache() {
 }
 
 #[test]
+fn invalid_timeframe_is_a_usage_error() {
+    let tmp = TempDir::new().unwrap();
+    for tf in ["99999999999999d", "2weeks", "0d", "-5d"] {
+        command(&tmp)
+            .args(["search", "uniquecli", &format!("--timeframe={tf}")])
+            .assert()
+            .code(2)
+            .stderr(predicates::str::contains("invalid --timeframe"));
+    }
+}
+
+#[test]
 fn corrupt_cache_falls_back_without_changing_search_results() {
     let tmp = TempDir::new().unwrap();
     cli_fixture(&tmp);
@@ -772,7 +979,43 @@ fn corrupt_cache_falls_back_without_changing_search_results() {
         String::from_utf8_lossy(&broken.stderr)
     );
     assert_eq!(broken.stdout, memory.stdout);
-    assert!(String::from_utf8_lossy(&broken.stderr).contains("in-memory BM25"));
+    assert!(
+        String::from_utf8_lossy(&broken.stderr).contains("resetting it in place"),
+        "{}",
+        String::from_utf8_lossy(&broken.stderr)
+    );
+}
+
+#[test]
+fn deleted_session_text_is_not_recoverable_from_index_bytes() {
+    let tmp = TempDir::new().unwrap();
+    let secret = "sk-live-SECRETTOKEN123";
+    let corpus = vec![transcript(&tmp, "secret-session", &[secret])];
+    let dir = tmp.path().join("index");
+    let mut index = Bm25Backend::open(Some(&dir)).unwrap();
+    index.sync(&corpus, false).unwrap();
+    drop(index);
+    fs::remove_file(&corpus[0].file).unwrap();
+    let mut index = Bm25Backend::open(Some(&dir)).unwrap();
+    index.sync(&[], false).unwrap();
+    drop(index);
+    for suffix in ["", "-wal", "-shm"] {
+        let path = dir.join(format!("{INDEX_FILENAME}{suffix}"));
+        let Ok(bytes) = fs::read(&path) else {
+            continue;
+        };
+        let hay = String::from_utf8_lossy(&bytes);
+        assert!(
+            !hay.contains(secret),
+            "raw secret still in {}",
+            path.display()
+        );
+        assert!(
+            !hay.to_lowercase().contains("secrettoken123"),
+            "token still in {}",
+            path.display()
+        );
+    }
 }
 
 #[test]
@@ -907,6 +1150,11 @@ fn locked_cache_uses_ephemeral_bm25_and_preserves_json() {
         .args(["search", "uniquecli", "--json"])
         .assert()
         .success();
+    write_messages(
+        &tmp.path()
+            .join("projects/demo/11111111-2222-3333-4444-555555555555.jsonl"),
+        &["Investigate uniquecli authentication failures during login. extra uniquecli refresh"],
+    );
     let conn =
         rusqlite::Connection::open(tmp.path().join(".chat-history/cache").join(INDEX_FILENAME))
             .unwrap();

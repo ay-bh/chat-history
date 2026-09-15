@@ -1,5 +1,5 @@
 use crate::inspect::InspectInfo;
-use crate::parser::{clean_prompt, display_title, snippet_around_match};
+use crate::parser::{clean_prompt, display_title, snippet_around_match, strip_terminal_controls};
 use crate::search::{IndexResult, SearchResult};
 use crate::session::{self, Message, Session};
 use std::collections::BTreeMap;
@@ -88,8 +88,12 @@ fn abbreviate_home_with(path: &str, home: Option<&str>) -> String {
     path.to_string()
 }
 
+fn tty(s: &str) -> String {
+    strip_terminal_controls(s)
+}
+
 fn dir_label(project: &str) -> String {
-    labeled("DIR", &abbreviate_home(project))
+    labeled("DIR", &tty(&abbreviate_home(project)))
 }
 
 fn copies_label(
@@ -146,11 +150,11 @@ fn id_chip(session: &Session) -> String {
 fn title_of(summary: &str, first_prompt: &str, max: usize) -> String {
     let t = display_title(summary, max);
     if !t.is_empty() {
-        return t;
+        return tty(&t);
     }
     let t = display_title(first_prompt, max);
     if !t.is_empty() {
-        return t;
+        return tty(&t);
     }
     "(untitled)".into()
 }
@@ -170,7 +174,7 @@ pub fn print_list(sessions: &[Session], verbose: bool) {
     for (i, s) in sessions.iter().enumerate() {
         let tag = src_tag(&s.source, s.also_ide);
         let title = title_of(&s.summary, &s.first_prompt, 100);
-        let branch = labeled("BRANCH", &s.branch);
+        let branch = labeled("BRANCH", &tty(&s.branch));
         let sidechain = if s.is_sidechain {
             format!(" {}[subagent]{}", c!("dim"), c!("reset"))
         } else {
@@ -247,7 +251,7 @@ pub fn print_summarized(sessions: &[Session]) {
                 id_chip(s),
                 dir_label(&s.project),
                 copies_label(&counts, s),
-                labeled("BRANCH", &s.branch)
+                labeled("BRANCH", &tty(&s.branch))
             );
             print_title_line(&title, s);
         }
@@ -336,50 +340,116 @@ pub fn print_search_results(results: &[SearchResult], query: &str) {
             dir_label(&r.session.project)
         );
         print_title_line(&title, &r.session);
-        let snippet = r
-            .snippet
-            .clone()
-            .unwrap_or_else(|| snippet_around_match(&r.message.content, query, 200));
-        // Search previews stay on one logical line; inspect/view retain the
-        // original formatting, as does structured search output.
-        let snippet = snippet.split_whitespace().collect::<Vec<_>>().join(" ");
-        println!("        {}: {}", role_str, snippet);
-        if !r.message.tool_uses.is_empty() {
-            let tools: String = r
-                .message
-                .tool_uses
-                .iter()
-                .take(5)
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(", ");
-            println!("       {}tools: {}{}", c!("dim"), tools, c!("reset"));
-        }
-        if !r.message.files_referenced.is_empty() {
-            let files: String = r
-                .message
-                .files_referenced
-                .iter()
-                .take(3)
-                .map(|f| abbreviate_home(f))
-                .collect::<Vec<_>>()
-                .join(", ");
-            println!("       {}files: {}{}", c!("dim"), files, c!("reset"));
-        }
+        let snippet = usable_search_snippet(r.snippet.as_deref(), &r.message.content, query, 200);
+        println!(
+            "        {}: {}",
+            role_str,
+            format_search_preview(&snippet, query)
+        );
+        print_hit_details(&r.message, "       ");
         for other in &r.additional_matches {
             let role = if other.message.role == "user" {
-                "You"
+                format!("{}You{}", c!("green"), c!("reset"))
             } else {
-                "Assistant"
+                format!("{}Assistant{}", c!("blue"), c!("reset"))
             };
-            let snippet = other
-                .snippet
-                .clone()
-                .unwrap_or_else(|| snippet_around_match(&other.message.content, query, 200));
-            let snippet = snippet.split_whitespace().collect::<Vec<_>>().join(" ");
-            println!("          also {role}: {snippet}");
+            let snippet =
+                usable_search_snippet(other.snippet.as_deref(), &other.message.content, query, 200);
+            println!(
+                "          also {role}: {}",
+                format_search_preview(&snippet, query)
+            );
+            print_hit_details(&other.message, "            ");
         }
         println!();
+    }
+}
+
+fn usable_search_snippet(
+    snippet: Option<&str>,
+    content: &str,
+    query: &str,
+    context_chars: usize,
+) -> String {
+    snippet
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| snippet_around_match(content, query, context_chars))
+}
+
+fn compact_search_preview(snippet: &str) -> String {
+    snippet.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn query_term_keys(query: &str) -> Vec<String> {
+    query
+        .split_whitespace()
+        .filter_map(|s| {
+            let key: String = s
+                .chars()
+                .filter(|c| c.is_alphanumeric())
+                .collect::<String>()
+                .to_lowercase();
+            (!key.is_empty()).then_some(key)
+        })
+        .collect()
+}
+
+/// Bold query tokens in a compacted preview. `color` is explicit so tests do
+/// not depend on whether the test runner's stdout is a TTY.
+pub fn emphasize_search_preview(preview: &str, query: &str, color: bool) -> String {
+    if !color || preview.is_empty() {
+        return preview.to_string();
+    }
+    let terms = query_term_keys(query);
+    if terms.is_empty() {
+        return preview.to_string();
+    }
+    preview
+        .split(' ')
+        .map(|tok| {
+            let key: String = tok
+                .chars()
+                .filter(|c| c.is_alphanumeric())
+                .collect::<String>()
+                .to_lowercase();
+            if !key.is_empty() && terms.iter().any(|term| term == &key) {
+                format!("\x1b[1m{tok}\x1b[0m")
+            } else {
+                tok.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn format_search_preview(snippet: &str, query: &str) -> String {
+    // Search previews stay on one logical line; inspect/view retain the
+    // original formatting, as does structured search output.
+    emphasize_search_preview(&compact_search_preview(&tty(snippet)), query, *USE_COLOR)
+}
+
+fn print_hit_details(message: &Message, indent: &str) {
+    if !message.tool_uses.is_empty() {
+        let tools: String = message
+            .tool_uses
+            .iter()
+            .take(5)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("{indent}{}tools: {}{}", c!("dim"), tty(&tools), c!("reset"));
+    }
+    if !message.files_referenced.is_empty() {
+        let files: String = message
+            .files_referenced
+            .iter()
+            .take(3)
+            .map(|f| abbreviate_home(f))
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("{indent}{}files: {}{}", c!("dim"), tty(&files), c!("reset"));
     }
 }
 
@@ -397,13 +467,13 @@ pub fn print_search_results_json(results: &[SearchResult], query: &str) {
                 "project": r.session.project,
                 "score": r.message.final_score,
                 "role": r.message.role,
-                "snippet": r.snippet.clone().unwrap_or_else(|| snippet_around_match(&r.message.content, query, 300)),
+                "snippet": usable_search_snippet(r.snippet.as_deref(), &r.message.content, query, 300),
                 "tools": r.message.tool_uses,
                 "files": r.message.files_referenced,
                 "additional_matches": r.additional_matches.iter().map(|hit| serde_json::json!({
                     "score": hit.message.final_score,
                     "role": hit.message.role,
-                    "snippet": hit.snippet.clone().unwrap_or_else(|| snippet_around_match(&hit.message.content, query, 300)),
+                    "snippet": usable_search_snippet(hit.snippet.as_deref(), &hit.message.content, query, 300),
                     "tools": hit.message.tool_uses,
                     "files": hit.message.files_referenced,
                 })).collect::<Vec<_>>(),
@@ -438,7 +508,7 @@ pub fn print_index_results_json(results: &[IndexResult], query: &str) {
 
 pub fn print_inspect(info: &InspectInfo) {
     let tag = src_tag(&info.source, info.also_ide);
-    let cleaned = display_title(&info.summary, 120);
+    let cleaned = tty(&display_title(&info.summary, 120));
     let summary = if cleaned.is_empty() {
         "(no summary)"
     } else {
@@ -449,18 +519,23 @@ pub fn print_inspect(info: &InspectInfo) {
     let cwd = if info.project.is_empty() {
         "-".to_string()
     } else {
-        abbreviate_home(&info.project)
+        tty(&abbreviate_home(&info.project))
     };
-    println!("  {}id: {}{}", c!("dim"), info.session_id, c!("reset"));
+    println!(
+        "  {}id: {}{}",
+        c!("dim"),
+        tty(&info.session_id),
+        c!("reset")
+    );
     println!(
         "  {}date: {}  cwd: {}  branch: {}{}",
         c!("dim"),
-        info.date,
+        tty(&info.date),
         cwd,
         if info.branch.is_empty() {
-            "-"
+            "-".to_string()
         } else {
-            &info.branch
+            tty(&info.branch)
         },
         c!("reset")
     );
@@ -490,7 +565,7 @@ pub fn print_inspect(info: &InspectInfo) {
     if !info.tools_used.is_empty() {
         println!("  {}{}Tools Used:{}", c!("cyan"), c!("bold"), c!("reset"));
         for t in &info.tools_used {
-            println!("    • {t}");
+            println!("    • {}", tty(t));
         }
         println!();
     }
@@ -502,7 +577,7 @@ pub fn print_inspect(info: &InspectInfo) {
             c!("reset")
         );
         for f in &info.files_modified {
-            println!("    • {}", abbreviate_home(f));
+            println!("    • {}", tty(&abbreviate_home(f)));
         }
         println!();
     }
@@ -514,7 +589,7 @@ pub fn print_inspect(info: &InspectInfo) {
             c!("reset")
         );
         for a in &info.accomplishments {
-            println!("    ✓ {a}");
+            println!("    ✓ {}", tty(a));
         }
         println!();
     }
@@ -526,7 +601,7 @@ pub fn print_inspect(info: &InspectInfo) {
             c!("reset")
         );
         for d in &info.decisions {
-            println!("    → {d}");
+            println!("    → {}", tty(d));
         }
         println!();
     }
@@ -539,7 +614,7 @@ pub fn print_inspect(info: &InspectInfo) {
         );
         for e in &info.errors {
             let truncated: String = e.chars().take(100).collect();
-            println!("    ✗ {truncated}");
+            println!("    ✗ {}", tty(&truncated));
         }
         println!();
     }
@@ -592,15 +667,15 @@ pub fn print_transcript(messages: &[Message], session: &Session, show_tools: boo
             println!(
                 "  {}tools: {}{}",
                 c!("dim"),
-                msg.tool_uses.join(", "),
+                tty(&msg.tool_uses.join(", ")),
                 c!("reset")
             );
         }
-        let text = if msg.role == "user" {
+        let text = tty(&if msg.role == "user" {
             clean_prompt(&msg.content)
         } else {
             msg.content.clone()
-        };
+        });
         for line in text.lines() {
             println!("  {line}");
         }
@@ -611,11 +686,11 @@ pub fn print_transcript(messages: &[Message], session: &Session, show_tools: boo
 pub fn print_plain(messages: &[Message]) {
     for msg in messages {
         let role = if msg.role == "user" { "You" } else { "Claude" };
-        let text = if msg.role == "user" {
+        let text = tty(&if msg.role == "user" {
             clean_prompt(&msg.content)
         } else {
             msg.content.clone()
-        };
+        });
         if !text.trim().is_empty() {
             println!("{role}: {text}\n");
         }
@@ -635,7 +710,7 @@ pub fn cursor_ide_resume_hint(session: &Session) -> String {
              Look for it in the Cursor sidebar after opening a related project.\n"
         );
     }
-    let dir = abbreviate_home(&session.project);
+    let dir = tty(&abbreviate_home(&session.project));
     format!(
         "You need to use the Cursor IDE UI in the directory {dir} to find this session.\n\
          IDE chats cannot be resumed from the CLI.\n\
@@ -711,7 +786,9 @@ pub fn export_transcript(messages: &[Message], session: &Session, out_path: Opti
 #[cfg(test)]
 mod tests {
     use super::abbreviate_home_with;
+    use super::compact_search_preview;
     use super::cursor_ide_resume_hint;
+    use super::emphasize_search_preview;
     use crate::session::Session;
 
     #[test]
@@ -845,5 +922,51 @@ mod tests {
             abbreviate_home_with(r"C:\Users\alex\proj", Some(r"C:\Users\alex")),
             "~/proj"
         );
+    }
+
+    #[test]
+    fn compact_search_preview_collapses_newlines() {
+        assert_eq!(
+            compact_search_preview("alpha\n\n  uniquecli\tbeta"),
+            "alpha uniquecli beta"
+        );
+    }
+
+    #[test]
+    fn empty_search_snippet_falls_back_to_message_text() {
+        let content = "Service returned uniquecli during credential validation.";
+        assert_eq!(
+            super::usable_search_snippet(Some("   "), content, "uniquecli", 200),
+            crate::parser::snippet_around_match(content, "uniquecli", 200)
+        );
+        assert_eq!(
+            super::usable_search_snippet(Some("matched uniquecli here"), content, "uniquecli", 200),
+            "matched uniquecli here"
+        );
+    }
+
+    #[test]
+    fn emphasize_search_preview_wraps_exact_query_tokens() {
+        let marked =
+            emphasize_search_preview("Fix uniquecli login in Waltham", "uniquecli WAL", true);
+        assert!(marked.contains("\x1b[1muniquecli\x1b[0m"), "{marked}");
+        assert!(
+            !marked.contains("\x1b[1mWaltham\x1b[0m"),
+            "must not treat WAL as a prefix of Waltham: {marked}"
+        );
+        assert_eq!(
+            emphasize_search_preview("Fix uniquecli login", "uniquecli", false),
+            "Fix uniquecli login"
+        );
+    }
+
+    #[test]
+    fn titles_and_previews_drop_terminal_controls() {
+        let injected = "hi\u{1b}]0;evil title\u{7} there";
+        assert_eq!(super::title_of(injected, "", 100), "hi there");
+        let preview = super::format_search_preview("x\u{1b}]52;c;AAAA\u{7}secret", "needle");
+        assert!(!preview.contains("]52"), "{preview:?}");
+        assert!(!preview.contains('\u{7}'), "{preview:?}");
+        assert!(preview.contains("xsecret"), "{preview}");
     }
 }

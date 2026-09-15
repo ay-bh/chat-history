@@ -160,21 +160,37 @@ pub fn index_quality_ok(results: &[IndexResult]) -> bool {
     }
 }
 
-pub(crate) fn parse_timeframe_duration(tf: &str) -> chrono::Duration {
+pub fn parse_timeframe_duration(tf: &str) -> Result<chrono::Duration, String> {
     let lower = tf.to_lowercase();
-    match lower.as_str() {
-        "today" | "1d" => chrono::Duration::days(1),
-        "yesterday" | "2d" => chrono::Duration::days(2),
-        "week" | "7d" => chrono::Duration::days(7),
-        "month" | "30d" => chrono::Duration::days(30),
+    let days = match lower.as_str() {
+        "today" | "1d" => 1,
+        "yesterday" | "2d" => 2,
+        "week" | "7d" => 7,
+        "month" | "30d" => 30,
         _ => {
-            if let Some(n) = lower.strip_suffix('d').and_then(|s| s.parse::<i64>().ok()) {
-                chrono::Duration::days(n)
-            } else {
-                chrono::Duration::days(365)
-            }
+            let Some(n) = lower.strip_suffix('d').and_then(|s| s.parse::<i64>().ok()) else {
+                return Err(format!(
+                    "invalid --timeframe '{tf}'; use today, yesterday, week, month, or Nd"
+                ));
+            };
+            n
         }
+    };
+    if !(1..=36_500).contains(&days) {
+        return Err(format!(
+            "invalid --timeframe '{tf}'; N in Nd must be between 1 and 36500"
+        ));
     }
+    chrono::Duration::try_days(days).ok_or_else(|| format!("invalid --timeframe '{tf}'"))
+}
+
+fn timeframe_cutoff_fixed(tf: &str) -> Option<DateTime<FixedOffset>> {
+    parse_timeframe_duration(tf).ok().map(|dur| {
+        Utc::now()
+            .checked_sub_signed(dur)
+            .unwrap_or(DateTime::<Utc>::MIN_UTC)
+            .fixed_offset()
+    })
 }
 
 fn parse_timestamp(ts: &str) -> Option<DateTime<FixedOffset>> {
@@ -187,10 +203,7 @@ pub(crate) fn direct_session_search(
     query: &str,
     timeframe: Option<&str>,
 ) -> Option<Vec<SearchResult>> {
-    let tf_cutoff: Option<DateTime<FixedOffset>> = timeframe.map(|tf| {
-        let dur = parse_timeframe_duration(tf);
-        (Utc::now() - dur).fixed_offset()
-    });
+    let tf_cutoff: Option<DateTime<FixedOffset>> = timeframe.and_then(timeframe_cutoff_fixed);
     // The direct lookup honors --timeframe the way the index title entry
     // does: a message inside the window, else the session's own activity
     // time; a session outside the window falls through to content search.
@@ -262,7 +275,7 @@ pub fn scored_search(
     if let Some(results) = direct_session_search(sessions, query, timeframe) {
         return results;
     }
-    let tf_cutoff = timeframe.map(|tf| (Utc::now() - parse_timeframe_duration(tf)).fixed_offset());
+    let tf_cutoff = timeframe.and_then(timeframe_cutoff_fixed);
 
     let boosts = semantic_boosts(query);
     let raw_words: Vec<String> = {
@@ -811,5 +824,28 @@ mod tests {
                 .any(|r| r.message.content.contains("mergeability")),
             "title-only hit should survive a covering timeframe"
         );
+    }
+
+    #[test]
+    fn parse_timeframe_duration_accepts_named_windows_and_nd() {
+        assert_eq!(
+            parse_timeframe_duration("today").unwrap(),
+            chrono::Duration::try_days(1).unwrap()
+        );
+        assert_eq!(
+            parse_timeframe_duration("7d").unwrap(),
+            chrono::Duration::try_days(7).unwrap()
+        );
+        assert_eq!(
+            parse_timeframe_duration("month").unwrap(),
+            chrono::Duration::try_days(30).unwrap()
+        );
+    }
+
+    #[test]
+    fn parse_timeframe_duration_rejects_overflow_and_junk() {
+        for tf in ["99999999999999d", "2weeks", "0d", "-5d", ""] {
+            assert!(parse_timeframe_duration(tf).is_err(), "{tf}");
+        }
     }
 }
