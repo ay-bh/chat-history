@@ -1,5 +1,6 @@
 use crate::parser::{
-    clean_first_prompt, clean_prompt, extract_text, is_clear_metadata, is_warmup_message,
+    clean_first_prompt, clean_prompt, extract_text, indexable_user_text, is_clear_metadata,
+    is_contextual_user_fragment, is_warmup_message, slash_command_text,
 };
 use chrono::{DateTime, FixedOffset, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
@@ -9,6 +10,10 @@ use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+// Catalog entry kind for cached transcript metadata. Bump when first-prompt or
+// title extraction changes so unchanged files are re-read, not served stale.
+const TRANSCRIPT_KIND: &str = "transcript-v2";
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct Session {
@@ -44,7 +49,7 @@ impl Session {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Message {
     #[allow(dead_code)]
     pub uuid: String,
@@ -490,6 +495,13 @@ fn claude_first_prompt(path: &Path) -> String {
             .cloned()
             .unwrap_or(Value::String(String::new()));
         let text = extract_text(&content);
+        let is_meta = entry.get("isMeta").and_then(Value::as_bool) == Some(true);
+        if let Some(command) = slash_command_text(&text) {
+            return command.chars().take(300).collect();
+        }
+        if is_meta {
+            continue;
+        }
         let cleaned = clean_prompt(&text);
         if !cleaned.is_empty() && !is_warmup_message(&cleaned) && !is_clear_metadata(&cleaned) {
             return cleaned.chars().take(300).collect();
@@ -642,7 +654,7 @@ pub fn load_claude_sessions() -> Vec<Session> {
                         continue;
                     }
                     let (cwd, branch, summary, first) =
-                        crate::catalog::read("claude", "transcript", &path, false, || {
+                        crate::catalog::read("claude", TRANSCRIPT_KIND, &path, false, || {
                             fs::File::open(&path).ok()?;
                             let (cwd, branch) = read_cwd_branch_from_jsonl(&path);
                             Some((
@@ -959,17 +971,35 @@ fn read_codex_meta(path: &Path) -> Option<CodexMeta> {
 // Codex injects system wrappers (environment, permissions, goal context,
 // aborted-turn markers, subagent notifications) as user-role messages.
 fn is_codex_noise(text: &str) -> bool {
-    let t = text.trim_start();
-    [
-        "<environment_context>",
-        "<permissions",
-        "<user_instructions>",
-        "<turn_aborted",
-        "<goal_context",
-        "<subagent_notification",
-    ]
-    .iter()
-    .any(|tag| t.starts_with(tag))
+    crate::parser::is_contextual_user_fragment(text)
+}
+
+fn extract_codex_user_text(content: &Value) -> String {
+    match content {
+        Value::String(s) => {
+            if is_contextual_user_fragment(s) {
+                String::new()
+            } else {
+                s.clone()
+            }
+        }
+        Value::Array(arr) => {
+            let mut parts = Vec::new();
+            for block in arr {
+                let Some(t) = block.get("text").and_then(Value::as_str) else {
+                    continue;
+                };
+                if is_contextual_user_fragment(t) {
+                    continue;
+                }
+                if !t.trim().is_empty() {
+                    parts.push(t.to_string());
+                }
+            }
+            parts.join("\n")
+        }
+        _ => extract_text(content),
+    }
 }
 
 fn codex_first_prompt(path: &Path) -> String {
@@ -1024,15 +1054,17 @@ pub fn load_codex_sessions() -> Vec<Session> {
         .flatten()
         .flatten()
     {
-        let Some((meta, first)) = crate::catalog::read("codex", "transcript", &path, false, || {
-            let meta = read_codex_meta(&path)?;
-            let first = if meta.is_subagent {
-                String::new()
-            } else {
-                codex_first_prompt(&path)
-            };
-            Some((meta, first))
-        }) else {
+        let Some((meta, first)) =
+            crate::catalog::read("codex", TRANSCRIPT_KIND, &path, false, || {
+                let meta = read_codex_meta(&path)?;
+                let first = if meta.is_subagent {
+                    String::new()
+                } else {
+                    codex_first_prompt(&path)
+                };
+                Some((meta, first))
+            })
+        else {
             continue;
         };
         if meta.is_subagent {
@@ -1283,9 +1315,15 @@ pub fn parse_claude_jsonl(
             .get("content")
             .cloned()
             .unwrap_or(Value::String(String::new()));
-        let text = extract_text(&content_raw);
+        let mut text = extract_text(&content_raw);
+        let is_meta = etype == "user" && entry.get("isMeta").and_then(Value::as_bool) == Some(true);
 
         if etype == "user" {
+            if let Some(command) = slash_command_text(&text) {
+                text = command;
+            } else if is_meta {
+                continue;
+            }
             user_texts.push(text.clone());
             if is_warmup_message(&text) {
                 skip_next_assistant = true;
@@ -1473,7 +1511,11 @@ pub fn parse_codex_jsonl(filepath: &str) -> Vec<Message> {
                     .get("content")
                     .cloned()
                     .unwrap_or(Value::String(String::new()));
-                let text = extract_text(&content_raw);
+                let text = if role == "user" {
+                    extract_codex_user_text(&content_raw)
+                } else {
+                    extract_text(&content_raw)
+                };
                 if text.trim().is_empty() || (role == "user" && is_codex_noise(&text)) {
                     continue;
                 }
@@ -1552,7 +1594,11 @@ pub fn parse_cursor_jsonl(filepath: &str) -> Vec<Message> {
             .get("content")
             .cloned()
             .unwrap_or(Value::String(String::new()));
-        let text = extract_text(&content_raw);
+        let text = if role == "user" {
+            indexable_user_text(&extract_text(&content_raw))
+        } else {
+            extract_text(&content_raw)
+        };
         let ctx = crate::parser::extract_context(&content_raw);
         if !role.is_empty() && !text.trim().is_empty() {
             messages.push(Message {
@@ -1788,6 +1834,7 @@ pub fn filter_sessions(
             }
             if let Some(src) = normalize_source_filter(source).as_deref()
                 && s.source != src
+                && !(src == "cursor-ide" && s.also_ide)
             {
                 return false;
             }
@@ -2673,6 +2720,69 @@ mod tests {
         let (messages, _) = parse_claude_jsonl(tmp.path().to_str().unwrap(), false);
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].content, "real question here");
+    }
+
+    #[test]
+    fn parse_claude_jsonl_skips_is_meta_but_keeps_slash_command_args() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let data = concat!(
+            r#"{"type":"user","isMeta":true,"message":{"role":"user","content":"Base directory for this skill\nhistory search skill body"},"uuid":"m0"}"#,
+            "\n",
+            r#"{"type":"user","message":{"role":"user","content":"<command-name>/code-review</command-name>\n<command-args>foo bar</command-args>"},"uuid":"m1"}"#,
+            "\n",
+            r#"{"type":"user","message":{"role":"user","content":"real authored prompt"},"uuid":"m2"}"#
+        );
+        std::fs::write(tmp.path(), data).unwrap();
+        let (messages, _) = parse_claude_jsonl(tmp.path().to_str().unwrap(), false);
+        let contents: Vec<_> = messages.iter().map(|m| m.content.as_str()).collect();
+        assert!(
+            !contents.iter().any(|c| c.contains("skill body")),
+            "{contents:?}"
+        );
+        assert!(contents.contains(&"/code-review foo bar"), "{contents:?}");
+        assert!(contents.contains(&"real authored prompt"), "{contents:?}");
+    }
+
+    #[test]
+    fn parse_claude_jsonl_keeps_tool_results_that_quote_command_tags() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let diff = "diff --git a/src/parser.rs b/src/parser.rs\n+    let args = between(\"<command-args>\", \"</command-args>\")?;\n+    uniquediffmarker";
+        let entry = serde_json::json!({
+            "type": "user", "uuid": "t1",
+            "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "x", "content": diff}
+            ]}
+        });
+        std::fs::write(tmp.path(), entry.to_string()).unwrap();
+        let (messages, _) = parse_claude_jsonl(tmp.path().to_str().unwrap(), false);
+        assert_eq!(messages.len(), 1);
+        assert!(
+            messages[0].content.contains("uniquediffmarker"),
+            "{}",
+            messages[0].content
+        );
+        assert!(claude_first_prompt(tmp.path()).contains("diff --git"));
+    }
+
+    #[test]
+    fn parse_cursor_jsonl_indexes_only_user_query() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let data = r#"{"role":"user","message":{"content":[{"type":"text","text":"<documentation_context>injected history</documentation_context><user_query>review the parser</user_query>"}]}}
+{"role":"assistant","message":{"content":[{"type":"text","text":"ok"}]}}"#;
+        std::fs::write(tmp.path(), data).unwrap();
+        let messages = parse_cursor_jsonl(tmp.path().to_str().unwrap());
+        assert_eq!(messages[0].content, "review the parser");
+        assert!(!messages[0].content.contains("injected history"));
+    }
+
+    #[test]
+    fn parse_codex_jsonl_drops_contextual_items_keeps_prompt() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let data = r#"{"type":"event_msg","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context><cwd>/p</cwd></environment_context>"},{"type":"input_text","text":"fix the flaky test"}]}}"#;
+        std::fs::write(tmp.path(), data).unwrap();
+        let messages = parse_codex_jsonl(tmp.path().to_str().unwrap());
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].content, "fix the flaky test");
     }
 
     #[test]

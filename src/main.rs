@@ -1,4 +1,5 @@
 use chat_history::dates::parse_human_date;
+use chat_history::search_index::{self, LegacyBackend, SearchBackend, SearchRequest};
 use chat_history::session::{
     self, ResumeAction, SessionLookup, filter_sessions, load_sessions, lookup_session,
     parse_session, session_copies,
@@ -6,6 +7,11 @@ use chat_history::session::{
 use chat_history::skill_install::{ensure_skills, install_skill};
 use chat_history::{display, inspect, scoring, search};
 use clap::{Parser, Subcommand};
+
+fn cli_timeframe(value: &str) -> Result<String, String> {
+    search::parse_timeframe_duration(value)?;
+    Ok(value.to_string())
+}
 
 #[derive(Parser)]
 #[command(
@@ -83,21 +89,39 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Search session content and metadata (add --deep --json from agents)
+    /// Search session content and metadata with BM25 relevance ranking
+    #[command(
+        after_help = "EXAMPLES:\n  chat-history search 'auth error' --json\n  chat-history search 'src/parser.rs' --scope files\n  chat-history search 'auth error' --engine legacy --deep\n\nExplicit flags override environment variables. BM25 searches transcripts by default."
+    )]
     Search {
         /// Search query, or a full session UUID for direct lookup
         query: String,
         /// What to search within transcripts
         #[arg(long, default_value = "all", value_parser = ["all", "errors", "similar", "tools", "files"])]
         scope: String,
-        /// Search full transcript content instead of the fast index
+        /// Search full transcript content with legacy (already enabled with BM25)
         #[arg(long)]
         deep: bool,
-        /// Maximum number of results
+        /// Ranking engine; legacy retains the previous metadata/deep search behavior
+        #[arg(long, env = "CHAT_HISTORY_SEARCH_ENGINE", default_value = "bm25", value_parser = ["bm25", "legacy"])]
+        engine: String,
+        /// Group hits by session or message (BM25 defaults to session; legacy/similar to message)
+        #[arg(long, env = "CHAT_HISTORY_SEARCH_GROUP_BY", value_parser = ["session", "message"])]
+        group_by: Option<String>,
+        /// Reparse all sessions and replace the BM25 index contents
+        #[arg(long, env = "CHAT_HISTORY_REBUILD_INDEX")]
+        rebuild_index: bool,
+        /// Directory for the disposable BM25 index (defaults to ~/.chat-history/cache)
+        #[arg(long, env = "CHAT_HISTORY_CACHE_DIR")]
+        cache_dir: Option<std::path::PathBuf>,
+        /// Build BM25 in memory; also enabled by CHAT_HISTORY_NO_CACHE
+        #[arg(long)]
+        no_cache: bool,
+        /// Maximum results (sessions when grouped, otherwise messages)
         #[arg(long, default_value_t = 15)]
         limit: usize,
-        /// Only messages newer than this (e.g. "2 days", "1 week")
-        #[arg(long)]
+        /// Only messages newer than today, week, month, or Nd (e.g. 7d)
+        #[arg(long, value_parser = cli_timeframe)]
         timeframe: Option<String>,
         /// Structured JSON output (session_id, score, snippet, tools, files)
         #[arg(long = "json")]
@@ -345,14 +369,35 @@ fn main() {
             | Some(Commands::Resume { .. })
             | Some(Commands::Find { .. })
     );
-    let mut sessions = if id_lookup {
+    let bm25_search =
+        matches!(&cli.command, Some(Commands::Search { engine, .. }) if engine == "bm25");
+    let mut sessions = if id_lookup || bm25_search {
         load_sessions(None)
     } else {
         load_sessions(cli.source.as_deref())
     };
+    // Stable collection statistics and freshness across project/source filters.
+    let search_corpus = bm25_search.then(|| sessions.clone());
     if !cli.sidechains {
         sessions.retain(|s| !s.is_sidechain);
     }
+    let source_filter = if bm25_search
+        && session::normalize_source_filter(cli.source.as_deref()).as_deref() == Some("cursor")
+    {
+        // Canonical discovery can replace a CLI metadata-only row with readable
+        // IDE bubbles. Preserve CLI membership independently of representation.
+        let agent_ids: std::collections::HashSet<String> = load_sessions(Some("cursor"))
+            .into_iter()
+            .map(|s| s.id.to_lowercase())
+            .collect();
+        sessions.retain(|s| {
+            s.source == "cursor"
+                || (s.source == "cursor-ide" && agent_ids.contains(&s.id.to_lowercase()))
+        });
+        None
+    } else {
+        cli.source.as_deref()
+    };
     let from_d = parse_date_arg(&cli.from_date);
     let to_d = parse_date_arg(&cli.to_date);
 
@@ -371,7 +416,7 @@ fn main() {
         from_d,
         to_d,
         cli.keyword.as_deref(),
-        cli.source.as_deref(),
+        source_filter,
         project_filter.as_deref(),
         cli.branch.as_deref(),
     );
@@ -381,13 +426,18 @@ fn main() {
             query,
             scope,
             deep,
+            engine,
+            group_by,
+            rebuild_index,
+            cache_dir,
+            no_cache,
             limit,
             timeframe,
             json_output,
         }) => {
             let pre = filtered;
 
-            if !deep && scope == "all" && !scoring::is_uuid(&query) {
+            if engine == "legacy" && !deep && scope == "all" && !scoring::is_uuid(&query) {
                 let idx_results = search::index_search(&pre, &query, limit);
                 if search::index_quality_ok(&idx_results) {
                     if json_output {
@@ -415,7 +465,39 @@ fn main() {
             {
                 eprintln!("No session with that ID — searching transcripts...");
             }
-            let results = search::scored_search(&pre, &query, &scope, limit, timeframe.as_deref());
+            let request = SearchRequest {
+                sessions: &pre,
+                query: &query,
+                scope: &scope,
+                limit,
+                timeframe: timeframe.as_deref(),
+                group_by_session: group_by
+                    .as_deref()
+                    .map_or(engine == "bm25" && scope != "similar", |value| {
+                        value == "session"
+                    }),
+            };
+            let result = if engine == "legacy" || scope == "similar" {
+                LegacyBackend.search(&request)
+            } else {
+                let directory = if no_cache || std::env::var_os("CHAT_HISTORY_NO_CACHE").is_some() {
+                    None
+                } else {
+                    cache_dir
+                        .filter(|p| !p.as_os_str().is_empty())
+                        .or_else(search_index::default_index_dir)
+                };
+                search_index::search_corpus(
+                    search_corpus.as_deref().unwrap_or(&sessions),
+                    &request,
+                    directory.as_deref(),
+                    rebuild_index,
+                )
+            };
+            let results = result.unwrap_or_else(|error| {
+                eprintln!("Search failed: {error}");
+                std::process::exit(1);
+            });
             if scoring::is_uuid(&query)
                 && timeframe.is_some()
                 && results.is_empty()

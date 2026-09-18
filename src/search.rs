@@ -19,6 +19,36 @@ pub struct IndexResult {
 pub struct SearchResult {
     pub session: Session,
     pub message: Message,
+    /// Match-aware excerpt from the ranked passage, when the backend provides it.
+    pub snippet: Option<String>,
+    /// Up to two further matches when the request groups by conversation.
+    pub additional_matches: Vec<SearchMatch>,
+}
+
+pub struct SearchMatch {
+    pub message: Message,
+    pub snippet: Option<String>,
+}
+
+/// Preserve first-hit order while collapsing message results into conversations.
+pub fn group_results(results: Vec<SearchResult>, limit: usize) -> Vec<SearchResult> {
+    let mut groups: HashMap<(String, String), usize> = HashMap::new();
+    let mut grouped: Vec<SearchResult> = Vec::new();
+    for hit in results {
+        let key = (hit.session.source.clone(), hit.session.id.to_lowercase());
+        if let Some(&index) = groups.get(&key) {
+            if grouped[index].additional_matches.len() < 2 {
+                grouped[index].additional_matches.push(SearchMatch {
+                    message: hit.message,
+                    snippet: hit.snippet,
+                });
+            }
+        } else if grouped.len() < limit {
+            groups.insert(key, grouped.len());
+            grouped.push(hit);
+        }
+    }
+    grouped
 }
 
 pub fn index_search(sessions: &[Session], query: &str, limit: usize) -> Vec<IndexResult> {
@@ -130,43 +160,50 @@ pub fn index_quality_ok(results: &[IndexResult]) -> bool {
     }
 }
 
-fn parse_timeframe_duration(tf: &str) -> chrono::Duration {
+pub fn parse_timeframe_duration(tf: &str) -> Result<chrono::Duration, String> {
     let lower = tf.to_lowercase();
-    match lower.as_str() {
-        "today" | "1d" => chrono::Duration::days(1),
-        "yesterday" | "2d" => chrono::Duration::days(2),
-        "week" | "7d" => chrono::Duration::days(7),
-        "month" | "30d" => chrono::Duration::days(30),
+    let days = match lower.as_str() {
+        "today" | "1d" => 1,
+        "yesterday" | "2d" => 2,
+        "week" | "7d" => 7,
+        "month" | "30d" => 30,
         _ => {
-            if let Some(n) = lower.strip_suffix('d').and_then(|s| s.parse::<i64>().ok()) {
-                chrono::Duration::days(n)
-            } else {
-                chrono::Duration::days(365)
-            }
+            let Some(n) = lower.strip_suffix('d').and_then(|s| s.parse::<i64>().ok()) else {
+                return Err(format!(
+                    "invalid --timeframe '{tf}'; use today, yesterday, week, month, or Nd"
+                ));
+            };
+            n
         }
+    };
+    if !(1..=36_500).contains(&days) {
+        return Err(format!(
+            "invalid --timeframe '{tf}'; N in Nd must be between 1 and 36500"
+        ));
     }
+    chrono::Duration::try_days(days).ok_or_else(|| format!("invalid --timeframe '{tf}'"))
+}
+
+fn timeframe_cutoff_fixed(tf: &str) -> Option<DateTime<FixedOffset>> {
+    parse_timeframe_duration(tf).ok().map(|dur| {
+        Utc::now()
+            .checked_sub_signed(dur)
+            .unwrap_or(DateTime::<Utc>::MIN_UTC)
+            .fixed_offset()
+    })
 }
 
 fn parse_timestamp(ts: &str) -> Option<DateTime<FixedOffset>> {
     crate::session::parse_any_timestamp(ts)
 }
 
-pub fn scored_search(
+/// Resolve exact session identities before either lexical engine runs.
+pub(crate) fn direct_session_search(
     sessions: &[Session],
     query: &str,
-    scope: &str,
-    limit: usize,
     timeframe: Option<&str>,
-) -> Vec<SearchResult> {
-    // On a UUID-shaped query try a direct session-id lookup first; on miss,
-    // fall through to content search so a UUID that was discussed inside a
-    // conversation is still findable.
-    // With --timeframe the stub has no message time to filter on, so the
-    // query goes through content search like everything else.
-    let tf_cutoff: Option<DateTime<FixedOffset>> = timeframe.map(|tf| {
-        let dur = parse_timeframe_duration(tf);
-        (Utc::now() - dur).fixed_offset()
-    });
+) -> Option<Vec<SearchResult>> {
+    let tf_cutoff: Option<DateTime<FixedOffset>> = timeframe.and_then(timeframe_cutoff_fixed);
     // The direct lookup honors --timeframe the way the index title entry
     // does: a message inside the window, else the session's own activity
     // time; a session outside the window falls through to content search.
@@ -181,10 +218,12 @@ pub fn scored_search(
         };
         if let Some(mut msg) = messages.into_iter().find(|m| in_window(&m.timestamp)) {
             msg.final_score = 100.0;
-            return vec![SearchResult {
+            return Some(vec![SearchResult {
                 session: s.clone(),
                 message: msg,
-            }];
+                snippet: None,
+                additional_matches: Vec::new(),
+            }]);
         }
         let activity = if s.modified.is_empty() {
             &s.created
@@ -209,14 +248,34 @@ pub fn scored_search(
                 relevance_score: 0.0,
                 final_score: 100.0,
             };
-            return vec![SearchResult {
+            return Some(vec![SearchResult {
                 session: s.clone(),
                 message: stub,
-            }];
+                snippet: None,
+                additional_matches: Vec::new(),
+            }]);
         }
         // Outside the window, content search may still find the id quoted in
         // another, recent conversation.
     }
+
+    None
+}
+
+pub fn scored_search(
+    sessions: &[Session],
+    query: &str,
+    scope: &str,
+    limit: usize,
+    timeframe: Option<&str>,
+) -> Vec<SearchResult> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    if let Some(results) = direct_session_search(sessions, query, timeframe) {
+        return results;
+    }
+    let tf_cutoff = timeframe.and_then(timeframe_cutoff_fixed);
 
     let boosts = semantic_boosts(query);
     let raw_words: Vec<String> = {
@@ -472,7 +531,12 @@ pub fn scored_search(
     final_results.truncate(limit);
     final_results
         .into_iter()
-        .map(|(session, message)| SearchResult { session, message })
+        .map(|(session, message)| SearchResult {
+            session,
+            message,
+            snippet: None,
+            additional_matches: Vec::new(),
+        })
         .collect()
 }
 
@@ -760,5 +824,28 @@ mod tests {
                 .any(|r| r.message.content.contains("mergeability")),
             "title-only hit should survive a covering timeframe"
         );
+    }
+
+    #[test]
+    fn parse_timeframe_duration_accepts_named_windows_and_nd() {
+        assert_eq!(
+            parse_timeframe_duration("today").unwrap(),
+            chrono::Duration::try_days(1).unwrap()
+        );
+        assert_eq!(
+            parse_timeframe_duration("7d").unwrap(),
+            chrono::Duration::try_days(7).unwrap()
+        );
+        assert_eq!(
+            parse_timeframe_duration("month").unwrap(),
+            chrono::Duration::try_days(30).unwrap()
+        );
+    }
+
+    #[test]
+    fn parse_timeframe_duration_rejects_overflow_and_junk() {
+        for tf in ["99999999999999d", "2weeks", "0d", "-5d", ""] {
+            assert!(parse_timeframe_duration(tf).is_err(), "{tf}");
+        }
     }
 }

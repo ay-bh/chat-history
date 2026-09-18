@@ -18,7 +18,7 @@ Search, inspect, and export Claude Code, Cursor, and Codex conversation history.
 
 **Keyword question** ("find that conversation where I..."):
 
-1. `chat-history search "<query>" --deep --json` — always `--deep --json` from agents. `--deep` searches full transcript content; `--json` returns structured results (`session_id`, `score`, `snippet`, `tools`, `files`). Note `--json` exists only on `search`.
+1. `chat-history search "<query>" --deep --json` — always `--deep --json` from agents. BM25 searches metadata and transcripts together by default (`--deep` is a no-op for that engine); `--deep` still forces transcript search if the legacy engine is selected; `--json` returns structured results (`session_id`, `score`, `snippet`, `tools`, `files`, `additional_matches`). Note `--json` exists only on `search`.
 2. Shortlist by snippet, not by raw score (see "Choosing the best hit").
 3. `chat-history inspect <partial-uuid>` on the top 2–3 candidates to confirm before answering.
 4. `view` / `export` only if the user needs the actual content.
@@ -32,7 +32,8 @@ Search, inspect, and export Claude Code, Cursor, and Codex conversation history.
 
 ## Choosing the best hit
 
-- Scores rank keyword density, not intent. Use scores only to shortlist; decide from snippets and `inspect`.
+- Scores rank lexical relevance (BM25 by default), not intent. They are not confidence values or comparable across queries or engines. Use scores only to shortlist; decide from snippets and `inspect`.
+- BM25 groups matches by conversation: `--limit` counts conversations, `snippet` follows the strongest matching passage, and `additional_matches` contains up to two more excerpts. Read these before inspecting the session. Use `--group-by message` if individual matching messages are needed; legacy and `--scope similar` retain their previous message-row default.
 - The conversation you are currently in can match its own query and score highest. Ignore hits whose session is the current one.
 - When candidates are close, `inspect` each before picking — don't answer from the top score alone.
 
@@ -41,7 +42,7 @@ Search, inspect, and export Claude Code, Cursor, and Codex conversation history.
 - Only `search` accepts `--json`; the session list and `inspect` reject it.
 - The subcommands are `search`, `inspect`, `view`, `export`, `resume`, `find`, `install-skill`, `completions`, and the optional `cursor-hook` receiver. Do not guess others; run `chat-history --help` when unsure. `cursor-hook` is for configured Cursor hooks, not normal history queries.
 - Cursor CLI rows labeled `[metadata only]` support `find`, `resume`, and title search when Cursor recorded a title (print-mode chats usually have none); their internal `store.db` cannot be viewed or exported as a transcript. Do not claim that metadata-only search covers message content.
-- Cursor message timestamps may be unavailable. `search --deep --timeframe` excludes unknown message times (without `--deep`, the index shortcut ignores `--timeframe`); use session `--from` / `--to` filters for activity-date questions. File modification times are not message timestamps.
+- Cursor message timestamps may be unavailable. `search --timeframe` excludes unknown message times and untimed first-prompt previews. Titles use session activity times. With `--engine legacy`, add `--deep` to bypass its metadata shortcut; use session `--from` / `--to` filters for activity-date questions. File modification times are not message timestamps.
 - Don't dump raw JSON or full transcripts at the user — summarize, cite the session ID and date (or title + directory for `cursor-ide`).
 - `cursor-ide` rows (and `--json` items with `"also_ide": true`) resume only when the Agent CLI has a `~/.cursor/chats` store for the id; otherwise `resume` prints a sidebar hint instead of launching the Agent CLI. Run `resume` and follow its output rather than assuming.
 - Some Cursor sessions have thin metadata (`(no summary)`, `duration: 0min`, raw first-message titles). If `inspect` is thin, fall back to `chat-history view <id> --plain`.
@@ -62,6 +63,7 @@ chat-history search "auth error" --deep --json
 chat-history search "fix" --scope errors --deep --json   # only messages with error patterns
 chat-history search <full-uuid>                          # direct session lookup (with --timeframe: only if active in the window)
 chat-history search "q" --deep --json --limit 30         # default limit is 15
+chat-history search "auth error" --engine legacy --deep --json  # compare previous ranking
 
 # Inspect / View / Export / Resume / Find
 chat-history inspect --last                # accomplishments, tools, model, tokens, files
@@ -79,6 +81,6 @@ chat-history completions zsh               # shell completions (bash/zsh/fish/el
 ## Interpreting output
 
 - Display tags: `claude` = Claude Code, `cursor-ide` = Cursor IDE sidebar (SQLite; IDE Agent also writes jsonl with the same id — still listed once as `cursor-ide`), `cursor-agent` = Agent CLI / jsonl-only, `codex` = Codex; `★ N.N` = relevance score. `--source cursor` / `cursor-agent` = Agent transcripts plus CLI chat metadata and hook-registered paths; `--source cursor-ide` = SQLite.
-- Header line has `DIR:` (spawn directory) and, for index search, `INDEX_FIELD:` (`summary` / `first_prompt` / `branch`). Title is on the next line. Pass the short ID to `find` for any row and to `inspect` / `view` / `export` for rows with a transcript (`[metadata only]` rows refuse those three), and to `resume` for `claude` / `codex` rows and any Cursor row whose id has a `~/.cursor/chats` store. Cursor rows without one are found in the sidebar by title + `DIR:`.
+- Header line has `DIR:` (spawn directory) and, for legacy metadata search, `INDEX_FIELD:` (`summary` / `first_prompt` / `branch`). Title is on the next line. Pass the short ID to `find` for any row and to `inspect` / `view` / `export` for rows with a transcript (`[metadata only]` rows refuse those three), and to `resume` for `claude` / `codex` rows and any Cursor row whose id has a `~/.cursor/chats` store. Cursor rows without one are found in the sidebar by title + `DIR:`.
 - `COPIES: N` means the same Cursor Agent session id exists in more than one project folder; `inspect`/`resume`/`find` pick one copy (cwd match, else newest) and print the others.
 - Accepted dates: `YYYY-MM-DD`, `today`, `yesterday`, `"3 days ago"`, `"last week"`, `"last month"`.

@@ -327,6 +327,47 @@ fn ide_db_with_bubble(tmp: &TempDir, with_bubble: bool) {
 }
 
 #[test]
+fn bm25_ide_filter_includes_merged_agent_transcripts() {
+    let tmp = TempDir::new().unwrap();
+    transcript(&tmp, true);
+    ide_db_with_bubble(&tmp, true);
+    let output = command(&tmp)
+        .args(["search", "uniquecache", "--source", "cursor-ide", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(result["count"].as_u64().unwrap() > 0);
+    assert_eq!(result["results"][0]["session_id"], ID);
+    assert_eq!(result["results"][0]["also_ide"], true);
+}
+
+#[test]
+fn bm25_agent_filter_keeps_cli_stores_merged_into_readable_ide_rows() {
+    let tmp = TempDir::new().unwrap();
+    cli_store(&tmp, true);
+    ide_db_with_bubble(&tmp, true);
+    let output = command(&tmp)
+        .args([
+            "search",
+            "uniquecache",
+            "--source",
+            "cursor-agent",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(result["count"].as_u64().unwrap() > 0);
+    assert_eq!(result["results"][0]["session_id"], ID);
+}
+
+#[test]
 fn store_only_chat_with_ide_bubbles_still_resumes() {
     // No transcript, but a CLI store and IDE bubbles: the row lists as
     // cursor-ide, and the store still wins for resume.
