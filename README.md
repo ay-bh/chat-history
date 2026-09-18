@@ -190,9 +190,7 @@ The first search indexes discovered history; later searches validate source fing
 
 Select the previous ranking with `--engine legacy` or `CHAT_HISTORY_SEARCH_ENGINE=legacy`. Explicit flags override environment values. `CHAT_HISTORY_CACHE_DIR` selects the cache location, `CHAT_HISTORY_NO_CACHE=1` bypasses both disk caches, and `CHAT_HISTORY_REBUILD_INDEX=true` forces a search-index refresh. A search-local `--cache-dir` overrides the BM25 directory only; `--no-cache` builds BM25 in memory. Unavailable, corrupt, or write-locked search caches fall back to in-memory BM25 with a stderr warning.
 
-See the [real-history binary comparison](docs/search-evaluation.md) and [follow-up improvements and semantic experiment](docs/search-improvements.md) for measured relevance, latency and remaining limitations.
-
-[Architecture, research sources, and validation](docs/search-architecture.md). [Implementation review and fixes](docs/search-review.md).
+See [docs/search-architecture.md](docs/search-architecture.md) for the design, research sources, and validation.
 
 **Legacy metadata:** field-weighted — summary 3×, first prompt 2×, branch/project 1× — with recency multipliers (3× today / 2× week / 1.5× month). AND across query words.
 

@@ -251,8 +251,7 @@ limits, filtering and score stability, timestamp provenance, scopes, persistent
 refresh/rebuild/deletion, WAL-only edits, cache failures, UUIDs and CLI selection.
 Follow-up tests cover winning-passage excerpts, coverage and phrase ordering,
 group filling and JSON children, unrelated Cursor writes, same-size WAL changes,
-and atomic database replacement. See [follow-up measurements](search-improvements.md)
-for verification after each improvement and a local dense/hybrid/reranker trial.
+and atomic database replacement.
 The original CLI and Cursor reliability suites exercise the new default; the two
 metadata-output contract tests explicitly select the legacy engine.
 
