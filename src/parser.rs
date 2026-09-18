@@ -260,7 +260,12 @@ pub fn is_noise(text: &str) -> bool {
 }
 
 /// `<command-name>/x</command-name>…<command-args>y</command-args>` → "/x y".
+/// Only an entry that is itself the harness wrapper counts: tool results and
+/// pasted diffs that merely quote these tags keep their full text.
 pub fn slash_command_text(text: &str) -> Option<String> {
+    if !text.trim_start().starts_with("<command-") {
+        return None;
+    }
     let between = |open: &str, close: &str| {
         let start = text.find(open)? + open.len();
         let end = start + text[start..].find(close)?;
@@ -699,6 +704,13 @@ mod tests {
         assert_eq!(
             slash_command_text("<command-name>/x</command-name>").as_deref(),
             None
+        );
+        // A tool result or diff quoting the wrapper is ordinary content.
+        let quoted = format!("diff --git a/x b/x\n+{text}\n context");
+        assert_eq!(slash_command_text(&quoted), None);
+        assert_eq!(
+            slash_command_text(&format!("\n  {text}")).as_deref(),
+            Some("/code-review foo bar")
         );
     }
 

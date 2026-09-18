@@ -129,6 +129,101 @@ fn grouping_fills_distinct_sessions_and_keeps_additional_matches() {
 }
 
 #[test]
+fn title_and_prompt_rows_do_not_crowd_out_deeper_matches() {
+    let tmp = TempDir::new().unwrap();
+    let mut session = transcript(
+        &tmp,
+        "echo",
+        &[
+            "Don't use zebrahooks here",
+            "second zebrahooks detail about retries",
+            "third zebrahooks detail about timeouts",
+        ],
+    );
+    session.summary = "Don't use zebrahooks here".into();
+    session.first_prompt = "don't use zebrahooks here".into();
+    let corpus = vec![session];
+    let mut index = Bm25Backend::open(None).unwrap();
+    index.sync(&corpus, false).unwrap();
+    for group_by_session in [true, false] {
+        let hits = index
+            .search(&SearchRequest {
+                sessions: &corpus,
+                query: "zebrahooks",
+                scope: "all",
+                limit: 5,
+                timeframe: None,
+                group_by_session,
+            })
+            .unwrap();
+        let mut shown: Vec<_> = hits
+            .iter()
+            .flat_map(|hit| {
+                std::iter::once(&hit.message)
+                    .chain(hit.additional_matches.iter().map(|m| &m.message))
+            })
+            .map(|m| (m.uuid.as_str(), m.content.as_str()))
+            .collect();
+        shown.sort();
+        assert_eq!(
+            shown,
+            [
+                ("m0", "Don't use zebrahooks here"),
+                ("m1", "second zebrahooks detail about retries"),
+                ("m2", "third zebrahooks detail about timeouts"),
+            ],
+            "grouped={group_by_session}"
+        );
+    }
+}
+
+#[test]
+fn a_real_message_replaces_its_own_synthetic_echo_not_the_title() {
+    let tmp = TempDir::new().unwrap();
+    let mut session = transcript(
+        &tmp,
+        "titled",
+        &[
+            "Don't use zebrahooks here",
+            "second zebrahooks detail about retries",
+            "third zebrahooks detail about timeouts",
+        ],
+    );
+    // An AI-written title that differs from the first prompt.
+    session.summary = "Zebrahooks migration plan".into();
+    session.first_prompt = "don't use zebrahooks here".into();
+    let corpus = vec![session];
+    let mut index = Bm25Backend::open(None).unwrap();
+    index.sync(&corpus, false).unwrap();
+    for group_by_session in [true, false] {
+        let hits = index
+            .search(&SearchRequest {
+                sessions: &corpus,
+                query: "zebrahooks",
+                scope: "all",
+                limit: 5,
+                timeframe: None,
+                group_by_session,
+            })
+            .unwrap();
+        let mut shown: Vec<_> = hits
+            .iter()
+            .flat_map(|hit| {
+                std::iter::once(&hit.message)
+                    .chain(hit.additional_matches.iter().map(|m| &m.message))
+            })
+            .map(|m| m.uuid.as_str())
+            .collect();
+        shown.sort();
+        assert_eq!(
+            shown,
+            ["index-title", "m0", "m1"],
+            "grouped={group_by_session}"
+        );
+    }
+}
+
+#[test]
 fn identical_text_in_two_sessions_stays_two_conversations() {
     let tmp = TempDir::new().unwrap();
     let shared = "Service returned error SHAREDCODE during credential validation.";
@@ -984,6 +1079,60 @@ fn corrupt_cache_falls_back_without_changing_search_results() {
         "{}",
         String::from_utf8_lossy(&broken.stderr)
     );
+}
+
+#[test]
+fn corruption_outside_the_sessions_table_is_repaired_once() {
+    let tmp = TempDir::new().unwrap();
+    cli_fixture(&tmp);
+    let dir = tmp.path().join("index");
+    let run = || {
+        command(&tmp)
+            .env("CHAT_HISTORY_CACHE_DIR", &dir)
+            .args(["search", "uniquecli", "--json"])
+            .output()
+            .unwrap()
+    };
+    let healthy = run();
+    assert!(healthy.status.success());
+    // The sessions table stays readable; only the FTS segments are damaged.
+    let conn = rusqlite::Connection::open(dir.join(INDEX_FILENAME)).unwrap();
+    conn.execute("DELETE FROM passages_fts_data WHERE id > 10", [])
+        .unwrap();
+    drop(conn);
+    let broken = run();
+    let stderr = String::from_utf8_lossy(&broken.stderr).to_string();
+    assert!(broken.status.success(), "{stderr}");
+    assert_eq!(broken.stdout, healthy.stdout);
+    assert!(stderr.contains("resetting it in place"), "{stderr}");
+    let repaired = run();
+    let stderr = String::from_utf8_lossy(&repaired.stderr).to_string();
+    assert_eq!(repaired.stdout, healthy.stdout);
+    assert!(
+        !stderr.contains("Warning"),
+        "cache was not repaired: {stderr}"
+    );
+}
+
+#[test]
+fn readable_transcripts_without_messages_are_not_reparsed_every_search() {
+    let tmp = TempDir::new().unwrap();
+    let session = transcript(&tmp, "empty", &[]);
+    fs::write(&session.file, "{\"type\":\"turn_ended\"}\n").unwrap();
+    // Match the shared metadata cache's conservative two-second racy window.
+    std::thread::sleep(std::time::Duration::from_millis(2100));
+    let corpus = vec![session];
+    let dir = tmp.path().join("index");
+    let mut index = Bm25Backend::open(Some(&dir)).unwrap();
+    index.sync(&corpus, false).unwrap();
+    drop(index);
+    // A null signature never matches, so the session is parsed on every sync.
+    let stamp: String = rusqlite::Connection::open(dir.join(INDEX_FILENAME))
+        .unwrap()
+        .query_row("SELECT fingerprint FROM sessions", [], |r| r.get(0))
+        .unwrap();
+    let stamp: serde_json::Value = serde_json::from_str(&stamp).unwrap();
+    assert!(stamp["signature"].is_string(), "{stamp}");
 }
 
 #[test]

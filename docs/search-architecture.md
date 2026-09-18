@@ -128,15 +128,18 @@ are treated as an unavailable cache, not an empty corpus.
   enrichment profile remain fingerprinted.
 - Stable database/WAL observations allow digest reuse. After a shared-database
   change, hashes are recomputed and only changed conversations are parsed.
-  Updating the observation alone does not replace postings. This still reads
+  Updating the observation alone does not replace postings: an unchanged
+  conversation has its stored observation refreshed in one best-effort write, so
+  later searches reuse the digest until the database changes again. This still reads
   conversation bytes; it is not a change feed. Cached read connections reopen
   when the database file identity changes, including atomic replacement on Unix.
 - Fingerprints are versioned objects. Older serialized arrays cause a one-time
   conservative refresh; identical extracted payloads can still retain postings.
 - Stable unchanged sessions skip transcript parsing. Changed sources are checked
   before and after parsing. Unstable or failed reads are retried next invocation.
-  Empty transcript parses also retry, except for deliberately metadata-only CLI
-  stores whose empty message list is legitimate.
+  Empty parses of SQLite-backed sources also retry. An empty parse is kept for
+  deliberately metadata-only CLI stores and for plain transcript files that read
+  cleanly from start to end (for example a lone `turn_ended` record).
 - Changed sources parse in parallel batches of at most eight sessions using the
   existing Rayon pool. Index writes stay serial and transactional. This bounds
   the number of parsed transcripts held at once, though an individual transcript
@@ -148,22 +151,28 @@ are treated as an unavailable cache, not an empty corpus.
 - Sessions absent from the discovery snapshot are removed from this disposable
   index. An unavailable source may therefore be indexed again when it returns;
   its original files are never changed.
-- WAL supports concurrent readers. The CLI holds synchronization and retrieval
-  in one transaction, so another profile's refresh cannot replace its corpus
-  between those steps. Updates publish together. Lock contention or an unreadable/
-  corrupt cache causes an in-memory BM25 rebuild with a stderr warning. If only
-  the final cache commit fails, already computed results are still returned.
+- WAL supports concurrent readers. Synchronization commits before retrieval so
+  a write lock is not held across ranking. Another profile that replaces the
+  cached corpus between those steps is retried, then falls back to in-memory
+  BM25. Lock contention or an unreadable/corrupt cache also causes an in-memory
+  rebuild with a stderr warning. If a cache write cannot be saved, search still
+  returns results from an ephemeral index.
 - `CHAT_HISTORY_NO_CACHE=1` bypasses both disk caches. `search --no-cache` bypasses
   the search index only. New directories/files use Unix modes 0700/0600.
-- `--rebuild-index` reparses all sessions in a usable index. A corrupt database
-  still falls back to memory; removing the disposable search database and its
-  sidecars while no searches run allows the next search to recreate it.
+- `--rebuild-index` reparses all sessions in a usable index. A database that
+  reports corruption while opening, synchronizing or matching is reset in place
+  once per invocation and refilled, unless `quick_check` and the FTS
+  `integrity-check` show that another process already repaired it. The file is
+  never unlinked. If the reset fails, search falls back to memory.
 
 ### Query and ranking policy
 
 Input is plain text. Whitespace-delimited chunks are deduplicated and safely
-quoted, including embedded quotation marks. Unicode61 analyzes both indexed
-text and query chunks, preserving combining characters. Punctuation separates
+quoted, including embedded quotation marks. At most 128 distinct chunks or
+analyzer tokens become clauses, so a pasted log cannot build an unbounded
+expression. Unicode61 analyzes both indexed
+text and query chunks with `remove_diacritics 2`, so composed and combining
+diacritics fold to the same tokens. Punctuation separates
 identifier/path components inside one adjacent token sequence, so a filename
 query does not become a broad OR over `src`, a basename and an extension.
 Chunks with at least two alphanumeric characters match both the exact sequence
@@ -171,8 +180,7 @@ and a prefix of their final token. Exact matches contribute their own IDF in
 addition to the prefix contribution, so `WAL` has an advantage over `wall` or
 `Waltham`. Single-character chunks use exact matching. Chunks are ORed for recall. There is
 no executable FTS syntax, stopword list, hardcoded technology vocabulary,
-stemming, typo correction or arbitrary infix matching. More than 64 distinct
-chunks is an actionable input error.
+stemming, typo correction or arbitrary infix matching.
 
 Field weights are content 1, title 3, first prompt 2, project/branch 0.5. Use
 BM25's length normalization over passages. The positive BM25 score is multiplied
@@ -187,8 +195,9 @@ values to zero. Scores are ranking signals, not probabilities.
 
 Source selection and timestamp/scope predicates are applied before consuming the
 ranked stream. Duplicate passage IDs and identical trimmed message text/role/
-tool/file tuples are collapsed without erasing numbers, case, quotes or suffixes.
-At most three messages per source/session ID are accepted across file copies.
+tool/file tuples are collapsed within a conversation without erasing numbers,
+case, quotes or suffixes. The same text in another session remains a separate
+hit. At most three messages per source/session ID are accepted across file copies.
 BM25 defaults to one result per logical conversation, with the highest-ranked
 message first and up to two additional matches. The limit counts conversations;
 `--group-by message` restores individual message rows. No fixed candidate cutoff
@@ -197,6 +206,11 @@ the stream to find children for selected groups, stopping when each selected
 group has three matches or the stream is exhausted. Sparse groups can therefore
 require traversing the full ranked stream, although accepted hydration is capped
 at three messages per group (duplicate payload checks can add hydration).
+The synthetic title and prompt rows usually repeat the first user message. Within
+a conversation a synthetic row whose cleaned text is a prefix of (or prefixed by)
+an accepted user message or other synthetic row is dropped, and a user message
+that arrives after its synthetic echo replaces it at the same rank, so one
+sentence cannot occupy all three slots.
 `--source cursor-ide` includes canonical Agent transcript rows marked `also_ide`.
 `--source cursor-agent` also retains CLI stores represented by readable IDE rows;
 that selection performs a separate cached Agent membership discovery.
@@ -221,7 +235,13 @@ that selection performs a separate cached Agent membership discovery.
   top-k retrieval, native code tokenizers and semantic fusion should follow
   measurements and relevance judgments, not be added preemptively.
 - Source parsers currently expose empty results rather than structured read
-  errors. Empty parses are therefore not trusted as durable cache hits.
+  errors. Empty parses are therefore trusted only for plain files that were
+  re-read successfully, never for SQLite-backed sources.
+- A shared Cursor database has no change feed. While Cursor is writing to it,
+  each search after a write re-hashes every dependent conversation (about one
+  second for 620 conversations on a 3.4 GB store) before the digests are reused.
+- FTS damage that raises no SQLite error (a segment that decodes to nothing) is
+  not detected at query time; `--rebuild-index` repairs it.
 
 ## Validation
 

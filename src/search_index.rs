@@ -22,7 +22,7 @@ pub type Result<T> = std::result::Result<T, SearchError>;
 pub const INDEX_FILENAME: &str = "search-v1.db";
 // Bump for parser, timestamp, chunking or tokenization changes that require
 // re-extracting unchanged sources without changing the relational schema.
-const EXTRACTION_VERSION: u32 = 2;
+const EXTRACTION_VERSION: u32 = 3;
 const MAX_ANALYZER_TOKENS: usize = 128;
 const MAX_PHRASE_TOKENS: usize = 32;
 const MAX_PASSAGE_CHARS: usize = 1600;
@@ -138,20 +138,26 @@ fn is_corrupt(error: &SearchError) -> bool {
         .is_some_and(|code| matches!(code, ErrorCode::NotADatabase | ErrorCode::DatabaseCorrupt))
 }
 
+/// Another process may already have reset and refilled the cache, so only a
+/// database that still fails its checks is wiped. Damage is not confined to
+/// `sessions`: the passage b-tree and the FTS segments are probed as well.
+fn cache_is_healthy(conn: &Connection) -> bool {
+    let ok = |sql: &str| conn.query_row(sql, [], |r| r.get::<_, String>(0));
+    conn.query_row("SELECT count(*) FROM sessions", [], |r| r.get::<_, i64>(0))
+        .is_ok()
+        && ok("PRAGMA quick_check(1)").is_ok_and(|v| v == "ok")
+        && conn
+            .execute(
+                "INSERT INTO passages_fts(passages_fts) VALUES ('integrity-check')",
+                [],
+            )
+            .is_ok()
+}
+
 fn reset_in_place(dir: &Path) -> Result<()> {
     let conn = Connection::open(dir.join(INDEX_FILENAME))?;
     conn.busy_timeout(BUSY_TIMEOUT)?;
-    if conn
-        .query_row(
-            "SELECT count(*) FROM sqlite_schema WHERE name = 'sessions'",
-            [],
-            |r| r.get::<_, i64>(0),
-        )
-        .is_ok_and(|n| n == 1)
-        && conn
-            .query_row("SELECT count(*) FROM sessions", [], |r| r.get::<_, i64>(0))
-            .is_ok()
-    {
+    if cache_is_healthy(&conn) {
         return Ok(());
     }
     conn.set_db_config(
@@ -274,6 +280,15 @@ pub fn search_corpus(
                     return memory_search(corpus, request, rebuild, &mut last_progress);
                 }
             },
+            Err(error) if is_corrupt(&error) && !reset_done => {
+                // Damaged postings surface at MATCH time, after a clean sync.
+                reset_done = true;
+                drop(backend);
+                eprintln!("Warning: search cache is corrupt ({error}); resetting it in place.");
+                if let Err(e) = reset_in_place(dir) {
+                    eprintln!("Warning: search cache reset failed ({e}).");
+                }
+            }
             Err(error) => {
                 eprintln!(
                     "Warning: search cache query failed ({error}); searching with an in-memory BM25 index."
@@ -525,6 +540,23 @@ impl Bm25Backend {
                 (key, before, !skip)
             })
             .collect();
+        // A shared Cursor database changes far more often than any one
+        // conversation in it. Save the new observation with the unchanged
+        // digest; otherwise every later search re-hashes every conversation.
+        let restamp: Vec<(&String, String)> = plan
+            .iter()
+            .filter(|(_, _, parse)| !parse)
+            .filter_map(|(key, stamp, _)| {
+                let stamp = stamp.as_ref()?;
+                stamp.cursor.as_ref()?.observed.as_ref()?;
+                let stamp = serde_json::to_string(stamp).ok()?;
+                (existing.get(key) != Some(&stamp)).then_some((key, stamp))
+            })
+            .collect();
+        if !restamp.is_empty() {
+            // Best effort: losing this write costs time on the next search only.
+            let _ = restamp_sessions(&self.conn, &existing, &restamp);
+        }
         let missing: Vec<&String> = existing.keys().filter(|k| !live.contains(*k)).collect();
         let gone: Vec<&String> = missing
             .par_iter()
@@ -640,6 +672,24 @@ impl Bm25Backend {
     }
 }
 
+fn restamp_sessions(
+    conn: &Connection,
+    existing: &HashMap<String, String>,
+    restamp: &[(&String, String)],
+) -> Result<()> {
+    let tx = begin_immediate(conn)?;
+    {
+        let mut update = tx.prepare_cached(
+            "UPDATE sessions SET fingerprint = ?2 WHERE key = ?1 AND fingerprint = ?3",
+        )?;
+        for (key, stamp) in restamp {
+            update.execute(params![key, stamp, existing[*key]])?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 fn read_existing(conn: &Connection) -> Result<HashMap<String, String>> {
     Ok(conn
         .prepare("SELECT key, fingerprint FROM sessions")?
@@ -696,6 +746,18 @@ fn published_elsewhere(
 
 type Extracted = Vec<(usize, Message, bool)>;
 
+/// Parsers report a failed read as an empty message list. An empty parse of a
+/// plain transcript is kept only when the file reads cleanly from start to end;
+/// SQLite-backed sources cannot be checked this way and are retried.
+fn empty_parse_is_durable(session: &Session) -> bool {
+    let sqlite = session.file.ends_with(".db") || session.file.ends_with(".vscdb");
+    !sqlite
+        && session.source != "cursor-ide"
+        && fs::File::open(&session.file)
+            .and_then(|mut file| std::io::copy(&mut file, &mut std::io::sink()))
+            .is_ok()
+}
+
 fn extract_session(
     session: &Session,
     before: Option<Fingerprint>,
@@ -706,7 +768,9 @@ fn extract_session(
         .as_ref()
         .zip(after.as_ref())
         .is_some_and(|(a, b)| a.matches(b))
-        && (!messages.is_empty() || session.is_cursor_store_only());
+        && (!messages.is_empty()
+            || session.is_cursor_store_only()
+            || empty_parse_is_durable(session));
     let mut stamp = after.unwrap_or(Fingerprint {
         version: EXTRACTION_VERSION,
         signature: None,
@@ -956,6 +1020,7 @@ fn match_query(query: &str) -> Result<Option<LexicalQuery>> {
     }
     let mut terms = Vec::new();
     let mut unique_analyzer = HashSet::new();
+    let mut seen_terms = HashSet::new();
     let mut analyzer_count = 0usize;
     for chunk in query.split_whitespace() {
         let toks = analyzer_tokens(chunk);
@@ -964,8 +1029,11 @@ fn match_query(query: &str) -> Result<Option<LexicalQuery>> {
         }
         analyzer_count = analyzer_count.saturating_add(toks.len());
         if toks.len() <= MAX_PHRASE_TOKENS {
-            if unique_analyzer.len() < MAX_ANALYZER_TOKENS {
-                terms.push(chunk.to_lowercase());
+            // A pasted log repeats the same words thousands of times. Each
+            // distinct chunk is one clause, however often it occurs.
+            let term = chunk.to_lowercase();
+            if terms.len() < MAX_ANALYZER_TOKENS && seen_terms.insert(term.clone()) {
+                terms.push(term);
                 unique_analyzer.extend(toks);
             }
         } else {
@@ -975,7 +1043,7 @@ fn match_query(query: &str) -> Result<Option<LexicalQuery>> {
                 }
             }
         }
-        if unique_analyzer.len() >= MAX_ANALYZER_TOKENS {
+        if unique_analyzer.len() >= MAX_ANALYZER_TOKENS || terms.len() >= MAX_ANALYZER_TOKENS {
             break;
         }
     }
@@ -1001,6 +1069,21 @@ fn match_query(query: &str) -> Result<Option<LexicalQuery>> {
         phrase: (clauses.len() > 1 && analyzer_count <= MAX_PHRASE_TOKENS)
             .then(|| format!("\"{}\"", query.replace('"', "\"\""))),
     }))
+}
+
+/// Comparable text of an accepted hit and, for a title or prompt row, its uuid.
+type Echo = (String, Option<String>);
+
+fn is_synthetic(message: &Message) -> bool {
+    message.uuid == "index-title" || message.uuid == "index-prompt"
+}
+
+/// Comparable form of a title, prompt preview or user message. Titles and
+/// previews are truncated, so callers compare by prefix.
+fn echo_text(text: &str) -> String {
+    clean_first_prompt(text)
+        .trim_end_matches(['…', '.', ' '])
+        .to_lowercase()
 }
 
 impl SearchBackend for Bm25Backend {
@@ -1092,6 +1175,7 @@ impl SearchBackend for Bm25Backend {
         let mut seen_content = HashSet::new();
         let mut counts: HashMap<(String, String), usize> = HashMap::new();
         let mut groups: HashMap<(String, String), usize> = HashMap::new();
+        let mut echoes: HashMap<(String, String), Vec<Echo>> = HashMap::new();
         let mut results: Vec<SearchResult> = Vec::new();
         while let Some(row) = rows.next()? {
             let id: i64 = row.get(0)?;
@@ -1126,6 +1210,27 @@ impl SearchBackend for Bm25Backend {
             if !seen_content.insert(sig) {
                 continue;
             }
+            // The title and prompt rows usually repeat the first user message.
+            // One sentence must not fill a conversation's three slots: a
+            // synthetic row yields to, or is replaced by, the real message.
+            let synthetic = is_synthetic(&message);
+            let echo = match message.uuid.as_str() {
+                "index-title" => echo_text(&session.summary),
+                _ if synthetic || message.role == "user" => echo_text(&message.content),
+                _ => String::new(),
+            };
+            let shown = echoes.entry(logical_session.clone()).or_default();
+            let twin = (!echo.is_empty())
+                .then(|| {
+                    shown.iter().position(|(other, other_synthetic): &Echo| {
+                        (synthetic || other_synthetic.is_some())
+                            && (other.starts_with(&echo) || echo.starts_with(other.as_str()))
+                    })
+                })
+                .flatten();
+            if synthetic && twin.is_some() {
+                continue;
+            }
             let score: f64 = row.get(2)?;
             message.relevance_score = score;
             message.final_score = score;
@@ -1143,6 +1248,35 @@ impl SearchBackend for Bm25Backend {
                 snippet
             };
             let snippet = cap_excerpt(&snippet, SNIPPET_CHARS);
+            if let Some(twin) = twin {
+                // Keep the synthetic row's rank; show the message it echoed.
+                // The title and prompt rows are distinct: replace the twin.
+                let twin_uuid = std::mem::replace(&mut shown[twin], (echo, None)).1;
+                let slot = results
+                    .iter_mut()
+                    .filter(|r| {
+                        r.session.source == session.source
+                            && r.session.id.eq_ignore_ascii_case(&session.id)
+                    })
+                    .flat_map(|r| {
+                        std::iter::once((&mut r.message, &mut r.snippet)).chain(
+                            r.additional_matches
+                                .iter_mut()
+                                .map(|m| (&mut m.message, &mut m.snippet)),
+                        )
+                    })
+                    .find(|(m, _)| Some(&m.uuid) == twin_uuid.as_ref());
+                if let Some((slot_message, slot_snippet)) = slot {
+                    message.relevance_score = slot_message.relevance_score;
+                    message.final_score = slot_message.final_score;
+                    *slot_message = message;
+                    *slot_snippet = Some(snippet);
+                }
+                continue;
+            }
+            if !echo.is_empty() {
+                shown.push((echo, synthetic.then(|| message.uuid.clone())));
+            }
             *counts.entry(logical_session.clone()).or_default() += 1;
             if request.group_by_session
                 && let Some(&group) = groups.get(&logical_session)
@@ -1189,6 +1323,21 @@ mod tests {
         assert!(parsed.broad.len() < 200, "{}", parsed.broad);
         assert!(parsed.broad.contains("sqlite"));
         assert!(parsed.broad.contains("rust"));
+    }
+
+    #[test]
+    fn match_query_deduplicates_repeated_words() {
+        let parsed = match_query(&"error fix ".repeat(3000))
+            .unwrap()
+            .expect("repeated words still form a query");
+        assert_eq!(parsed.broad.matches(" OR (").count(), 1, "{}", parsed.broad);
+        assert!(parsed.phrase.is_none());
+        // Distinct chunks that share analyzer tokens are still bounded.
+        let noisy: String = (0..5000)
+            .map(|i| format!("{} ", "-".repeat(i % 700 + 1) + "x"))
+            .collect();
+        let parsed = match_query(&noisy).unwrap().unwrap();
+        assert!(parsed.broad.matches(" OR ").count() <= 2 * super::MAX_ANALYZER_TOKENS);
     }
 
     #[test]

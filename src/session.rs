@@ -11,6 +11,10 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+// Catalog entry kind for cached transcript metadata. Bump when first-prompt or
+// title extraction changes so unchanged files are re-read, not served stale.
+const TRANSCRIPT_KIND: &str = "transcript-v2";
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct Session {
     pub source: String,
@@ -650,7 +654,7 @@ pub fn load_claude_sessions() -> Vec<Session> {
                         continue;
                     }
                     let (cwd, branch, summary, first) =
-                        crate::catalog::read("claude", "transcript", &path, false, || {
+                        crate::catalog::read("claude", TRANSCRIPT_KIND, &path, false, || {
                             fs::File::open(&path).ok()?;
                             let (cwd, branch) = read_cwd_branch_from_jsonl(&path);
                             Some((
@@ -1050,15 +1054,17 @@ pub fn load_codex_sessions() -> Vec<Session> {
         .flatten()
         .flatten()
     {
-        let Some((meta, first)) = crate::catalog::read("codex", "transcript", &path, false, || {
-            let meta = read_codex_meta(&path)?;
-            let first = if meta.is_subagent {
-                String::new()
-            } else {
-                codex_first_prompt(&path)
-            };
-            Some((meta, first))
-        }) else {
+        let Some((meta, first)) =
+            crate::catalog::read("codex", TRANSCRIPT_KIND, &path, false, || {
+                let meta = read_codex_meta(&path)?;
+                let first = if meta.is_subagent {
+                    String::new()
+                } else {
+                    codex_first_prompt(&path)
+                };
+                Some((meta, first))
+            })
+        else {
             continue;
         };
         if meta.is_subagent {
@@ -2735,6 +2741,27 @@ mod tests {
         );
         assert!(contents.contains(&"/code-review foo bar"), "{contents:?}");
         assert!(contents.contains(&"real authored prompt"), "{contents:?}");
+    }
+
+    #[test]
+    fn parse_claude_jsonl_keeps_tool_results_that_quote_command_tags() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let diff = "diff --git a/src/parser.rs b/src/parser.rs\n+    let args = between(\"<command-args>\", \"</command-args>\")?;\n+    uniquediffmarker";
+        let entry = serde_json::json!({
+            "type": "user", "uuid": "t1",
+            "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "x", "content": diff}
+            ]}
+        });
+        std::fs::write(tmp.path(), entry.to_string()).unwrap();
+        let (messages, _) = parse_claude_jsonl(tmp.path().to_str().unwrap(), false);
+        assert_eq!(messages.len(), 1);
+        assert!(
+            messages[0].content.contains("uniquediffmarker"),
+            "{}",
+            messages[0].content
+        );
+        assert!(claude_first_prompt(tmp.path()).contains("diff --git"));
     }
 
     #[test]

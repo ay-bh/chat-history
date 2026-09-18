@@ -18,7 +18,7 @@ Search, inspect, and export Claude Code, Cursor, and Codex conversation history.
 
 **Keyword question** ("find that conversation where I..."):
 
-1. `chat-history search "<query>" --deep --json` — always `--deep --json` from agents. BM25 searches metadata and transcripts together by default; `--deep` also ensures transcript search if the legacy engine is selected; `--json` returns structured results (`session_id`, `score`, `snippet`, `tools`, `files`). Note `--json` exists only on `search`.
+1. `chat-history search "<query>" --deep --json` — always `--deep --json` from agents. BM25 searches metadata and transcripts together by default (`--deep` is a no-op for that engine); `--deep` still forces transcript search if the legacy engine is selected; `--json` returns structured results (`session_id`, `score`, `snippet`, `tools`, `files`, `additional_matches`). Note `--json` exists only on `search`.
 2. Shortlist by snippet, not by raw score (see "Choosing the best hit").
 3. `chat-history inspect <partial-uuid>` on the top 2–3 candidates to confirm before answering.
 4. `view` / `export` only if the user needs the actual content.
