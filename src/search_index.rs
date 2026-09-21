@@ -35,9 +35,15 @@ const MAX_ANALYZER_TOKENS: usize = 128;
 const MAX_PHRASE_TOKENS: usize = 32;
 const MAX_PASSAGE_CHARS: usize = 1600;
 const PASSAGE_OVERLAP: usize = 200;
-// Each batch is one transaction and one FTS5 flush. Sessions stay below a
-// few megabytes, so 64 bounds memory while cutting flushes and merges.
+// Each batch is one transaction and one FTS5 flush: larger batches mean fewer
+// flushes and merges. Batches are bounded by session count and by source
+// bytes, so a run of large transcripts cannot pile up parsed text in memory or
+// hold the write lock for long.
 const PARSE_BATCH_SIZE: usize = 64;
+const PARSE_BATCH_BYTES: u64 = 32 << 20;
+// Transcripts are parsed up to this size, so a larger source file weighs no
+// more than this in a batch (a shared Cursor database is much larger).
+const PARSE_SESSION_BYTES: u64 = 4 << 20;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const WRITER_STALL: Duration = Duration::from_secs(10);
 const CACHE_MISMATCH_ATTEMPTS: usize = 3;
@@ -645,9 +651,15 @@ impl Bm25Backend {
         let mut todo = todo;
         todo.sort_by_cached_key(|&i| order.hash_one(&plan[i].0));
         let mut done = stats.unchanged;
-        for batch in todo.chunks(PARSE_BATCH_SIZE) {
+        let source_bytes = |i: usize| {
+            fs::metadata(&corpus[i].file)
+                .map(|m| m.len())
+                .unwrap_or(0)
+                .min(PARSE_SESSION_BYTES)
+        };
+        for batch in batches(&todo, source_bytes, PARSE_BATCH_SIZE, PARSE_BATCH_BYTES) {
             let mut need = Vec::with_capacity(batch.len());
-            for &i in batch {
+            for &i in &batch {
                 let current = current_fingerprint(&self.conn, &plan[i].0)?;
                 if published_elsewhere(&current, existing.get(&plan[i].0), plan[i].1.as_ref()) {
                     stats.unchanged += 1;
@@ -716,6 +728,34 @@ impl Bm25Backend {
         }
         Ok(stats)
     }
+}
+
+/// Splits work into batches bounded by item count and by total size. An item
+/// larger than the byte bound forms a batch of its own.
+fn batches<'a>(
+    items: &'a [usize],
+    size: impl Fn(usize) -> u64 + 'a,
+    max_items: usize,
+    max_bytes: u64,
+) -> impl Iterator<Item = Vec<usize>> + 'a {
+    let mut next = 0;
+    std::iter::from_fn(move || {
+        let first = *items.get(next)?;
+        let mut batch = vec![first];
+        let mut bytes = size(first);
+        next += 1;
+        while next < items.len() && batch.len() < max_items {
+            let item = items[next];
+            let more = size(item);
+            if bytes + more > max_bytes {
+                break;
+            }
+            batch.push(item);
+            bytes += more;
+            next += 1;
+        }
+        Some(batch)
+    })
 }
 
 fn restamp_sessions(
@@ -1367,6 +1407,19 @@ impl SearchBackend for Bm25Backend {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sync_batches_are_bounded_by_session_count_and_source_bytes() {
+        let sizes = [10u64, 30, 5, 1, 1, 1, 50];
+        let batches: Vec<Vec<usize>> =
+            super::batches(&[0, 1, 2, 3, 4, 5, 6], |i| sizes[i], 3, 32).collect();
+        // 10 fits; 30 would exceed 32 bytes; 5 joins nothing after 30; then a
+        // count-bounded run of three; an oversized session is its own batch.
+        assert_eq!(
+            batches,
+            vec![vec![0], vec![1], vec![2, 3, 4], vec![5], vec![6]]
+        );
+    }
+
     use super::{grouped_message_oversample, match_query};
 
     #[test]
