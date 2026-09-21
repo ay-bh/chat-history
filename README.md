@@ -161,7 +161,7 @@ Cursor Agent chats found in both transcript and IDE data are shown once as `curs
 
 ### Metadata cache
 
-Session discovery caches titles, first-prompt previews, and other extracted metadata from unchanged sources in `~/.chat-history/cache/catalog-v1.db`. This metadata cache does not store transcripts. BM25 uses a separate, disposable `search-v1.db` containing message text and full-text postings; it refreshes only changed sessions. Search results themselves are not cached. Discovery and workspace/store checks remain live, so added or deleted transcripts still appear immediately. On one local profile, a warm Claude extraction fell from about 300ms to 10ms.
+Session discovery caches titles, first-prompt previews, and other extracted metadata from unchanged sources in `~/.chat-history/cache/catalog-v1.db`. This metadata cache does not store transcripts. BM25 uses a separate, disposable `search-v2.db` containing message text and full-text postings; it refreshes only changed sessions. Search results themselves are not cached. Discovery and workspace/store checks remain live, so added or deleted transcripts still appear immediately. On one local profile, a warm Claude extraction fell from about 300ms to 10ms.
 
 The cache tracks file metadata and SQLite WAL/journal changes. Unavailable, corrupt, or locked caches fall back to reading the sources. Set `CHAT_HISTORY_NO_CACHE=1` to bypass it or `CHAT_HISTORY_CACHE_DIR` to move it; deleting the cache rebuilds it on the next command. New cache directories and databases are user-private on Unix.
 

@@ -63,7 +63,7 @@ similarity calculation so the meaning of that option does not change.
 
 ## Storage
 
-The index is `search-v1.db` under the cache directory, separate from the
+The index is `search-v2.db` under the cache directory, separate from the
 metadata cache. New directories and files use Unix modes 0700 and 0600.
 
 | Relation | Purpose |

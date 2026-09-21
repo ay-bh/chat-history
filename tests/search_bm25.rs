@@ -1647,3 +1647,153 @@ fn benchmark_cold_warm_and_legacy() {
         "250 sessions / 5000 messages: cold={cold:?}; warm open+sync={warm:?}; BM25 query={query:?}; legacy deep query={legacy:?}"
     );
 }
+
+fn count(conn: &rusqlite::Connection, sql: &str) -> i64 {
+    conn.query_row(sql, [], |r| r.get(0)).unwrap()
+}
+
+fn age(path: &std::path::Path, days: u64) {
+    let when = std::time::SystemTime::now() - std::time::Duration::from_secs(days * 86_400);
+    fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(when)
+        .unwrap();
+}
+
+/// A previous-generation database with enough content to be worth reclaiming.
+fn previous_generation(dir: &std::path::Path) -> std::path::PathBuf {
+    let path = dir.join("search-v1.db");
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch("CREATE TABLE sessions (key TEXT PRIMARY KEY, fingerprint TEXT NOT NULL)")
+        .unwrap();
+    let filler = "x".repeat(1024);
+    for i in 0..512 {
+        conn.execute(
+            "INSERT INTO sessions VALUES (?1, ?2)",
+            rusqlite::params![i.to_string(), filler],
+        )
+        .unwrap();
+    }
+    drop(conn);
+    assert!(fs::metadata(&path).unwrap().len() > 256 * 1024);
+    path
+}
+
+#[test]
+fn opening_the_index_empties_a_previous_generation_unused_for_a_week_in_place() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join("index");
+    fs::create_dir(&dir).unwrap();
+    let v1 = previous_generation(&dir);
+    age(&v1, 8);
+    assert_eq!(INDEX_FILENAME, "search-v2.db");
+    drop(Bm25Backend::open(Some(&dir)).unwrap());
+    assert!(dir.join(INDEX_FILENAME).exists());
+    // Never unlinked: another binary may hold it open. Reset through SQLite instead.
+    assert!(v1.exists());
+    assert!(fs::metadata(&v1).unwrap().len() < 64 * 1024);
+    let conn = rusqlite::Connection::open(&v1).unwrap();
+    assert_eq!(count(&conn, "SELECT count(*) FROM sqlite_schema"), 0);
+}
+
+#[test]
+fn a_previous_generation_with_a_writer_in_progress_is_left_alone() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join("index");
+    fs::create_dir(&dir).unwrap();
+    let v1 = previous_generation(&dir);
+    age(&v1, 30);
+    let holder = rusqlite::Connection::open(&v1).unwrap();
+    holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let started = std::time::Instant::now();
+    drop(Bm25Backend::open(Some(&dir)).unwrap());
+    assert!(started.elapsed() < std::time::Duration::from_secs(3));
+    holder.execute_batch("COMMIT").unwrap();
+    assert_eq!(count(&holder, "SELECT count(*) FROM sessions"), 512);
+}
+
+#[test]
+fn a_recently_used_previous_generation_is_kept_for_its_binary() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join("index");
+    fs::create_dir(&dir).unwrap();
+    fs::write(dir.join("search-v1.db"), "fresh").unwrap();
+    age(&dir.join("search-v1.db"), 2);
+    drop(Bm25Backend::open(Some(&dir)).unwrap());
+    assert!(dir.join("search-v1.db").exists());
+}
+
+#[test]
+fn a_previous_generation_with_live_sidecars_is_left_for_its_binary() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join("index");
+    fs::create_dir(&dir).unwrap();
+    let live = ["search-v1.db", "search-v1.db-wal", "search-v1.db-shm"];
+    for name in live {
+        fs::write(dir.join(name), "in use").unwrap();
+        age(&dir.join(name), 30);
+    }
+    drop(Bm25Backend::open(Some(&dir)).unwrap());
+    assert!(dir.join(INDEX_FILENAME).exists());
+    for name in live {
+        assert!(
+            dir.join(name).exists(),
+            "{name} must not be removed while open"
+        );
+    }
+}
+
+#[test]
+fn full_text_rows_are_written_once_without_an_insert_trigger() {
+    let tmp = TempDir::new().unwrap();
+    let mut corpus = vec![
+        transcript(
+            &tmp,
+            "one",
+            &["Directneedle first message", "second message"],
+        ),
+        transcript(&tmp, "two", &["Directneedle in another session"]),
+    ];
+    let dir = tmp.path().join("index");
+    let mut index = Bm25Backend::open(Some(&dir)).unwrap();
+    index.sync(&corpus, false).unwrap();
+    assert_eq!(search(&mut index, &corpus, "directneedle", 10).len(), 2);
+    drop(index);
+    let conn = rusqlite::Connection::open(dir.join(INDEX_FILENAME)).unwrap();
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT count(*) FROM sqlite_schema WHERE type = 'trigger' AND name = 'passages_insert'"
+        ),
+        0,
+        "inserts must not go through a trigger"
+    );
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE temp.vocab USING fts5vocab('main', 'passages_fts', 'row')",
+    )
+    .unwrap();
+    let postings = "SELECT doc || '/' || cnt FROM vocab WHERE term = 'directneedle'";
+    let posting: String = conn.query_row(postings, [], |r| r.get(0)).unwrap();
+    assert_eq!(posting, "2/2", "each passage indexed exactly once");
+    conn.execute(
+        "INSERT INTO passages_fts(passages_fts, rank) VALUES ('integrity-check', 1)",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+    let removed = corpus.pop().unwrap();
+    fs::remove_file(&removed.file).unwrap();
+    let mut index = Bm25Backend::open(Some(&dir)).unwrap();
+    assert_eq!(index.sync(&corpus, false).unwrap().removed, 1);
+    assert_eq!(search(&mut index, &corpus, "directneedle", 10).len(), 1);
+    drop(index);
+    let conn = rusqlite::Connection::open(dir.join(INDEX_FILENAME)).unwrap();
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE temp.vocab USING fts5vocab('main', 'passages_fts', 'row')",
+    )
+    .unwrap();
+    let posting: String = conn.query_row(postings, [], |r| r.get(0)).unwrap();
+    assert_eq!(posting, "1/1", "deleted passages leave the full-text index");
+}

@@ -19,7 +19,15 @@ use std::time::{Duration, Instant};
 
 pub type SearchError = Box<dyn std::error::Error + Send + Sync>;
 pub type Result<T> = std::result::Result<T, SearchError>;
-pub const INDEX_FILENAME: &str = "search-v1.db";
+pub const INDEX_FILENAME: &str = "search-v2.db";
+/// Earlier generations wrote full-text rows through an insert trigger. An older
+/// binary sharing the directory would recreate that trigger, so they are not
+/// migrated in place: a new file is used and the old one emptied once idle.
+const PREVIOUS_INDEX_FILENAMES: [&str; 1] = ["search-v1.db"];
+const PREVIOUS_INDEX_GRACE: Duration = Duration::from_secs(7 * 86_400);
+/// An emptied database is a few pages; anything at or below this is done.
+const RECLAIMED_SIZE: u64 = 64 * 1024;
+const RECLAIM_TIMEOUT: Duration = Duration::from_millis(250);
 // Bump for parser, timestamp, chunking or tokenization changes that require
 // re-extracting unchanged sources without changing the relational schema.
 const EXTRACTION_VERSION: u32 = 3;
@@ -27,7 +35,15 @@ const MAX_ANALYZER_TOKENS: usize = 128;
 const MAX_PHRASE_TOKENS: usize = 32;
 const MAX_PASSAGE_CHARS: usize = 1600;
 const PASSAGE_OVERLAP: usize = 200;
-const PARSE_BATCH_SIZE: usize = 8;
+// Each batch is one transaction and one FTS5 flush: larger batches mean fewer
+// flushes and merges. Batches are bounded by session count and by source
+// bytes, so a run of large transcripts cannot pile up parsed text in memory or
+// hold the write lock for long.
+const PARSE_BATCH_SIZE: usize = 64;
+const PARSE_BATCH_BYTES: u64 = 32 << 20;
+// Transcripts are parsed up to this size, so a larger source file weighs no
+// more than this in a batch (a shared Cursor database is much larger).
+const PARSE_SESSION_BYTES: u64 = 4 << 20;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const WRITER_STALL: Duration = Duration::from_secs(10);
 const CACHE_MISMATCH_ATTEMPTS: usize = 3;
@@ -160,6 +176,12 @@ fn reset_in_place(dir: &Path) -> Result<()> {
     if cache_is_healthy(&conn) {
         return Ok(());
     }
+    reset_database(&conn)
+}
+
+/// Empties a database under SQLite's own locking, so connections other
+/// processes hold stay valid and see an empty schema on their next statement.
+fn reset_database(conn: &Connection) -> Result<()> {
     conn.set_db_config(
         rusqlite::config::DbConfig::SQLITE_DBCONFIG_RESET_DATABASE,
         true,
@@ -171,6 +193,39 @@ fn reset_in_place(dir: &Path) -> Result<()> {
     )?;
     vacuum?;
     Ok(())
+}
+
+/// Best-effort space reclaim of a previous index generation. Nothing proves a
+/// file is unopened, so it is never unlinked: it is emptied in place through
+/// SQLite, which an older binary still holding it handles as a fresh cache.
+/// Only a file idle for a week is touched, so an older binary in daily use is
+/// left alone; a concurrent writer makes the reset wait briefly, then give up
+/// until a later run.
+fn reclaim_previous_generations(dir: &Path) {
+    for stale in PREVIOUS_INDEX_FILENAMES {
+        let path = dir.join(stale);
+        let Ok(meta) = fs::metadata(&path) else {
+            continue;
+        };
+        let in_use = ["-wal", "-shm", "-journal"]
+            .iter()
+            .any(|suffix| dir.join(format!("{stale}{suffix}")).exists());
+        let idle = meta
+            .modified()
+            .ok()
+            .and_then(|m| m.elapsed().ok())
+            .is_some_and(|age| age >= PREVIOUS_INDEX_GRACE);
+        if in_use || !idle || meta.len() <= RECLAIMED_SIZE {
+            continue;
+        }
+        let Ok(conn) = Connection::open(&path) else {
+            continue;
+        };
+        if conn.busy_timeout(RECLAIM_TIMEOUT).is_err() {
+            continue;
+        }
+        let _ = reset_database(&conn);
+    }
 }
 
 fn sync_corpus(
@@ -390,6 +445,7 @@ impl Bm25Backend {
                 builder.mode(0o700);
             }
             builder.create(dir)?;
+            reclaim_previous_generations(dir);
             let path = dir.join(INDEX_FILENAME);
             let mut options = fs::OpenOptions::new();
             options.write(true).create_new(true);
@@ -448,18 +504,18 @@ impl Bm25Backend {
             return Err("Search cache has incomplete message tables; remove the disposable search database to recreate it.".into());
         }
         let initialized: bool = conn.query_row(
-            "SELECT count(*) = 8 FROM sqlite_schema WHERE name IN (
+            "SELECT count(*) = 7 FROM sqlite_schema WHERE name IN (
              'sessions', 'messages', 'messages_session', 'passages', 'passages_message',
-             'passages_fts', 'passages_insert', 'passages_delete')",
+             'passages_fts', 'passages_delete')",
             [],
             |r| r.get(0),
         )?;
         if !initialized {
             let tx = begin_immediate(&conn)?;
             let initialized: bool = tx.query_row(
-                "SELECT count(*) = 8 FROM sqlite_schema WHERE name IN (
+                "SELECT count(*) = 7 FROM sqlite_schema WHERE name IN (
                  'sessions', 'messages', 'messages_session', 'passages', 'passages_message',
-                 'passages_fts', 'passages_insert', 'passages_delete')",
+                 'passages_fts', 'passages_delete')",
                 [],
                 |r| r.get(0),
             )?;
@@ -488,10 +544,6 @@ impl Bm25Backend {
                 content='passages', content_rowid='id',
                 tokenize='unicode61 remove_diacritics 2', prefix='2 3 4'
              );
-             CREATE TRIGGER IF NOT EXISTS passages_insert AFTER INSERT ON passages BEGIN
-                INSERT INTO passages_fts(rowid, content, title, prompt, project, branch)
-                VALUES (new.id, new.content, new.title, new.prompt, new.project, new.branch);
-             END;
              CREATE TRIGGER IF NOT EXISTS passages_delete AFTER DELETE ON passages BEGIN
                 INSERT INTO passages_fts(passages_fts, rowid, content, title, prompt, project, branch)
                 VALUES ('delete', old.id, old.content, old.title, old.prompt, old.project, old.branch);
@@ -599,9 +651,15 @@ impl Bm25Backend {
         let mut todo = todo;
         todo.sort_by_cached_key(|&i| order.hash_one(&plan[i].0));
         let mut done = stats.unchanged;
-        for batch in todo.chunks(PARSE_BATCH_SIZE) {
+        let source_bytes = |i: usize| {
+            fs::metadata(&corpus[i].file)
+                .map(|m| m.len())
+                .unwrap_or(0)
+                .min(PARSE_SESSION_BYTES)
+        };
+        for batch in batches(&todo, source_bytes, PARSE_BATCH_SIZE, PARSE_BATCH_BYTES) {
             let mut need = Vec::with_capacity(batch.len());
-            for &i in batch {
+            for &i in &batch {
                 let current = current_fingerprint(&self.conn, &plan[i].0)?;
                 if published_elsewhere(&current, existing.get(&plan[i].0), plan[i].1.as_ref()) {
                     stats.unchanged += 1;
@@ -670,6 +728,34 @@ impl Bm25Backend {
         }
         Ok(stats)
     }
+}
+
+/// Splits work into batches bounded by item count and by total size. An item
+/// larger than the byte bound forms a batch of its own.
+fn batches<'a>(
+    items: &'a [usize],
+    size: impl Fn(usize) -> u64 + 'a,
+    max_items: usize,
+    max_bytes: u64,
+) -> impl Iterator<Item = Vec<usize>> + 'a {
+    let mut next = 0;
+    std::iter::from_fn(move || {
+        let first = *items.get(next)?;
+        let mut batch = vec![first];
+        let mut bytes = size(first);
+        next += 1;
+        while next < items.len() && batch.len() < max_items {
+            let item = items[next];
+            let more = size(item);
+            if bytes + more > max_bytes {
+                break;
+            }
+            batch.push(item);
+            bytes += more;
+            next += 1;
+        }
+        Some(batch)
+    })
 }
 
 fn restamp_sessions(
@@ -851,7 +937,12 @@ fn publish_session(
         }
         return Ok(());
     }
-    tx.execute("DELETE FROM sessions WHERE key = ?1", [key])?;
+    // The cascading delete is a multi-write statement and takes a savepoint,
+    // which makes FTS5 flush; a session absent from the index has nothing to
+    // remove.
+    if current.is_some() {
+        tx.execute("DELETE FROM sessions WHERE key = ?1", [key])?;
+    }
     tx.execute("INSERT INTO sessions VALUES (?1, ?2)", params![key, stamp])?;
     for (ordinal, message, metadata) in extracted {
         insert_message(tx, key, session, &message, ordinal, metadata)?;
@@ -950,23 +1041,33 @@ fn insert_message(
         ],
     )?;
     let id = conn.last_insert_rowid();
-    let mut stmt = conn.prepare_cached(
+    // Written directly rather than through an AFTER INSERT trigger: a trigger
+    // makes each passage insert a multi-write statement with its own savepoint,
+    // and FTS5 flushes its pending index to disk on every savepoint.
+    let mut row = conn.prepare_cached(
         "INSERT INTO passages(message_id, content, title, prompt, project, branch)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
     )?;
+    let mut fts = conn.prepare_cached(
+        "INSERT INTO passages_fts(rowid, content, title, prompt, project, branch)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+    )?;
+    let mut insert = |content: &str, title: &str, prompt: &str, project: &str, branch: &str| {
+        row.execute(params![id, content, title, prompt, project, branch])?;
+        let passage = conn.last_insert_rowid();
+        fts.execute(params![passage, content, title, prompt, project, branch])?;
+        Ok::<(), rusqlite::Error>(())
+    };
     if metadata {
         let prompt = message.uuid == "index-prompt";
-        stmt.execute(params![
-            id,
-            "",
-            if prompt { "" } else { &session.summary },
-            if prompt { &session.first_prompt } else { "" },
-            if prompt { "" } else { &session.project },
-            if prompt { "" } else { &session.branch }
-        ])?;
+        if prompt {
+            insert("", "", &session.first_prompt, "", "")?;
+        } else {
+            insert("", &session.summary, "", &session.project, &session.branch)?;
+        }
     } else {
         for content in passages(&message.content) {
-            stmt.execute(params![id, content, "", "", "", ""])?;
+            insert(content, "", "", "", "")?;
         }
     }
     Ok(())
@@ -1306,6 +1407,19 @@ impl SearchBackend for Bm25Backend {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sync_batches_are_bounded_by_session_count_and_source_bytes() {
+        let sizes = [10u64, 30, 5, 1, 1, 1, 50];
+        let batches: Vec<Vec<usize>> =
+            super::batches(&[0, 1, 2, 3, 4, 5, 6], |i| sizes[i], 3, 32).collect();
+        // 10 fits; 30 would exceed 32 bytes; 5 joins nothing after 30; then a
+        // count-bounded run of three; an oversized session is its own batch.
+        assert_eq!(
+            batches,
+            vec![vec![0], vec![1], vec![2, 3, 4], vec![5], vec![6]]
+        );
+    }
+
     use super::{grouped_message_oversample, match_query};
 
     #[test]

@@ -804,7 +804,10 @@ mod tests {
             "main",
         );
         s.file = tmp.path().to_str().unwrap().to_string();
-        s.created = "2026-08-20T00:00:00Z".into();
+        // Session activity is recent while its messages stay dated 2026-08-14,
+        // so the title-only hit depends on the session window, not messages.
+        s.created = (chrono::Utc::now() - chrono::Duration::days(3))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         s.modified = s.created.clone();
         let results = scored_search(&[s.clone()], "mergeability", "all", 10, None);
         assert!(
