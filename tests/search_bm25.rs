@@ -1662,17 +1662,56 @@ fn age(path: &std::path::Path, days: u64) {
         .unwrap();
 }
 
+/// A previous-generation database with enough content to be worth reclaiming.
+fn previous_generation(dir: &std::path::Path) -> std::path::PathBuf {
+    let path = dir.join("search-v1.db");
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch("CREATE TABLE sessions (key TEXT PRIMARY KEY, fingerprint TEXT NOT NULL)")
+        .unwrap();
+    let filler = "x".repeat(1024);
+    for i in 0..512 {
+        conn.execute(
+            "INSERT INTO sessions VALUES (?1, ?2)",
+            rusqlite::params![i.to_string(), filler],
+        )
+        .unwrap();
+    }
+    drop(conn);
+    assert!(fs::metadata(&path).unwrap().len() > 256 * 1024);
+    path
+}
+
 #[test]
-fn opening_the_index_removes_a_previous_generation_unused_for_a_week() {
+fn opening_the_index_empties_a_previous_generation_unused_for_a_week_in_place() {
     let tmp = TempDir::new().unwrap();
     let dir = tmp.path().join("index");
     fs::create_dir(&dir).unwrap();
-    fs::write(dir.join("search-v1.db"), "stale").unwrap();
-    age(&dir.join("search-v1.db"), 8);
+    let v1 = previous_generation(&dir);
+    age(&v1, 8);
     assert_eq!(INDEX_FILENAME, "search-v2.db");
     drop(Bm25Backend::open(Some(&dir)).unwrap());
     assert!(dir.join(INDEX_FILENAME).exists());
-    assert!(!dir.join("search-v1.db").exists());
+    // Never unlinked: another binary may hold it open. Reset through SQLite instead.
+    assert!(v1.exists());
+    assert!(fs::metadata(&v1).unwrap().len() < 64 * 1024);
+    let conn = rusqlite::Connection::open(&v1).unwrap();
+    assert_eq!(count(&conn, "SELECT count(*) FROM sqlite_schema"), 0);
+}
+
+#[test]
+fn a_previous_generation_with_a_writer_in_progress_is_left_alone() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join("index");
+    fs::create_dir(&dir).unwrap();
+    let v1 = previous_generation(&dir);
+    age(&v1, 30);
+    let holder = rusqlite::Connection::open(&v1).unwrap();
+    holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let started = std::time::Instant::now();
+    drop(Bm25Backend::open(Some(&dir)).unwrap());
+    assert!(started.elapsed() < std::time::Duration::from_secs(3));
+    holder.execute_batch("COMMIT").unwrap();
+    assert_eq!(count(&holder, "SELECT count(*) FROM sessions"), 512);
 }
 
 #[test]

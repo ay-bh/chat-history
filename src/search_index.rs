@@ -22,9 +22,12 @@ pub type Result<T> = std::result::Result<T, SearchError>;
 pub const INDEX_FILENAME: &str = "search-v2.db";
 /// Earlier generations wrote full-text rows through an insert trigger. An older
 /// binary sharing the directory would recreate that trigger, so they are not
-/// migrated in place: a new file is used and the old one reclaimed once idle.
+/// migrated in place: a new file is used and the old one emptied once idle.
 const PREVIOUS_INDEX_FILENAMES: [&str; 1] = ["search-v1.db"];
 const PREVIOUS_INDEX_GRACE: Duration = Duration::from_secs(7 * 86_400);
+/// An emptied database is a few pages; anything at or below this is done.
+const RECLAIMED_SIZE: u64 = 64 * 1024;
+const RECLAIM_TIMEOUT: Duration = Duration::from_millis(250);
 // Bump for parser, timestamp, chunking or tokenization changes that require
 // re-extracting unchanged sources without changing the relational schema.
 const EXTRACTION_VERSION: u32 = 3;
@@ -167,6 +170,12 @@ fn reset_in_place(dir: &Path) -> Result<()> {
     if cache_is_healthy(&conn) {
         return Ok(());
     }
+    reset_database(&conn)
+}
+
+/// Empties a database under SQLite's own locking, so connections other
+/// processes hold stay valid and see an empty schema on their next statement.
+fn reset_database(conn: &Connection) -> Result<()> {
     conn.set_db_config(
         rusqlite::config::DbConfig::SQLITE_DBCONFIG_RESET_DATABASE,
         true,
@@ -178,6 +187,39 @@ fn reset_in_place(dir: &Path) -> Result<()> {
     )?;
     vacuum?;
     Ok(())
+}
+
+/// Best-effort space reclaim of a previous index generation. Nothing proves a
+/// file is unopened, so it is never unlinked: it is emptied in place through
+/// SQLite, which an older binary still holding it handles as a fresh cache.
+/// Only a file idle for a week is touched, so an older binary in daily use is
+/// left alone; a concurrent writer makes the reset wait briefly, then give up
+/// until a later run.
+fn reclaim_previous_generations(dir: &Path) {
+    for stale in PREVIOUS_INDEX_FILENAMES {
+        let path = dir.join(stale);
+        let Ok(meta) = fs::metadata(&path) else {
+            continue;
+        };
+        let in_use = ["-wal", "-shm", "-journal"]
+            .iter()
+            .any(|suffix| dir.join(format!("{stale}{suffix}")).exists());
+        let idle = meta
+            .modified()
+            .ok()
+            .and_then(|m| m.elapsed().ok())
+            .is_some_and(|age| age >= PREVIOUS_INDEX_GRACE);
+        if in_use || !idle || meta.len() <= RECLAIMED_SIZE {
+            continue;
+        }
+        let Ok(conn) = Connection::open(&path) else {
+            continue;
+        };
+        if conn.busy_timeout(RECLAIM_TIMEOUT).is_err() {
+            continue;
+        }
+        let _ = reset_database(&conn);
+    }
 }
 
 fn sync_corpus(
@@ -397,24 +439,7 @@ impl Bm25Backend {
                 builder.mode(0o700);
             }
             builder.create(dir)?;
-            // Best effort reclaim of the previous generation. Nothing proves a
-            // file is unopened, so it is removed only once it has sidecars gone
-            // and no writes for a week: an older binary still in use keeps
-            // touching it, and one that was upgraded never will.
-            for stale in PREVIOUS_INDEX_FILENAMES {
-                let path = dir.join(stale);
-                let in_use = ["-wal", "-shm"]
-                    .iter()
-                    .any(|suffix| dir.join(format!("{stale}{suffix}")).exists());
-                let idle = fs::metadata(&path)
-                    .and_then(|m| m.modified())
-                    .ok()
-                    .and_then(|m| m.elapsed().ok())
-                    .is_some_and(|age| age >= PREVIOUS_INDEX_GRACE);
-                if !in_use && idle {
-                    let _ = fs::remove_file(&path);
-                }
-            }
+            reclaim_previous_generations(dir);
             let path = dir.join(INDEX_FILENAME);
             let mut options = fs::OpenOptions::new();
             options.write(true).create_new(true);
