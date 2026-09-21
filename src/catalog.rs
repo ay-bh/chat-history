@@ -142,7 +142,7 @@ impl Catalog {
             builder.mode(0o700);
         }
         builder.create(dir).ok()?;
-        let path = dir.join(format!("catalog-v{VERSION}.db"));
+        let path = dir.join(filename());
         // Cached titles and prompt previews have the same sensitivity as the
         // source metadata. Create the DB privately before SQLite opens it.
         let mut options = fs::OpenOptions::new();
@@ -569,7 +569,7 @@ mod tests {
         assert_eq!(cached_text(&path, &path, &calls), "value");
         let dir = tmp.path().join("cache");
         fs::create_dir(&dir).unwrap();
-        let db = dir.join(format!("catalog-v{VERSION}.db"));
+        let db = dir.join(filename());
         fs::write(&db, "not sqlite").unwrap();
         assert_eq!(cached_text(&dir, &path, &calls), "value");
         fs::remove_file(&db).unwrap();
@@ -825,7 +825,7 @@ mod tests {
             0o700
         );
         assert_eq!(
-            fs::metadata(dir.join(format!("catalog-v{VERSION}.db")))
+            fs::metadata(dir.join(filename()))
                 .unwrap()
                 .permissions()
                 .mode()

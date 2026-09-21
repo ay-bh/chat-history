@@ -128,7 +128,13 @@ fn writable(dir: &Path) -> bool {
     if builder.create(dir).is_err() {
         return false;
     }
-    let probe = dir.join(format!(".write-probe-{}", std::process::id()));
+    // Named uniquely enough that a probe left by a killed process with a
+    // reused PID cannot make a writable directory look unwritable.
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let probe = dir.join(format!(".write-probe-{}-{nonce}", std::process::id()));
     let mut options = fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -179,7 +185,7 @@ fn private_dir(dir: &Path) -> Option<()> {
 }
 
 /// Copies one cache database into `to` unless a copy is already there. A
-/// database with a write-ahead log beside it may be mid-update and is
+/// database with a SQLite sidecar beside it may be mid-update and is
 /// skipped; a copy whose source changed underneath it is discarded. Each
 /// process cleans up only its own staging file: another process's file may
 /// be a copy in progress, and a leftover from a crash is the temp
@@ -188,7 +194,10 @@ fn private_dir(dir: &Path) -> Option<()> {
 fn seed_file(from: &Path, to: &Path, name: &str) {
     let source = from.join(name);
     let target = to.join(name);
-    if target.exists() || from.join(format!("{name}-wal")).exists() {
+    let in_use = ["-wal", "-shm", "-journal"]
+        .iter()
+        .any(|suffix| from.join(format!("{name}{suffix}")).exists());
+    if target.exists() || in_use {
         return;
     }
     let Ok(before) = fs::metadata(&source) else {
@@ -215,7 +224,12 @@ fn seed_file(from: &Path, to: &Path, name: &str) {
 /// link refuses an existing target atomically, so two processes seeding at
 /// once cannot replace a copy the other has already opened.
 fn place(staging: &Path, target: &Path) -> bool {
-    let placed = fs::hard_link(staging, target).is_ok();
+    let placed = match fs::hard_link(staging, target) {
+        Ok(()) => true,
+        Err(e) if e.kind() == ErrorKind::AlreadyExists => false,
+        // No hard links on this filesystem: a guarded rename is the best left.
+        Err(_) => !target.exists() && fs::rename(staging, target).is_ok(),
+    };
     let _ = fs::remove_file(staging);
     placed
 }
@@ -227,8 +241,18 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
 
-    fn read_only(dir: &Path) {
+    /// Restores write permission on drop so the temp directory can be removed.
+    struct ReadOnly(PathBuf);
+
+    impl Drop for ReadOnly {
+        fn drop(&mut self) {
+            let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o700));
+        }
+    }
+
+    fn read_only(dir: &Path) -> ReadOnly {
         fs::set_permissions(dir, fs::Permissions::from_mode(0o500)).unwrap();
+        ReadOnly(dir.to_path_buf())
     }
 
     fn age(path: &Path, secs: u64) {
@@ -241,13 +265,13 @@ mod tests {
             .unwrap();
     }
 
-    fn unwritable_cache(tmp: &TempDir) -> PathBuf {
+    fn unwritable_cache(tmp: &TempDir) -> (PathBuf, ReadOnly) {
         let preferred = tmp.path().join("cache");
         fs::create_dir(&preferred).unwrap();
         fs::write(preferred.join("search-v2.db"), "index").unwrap();
         fs::write(preferred.join("catalog-v1.db"), "catalog").unwrap();
-        read_only(&preferred);
-        preferred
+        let guard = read_only(&preferred);
+        (preferred, guard)
     }
 
     #[test]
@@ -270,7 +294,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let preferred = tmp.path().join("explicit");
         fs::create_dir(&preferred).unwrap();
-        read_only(&preferred);
+        let _guard = read_only(&preferred);
         let root = tmp.path().join("tmp");
         let resolved = resolve_with(&preferred, true, Some(&root)).unwrap();
         assert_eq!(resolved.dir, preferred);
@@ -281,7 +305,7 @@ mod tests {
     #[test]
     fn unwritable_default_falls_back_to_a_private_directory_without_copying() {
         let tmp = TempDir::new().unwrap();
-        let preferred = unwritable_cache(&tmp);
+        let (preferred, _guard) = unwritable_cache(&tmp);
         let root = tmp.path().join("tmp");
         let resolved = resolve_with(&preferred, false, Some(&root)).unwrap();
         assert_eq!(resolved.dir, root.join("cache"));
@@ -310,7 +334,7 @@ mod tests {
     #[test]
     fn each_database_is_seeded_only_when_asked_for() {
         let tmp = TempDir::new().unwrap();
-        let preferred = unwritable_cache(&tmp);
+        let (preferred, _guard) = unwritable_cache(&tmp);
         let root = tmp.path().join("tmp");
         let resolved = resolve_with(&preferred, false, Some(&root)).unwrap();
         seed_file(&preferred, &resolved.dir, "catalog-v1.db");
@@ -329,6 +353,37 @@ mod tests {
     }
 
     #[test]
+    fn seeding_skips_a_database_with_any_sqlite_sidecar() {
+        let tmp = TempDir::new().unwrap();
+        let preferred = tmp.path().join("cache");
+        fs::create_dir(&preferred).unwrap();
+        let to = tmp.path().join("to");
+        fs::create_dir(&to).unwrap();
+        for sidecar in ["-shm", "-journal"] {
+            fs::write(preferred.join("search-v2.db"), "busy").unwrap();
+            fs::write(preferred.join(format!("search-v2.db{sidecar}")), "x").unwrap();
+            seed_file(&preferred, &to, "search-v2.db");
+            assert!(!to.join("search-v2.db").exists(), "{sidecar} means in use");
+            fs::remove_file(preferred.join(format!("search-v2.db{sidecar}"))).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_probe_file_left_by_a_killed_process_does_not_make_a_directory_unwritable() {
+        let tmp = TempDir::new().unwrap();
+        let preferred = tmp.path().join("cache");
+        fs::create_dir(&preferred).unwrap();
+        fs::write(
+            preferred.join(format!(".write-probe-{}", std::process::id())),
+            "leftover",
+        )
+        .unwrap();
+        let root = tmp.path().join("tmp");
+        let resolved = resolve_with(&preferred, false, Some(&root)).unwrap();
+        assert!(matches!(resolved.kind, Kind::Default));
+    }
+
+    #[test]
     fn seeding_skips_a_database_with_a_live_write_ahead_log_or_an_existing_copy() {
         let tmp = TempDir::new().unwrap();
         let preferred = tmp.path().join("cache");
@@ -336,7 +391,7 @@ mod tests {
         fs::write(preferred.join("search-v2.db"), "busy").unwrap();
         fs::write(preferred.join("search-v2.db-wal"), "frames").unwrap();
         fs::write(preferred.join("catalog-v1.db"), "new catalog").unwrap();
-        read_only(&preferred);
+        let _guard = read_only(&preferred);
         let to = tmp.path().join("to");
         fs::create_dir(&to).unwrap();
         fs::write(to.join("catalog-v1.db"), "old catalog").unwrap();
@@ -368,7 +423,7 @@ mod tests {
         // A copy keeps its source's timestamp on some platforms, so age says
         // nothing about whether another process is still copying.
         let tmp = TempDir::new().unwrap();
-        let preferred = unwritable_cache(&tmp);
+        let (preferred, _guard) = unwritable_cache(&tmp);
         age(&preferred.join("search-v2.db"), 8 * 86_400);
         let to = tmp.path().join("to");
         fs::create_dir(&to).unwrap();
@@ -390,7 +445,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let preferred = tmp.path().join("cache");
         fs::create_dir(&preferred).unwrap();
-        read_only(&preferred);
+        let _guard = read_only(&preferred);
         let target = tmp.path().join("elsewhere");
         fs::create_dir(&target).unwrap();
         let root = tmp.path().join("tmp");
@@ -403,7 +458,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let preferred = tmp.path().join("cache");
         fs::create_dir(&preferred).unwrap();
-        read_only(&preferred);
+        let _guard = read_only(&preferred);
         let root = tmp.path().join("tmp");
         fs::create_dir(&root).unwrap();
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
@@ -418,7 +473,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let preferred = tmp.path().join("cache");
         fs::create_dir(&preferred).unwrap();
-        read_only(&preferred);
+        let _guard = read_only(&preferred);
         assert!(resolve_with(&preferred, false, None).is_none());
     }
 }

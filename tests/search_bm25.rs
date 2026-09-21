@@ -1816,6 +1816,13 @@ fn read_only_home_cache_falls_back_to_a_private_temp_copy_without_rebuilding() {
     assert!(warm.status.success());
     let home_cache = tmp.path().join(".chat-history/cache");
     assert!(home_cache.join(INDEX_FILENAME).exists());
+    struct Restore(std::path::PathBuf);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o700));
+        }
+    }
+    let _restore = Restore(home_cache.clone());
     fs::set_permissions(&home_cache, fs::Permissions::from_mode(0o500)).unwrap();
 
     // A listing needs the metadata catalog only; the search index is not copied.
@@ -1860,5 +1867,4 @@ fn read_only_home_cache_falls_back_to_a_private_temp_copy_without_rebuilding() {
     assert!(second.status.success(), "{stderr}");
     assert!(!stderr.contains("not writable"), "quiet on reuse: {stderr}");
     assert_eq!(second.stdout, warm.stdout);
-    fs::set_permissions(&home_cache, fs::Permissions::from_mode(0o700)).unwrap();
 }
