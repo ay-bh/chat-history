@@ -184,6 +184,17 @@ fn private_dir(dir: &Path) -> Option<()> {
 /// skipped; a copy whose source changed underneath it is discarded. The
 /// copies are only a head start: every session is re-verified on sync.
 fn seed(from: &Path, to: &Path) {
+    let pid = std::process::id();
+    let mine = format!(".seed-{pid}");
+    if let Ok(entries) = fs::read_dir(to) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with('.') && name.contains(".seed-") && !name.ends_with(&mine) {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+    }
     for name in seedable() {
         let source = from.join(&name);
         let target = to.join(&name);
@@ -193,7 +204,7 @@ fn seed(from: &Path, to: &Path) {
         let Ok(before) = fs::metadata(&source) else {
             continue;
         };
-        let staging = to.join(format!(".{name}.seed-{}", std::process::id()));
+        let staging = to.join(format!(".{name}{mine}"));
         let copied = fs::copy(&source, &staging).is_ok()
             && fs::metadata(&source).is_ok_and(|after| {
                 after.len() == before.len() && after.modified().ok() == before.modified().ok()
@@ -203,10 +214,21 @@ fn seed(from: &Path, to: &Path) {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&staging, fs::Permissions::from_mode(0o600)).is_ok()
         };
-        if !copied || fs::rename(&staging, &target).is_err() {
+        if copied {
+            place(&staging, &target);
+        } else {
             let _ = fs::remove_file(&staging);
         }
     }
+}
+
+/// Moves a finished copy into place only if nothing is there yet. A hard
+/// link refuses an existing target atomically, so two processes seeding at
+/// once cannot replace a copy the other has already opened.
+fn place(staging: &Path, target: &Path) -> bool {
+    let placed = fs::hard_link(staging, target).is_ok();
+    let _ = fs::remove_file(staging);
+    placed
 }
 
 #[cfg(test)]
@@ -302,6 +324,40 @@ mod tests {
             fs::read(root.join("cache/catalog-v1.db")).unwrap(),
             b"old catalog"
         );
+    }
+
+    #[test]
+    fn a_copy_placed_first_by_another_process_is_kept() {
+        let tmp = TempDir::new().unwrap();
+        let staging = tmp.path().join(".search-v2.db.seed-1");
+        let target = tmp.path().join("search-v2.db");
+        fs::write(&staging, "mine").unwrap();
+        fs::write(&target, "theirs").unwrap();
+        assert!(!place(&staging, &target));
+        assert_eq!(fs::read(&target).unwrap(), b"theirs");
+        assert!(!staging.exists(), "staging copy is discarded");
+        fs::write(&staging, "mine").unwrap();
+        fs::remove_file(&target).unwrap();
+        assert!(place(&staging, &target));
+        assert_eq!(fs::read(&target).unwrap(), b"mine");
+        assert!(!staging.exists());
+    }
+
+    #[test]
+    fn staging_files_left_by_an_interrupted_seed_are_removed() {
+        let tmp = TempDir::new().unwrap();
+        let preferred = tmp.path().join("cache");
+        fs::create_dir(&preferred).unwrap();
+        fs::write(preferred.join("search-v2.db"), "index").unwrap();
+        read_only(&preferred);
+        let root = tmp.path().join("tmp");
+        fs::create_dir_all(root.join("cache")).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let leftover = root.join("cache/.search-v2.db.seed-99999");
+        fs::write(&leftover, "partial").unwrap();
+        resolve_with(&preferred, false, Some(&root)).unwrap();
+        assert!(!leftover.exists());
+        assert_eq!(fs::read(root.join("cache/search-v2.db")).unwrap(), b"index");
     }
 
     #[test]
