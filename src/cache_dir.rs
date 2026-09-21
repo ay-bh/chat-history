@@ -7,7 +7,6 @@ use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-use std::time::Duration;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Kind {
@@ -181,8 +180,11 @@ fn private_dir(dir: &Path) -> Option<()> {
 
 /// Copies one cache database into `to` unless a copy is already there. A
 /// database with a write-ahead log beside it may be mid-update and is
-/// skipped; a copy whose source changed underneath it is discarded. The copy
-/// is only a head start: every session is re-verified on the next sync.
+/// skipped; a copy whose source changed underneath it is discarded. Each
+/// process cleans up only its own staging file: another process's file may
+/// be a copy in progress, and a leftover from a crash is the temp
+/// directory's to expire. The copy is only a head start: every session is
+/// re-verified on the next sync.
 fn seed_file(from: &Path, to: &Path, name: &str) {
     let source = from.join(name);
     let target = to.join(name);
@@ -192,7 +194,6 @@ fn seed_file(from: &Path, to: &Path, name: &str) {
     let Ok(before) = fs::metadata(&source) else {
         return;
     };
-    remove_abandoned_staging(to);
     let staging = to.join(format!(".{name}.seed-{}", std::process::id()));
     let copied = fs::copy(&source, &staging).is_ok()
         && fs::metadata(&source).is_ok_and(|after| {
@@ -207,31 +208,6 @@ fn seed_file(from: &Path, to: &Path, name: &str) {
         place(&staging, &target);
     } else {
         let _ = fs::remove_file(&staging);
-    }
-}
-
-/// A staging file belongs to a process that may still be copying. Only one
-/// untouched for longer than any copy takes is treated as abandoned.
-fn remove_abandoned_staging(dir: &Path) {
-    const ABANDONED: Duration = Duration::from_secs(3600);
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if !name.starts_with('.') || !name.contains(".seed-") {
-            continue;
-        }
-        let abandoned = entry
-            .metadata()
-            .and_then(|m| m.modified())
-            .ok()
-            .and_then(|m| m.elapsed().ok())
-            .is_some_and(|age| age >= ABANDONED);
-        if abandoned {
-            let _ = fs::remove_file(entry.path());
-        }
     }
 }
 
@@ -388,20 +364,25 @@ mod tests {
     }
 
     #[test]
-    fn only_staging_files_abandoned_for_an_hour_are_removed() {
+    fn other_processes_staging_files_are_never_touched() {
+        // A copy keeps its source's timestamp on some platforms, so age says
+        // nothing about whether another process is still copying.
         let tmp = TempDir::new().unwrap();
         let preferred = unwritable_cache(&tmp);
+        age(&preferred.join("search-v2.db"), 8 * 86_400);
         let to = tmp.path().join("to");
         fs::create_dir(&to).unwrap();
-        let abandoned = to.join(".search-v2.db.seed-99998");
-        let in_progress = to.join(".catalog-v1.db.seed-99999");
-        fs::write(&abandoned, "partial").unwrap();
-        fs::write(&in_progress, "partial").unwrap();
-        age(&abandoned, 2 * 3600);
+        let theirs = to.join(".search-v2.db.seed-99999");
+        fs::write(&theirs, "partial").unwrap();
+        age(&theirs, 8 * 86_400);
         seed_file(&preferred, &to, "search-v2.db");
-        assert!(!abandoned.exists());
-        assert!(in_progress.exists(), "another process may still be copying");
+        assert!(theirs.exists());
         assert_eq!(fs::read(to.join("search-v2.db")).unwrap(), b"index");
+        assert_eq!(
+            fs::read_dir(&to).unwrap().count(),
+            2,
+            "own staging file removed, theirs kept"
+        );
     }
 
     #[test]
