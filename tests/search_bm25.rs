@@ -1653,19 +1653,33 @@ fn count(conn: &rusqlite::Connection, sql: &str) -> i64 {
 }
 
 #[test]
-fn opening_the_index_removes_the_previous_schema_generation() {
+fn opening_the_index_removes_an_idle_previous_schema_generation() {
     let tmp = TempDir::new().unwrap();
     let dir = tmp.path().join("index");
     fs::create_dir(&dir).unwrap();
-    let stale = ["search-v1.db", "search-v1.db-wal", "search-v1.db-shm"];
-    for name in stale {
-        fs::write(dir.join(name), "stale").unwrap();
-    }
+    fs::write(dir.join("search-v1.db"), "stale").unwrap();
     assert_eq!(INDEX_FILENAME, "search-v2.db");
     drop(Bm25Backend::open(Some(&dir)).unwrap());
     assert!(dir.join(INDEX_FILENAME).exists());
-    for name in stale {
-        assert!(!dir.join(name).exists(), "{name} should be removed");
+    assert!(!dir.join("search-v1.db").exists());
+}
+
+#[test]
+fn a_previous_generation_with_live_sidecars_is_left_for_its_binary() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join("index");
+    fs::create_dir(&dir).unwrap();
+    let live = ["search-v1.db", "search-v1.db-wal", "search-v1.db-shm"];
+    for name in live {
+        fs::write(dir.join(name), "in use").unwrap();
+    }
+    drop(Bm25Backend::open(Some(&dir)).unwrap());
+    assert!(dir.join(INDEX_FILENAME).exists());
+    for name in live {
+        assert!(
+            dir.join(name).exists(),
+            "{name} must not be removed while open"
+        );
     }
 }
 

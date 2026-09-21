@@ -22,7 +22,7 @@ pub type Result<T> = std::result::Result<T, SearchError>;
 pub const INDEX_FILENAME: &str = "search-v2.db";
 /// Earlier generations wrote full-text rows through an insert trigger. An older
 /// binary sharing the directory would recreate that trigger, so they are not
-/// migrated in place: the file is replaced and the stale copy removed.
+/// migrated in place: a new file is used and an idle stale copy removed.
 const PREVIOUS_INDEX_FILENAMES: [&str; 1] = ["search-v1.db"];
 // Bump for parser, timestamp, chunking or tokenization changes that require
 // re-extracting unchanged sources without changing the relational schema.
@@ -396,13 +396,14 @@ impl Bm25Backend {
                 builder.mode(0o700);
             }
             builder.create(dir)?;
+            // Best effort: live WAL/SHM sidecars mean an older binary still has
+            // the file open, so it is left for a later run to reclaim.
             for stale in PREVIOUS_INDEX_FILENAMES {
-                for suffix in ["", "-wal", "-shm"] {
-                    match fs::remove_file(dir.join(format!("{stale}{suffix}"))) {
-                        Ok(()) => {}
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                        Err(e) => return Err(e.into()),
-                    }
+                let in_use = ["-wal", "-shm"]
+                    .iter()
+                    .any(|suffix| dir.join(format!("{stale}{suffix}")).exists());
+                if !in_use {
+                    let _ = fs::remove_file(dir.join(stale));
                 }
             }
             let path = dir.join(INDEX_FILENAME);
