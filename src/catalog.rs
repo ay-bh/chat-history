@@ -288,8 +288,8 @@ pub(crate) fn with_catalog<T>(sources: &[&str], load: impl FnOnce() -> T) -> T {
     if std::env::var_os("CHAT_HISTORY_NO_CACHE").is_some() {
         return load();
     }
-    let dir = crate::cache_dir::resolve().map(|r| r.dir.as_path());
-    with_directory(dir, sources, load)
+    let dir = crate::cache_dir::prepare(&filename());
+    with_directory(dir.as_deref(), sources, load)
 }
 
 fn with_directory<T>(dir: Option<&Path>, sources: &[&str], load: impl FnOnce() -> T) -> T {

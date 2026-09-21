@@ -1799,6 +1799,7 @@ fn full_text_rows_are_written_once_without_an_insert_trigger() {
 }
 
 #[test]
+#[cfg(unix)]
 fn read_only_home_cache_falls_back_to_a_private_temp_copy_without_rebuilding() {
     use std::os::unix::fs::PermissionsExt;
     let tmp = TempDir::new().unwrap();
@@ -1817,16 +1818,14 @@ fn read_only_home_cache_falls_back_to_a_private_temp_copy_without_rebuilding() {
     assert!(home_cache.join(INDEX_FILENAME).exists());
     fs::set_permissions(&home_cache, fs::Permissions::from_mode(0o500)).unwrap();
 
-    let first = run();
-    let stderr = String::from_utf8_lossy(&first.stderr);
-    assert!(first.status.success(), "{stderr}");
-    assert!(stderr.contains("not writable"), "{stderr}");
-    assert!(!stderr.contains("in-memory BM25"), "{stderr}");
+    // A listing needs the metadata catalog only; the search index is not copied.
+    let listing = command(&tmp).env("TMPDIR", &temp_root).output().unwrap();
+    let stderr = String::from_utf8_lossy(&listing.stderr);
+    assert!(listing.status.success(), "{stderr}");
     assert!(
-        !stderr.contains("Updating search index"),
-        "seeded copy must not rebuild: {stderr}"
+        stderr.contains("not writable"),
+        "one note when created: {stderr}"
     );
-    assert_eq!(first.stdout, warm.stdout);
     let fallback = fs::read_dir(&temp_root)
         .unwrap()
         .map(|e| e.unwrap().path())
@@ -1837,6 +1836,19 @@ fn read_only_home_cache_falls_back_to_a_private_temp_copy_without_rebuilding() {
                 .starts_with("chat-history-")
         })
         .expect("private fallback directory");
+    assert!(fallback.join("cache/catalog-v1.db").exists());
+    assert!(!fallback.join("cache").join(INDEX_FILENAME).exists());
+
+    let first = run();
+    let stderr = String::from_utf8_lossy(&first.stderr);
+    assert!(first.status.success(), "{stderr}");
+    assert!(!stderr.contains("not writable"), "quiet on reuse: {stderr}");
+    assert!(!stderr.contains("in-memory BM25"), "{stderr}");
+    assert!(
+        !stderr.contains("Updating search index"),
+        "seeded copy must not rebuild: {stderr}"
+    );
+    assert_eq!(first.stdout, warm.stdout);
     assert_eq!(
         fs::metadata(&fallback).unwrap().permissions().mode() & 0o777,
         0o700

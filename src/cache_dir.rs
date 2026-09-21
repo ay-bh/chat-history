@@ -7,15 +7,7 @@ use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-
-/// Cache databases worth carrying into a fallback directory. Older
-/// generations are left behind; the owning module removes them on open.
-fn seedable() -> [String; 2] {
-    [
-        crate::search_index::INDEX_FILENAME.to_owned(),
-        crate::catalog::filename(),
-    ]
-}
+use std::time::Duration;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Kind {
@@ -33,9 +25,20 @@ pub struct Resolved {
     pub kind: Kind,
 }
 
+/// The cache directory for one database, seeded from the home copy when a
+/// fallback is in use. Each backend asks for its own file, so a listing that
+/// needs only the metadata catalog never copies the search index.
+pub fn prepare(name: &str) -> Option<PathBuf> {
+    let resolved = resolve()?;
+    if let Kind::Fallback { from, .. } = &resolved.kind {
+        seed_file(from, &resolved.dir, name);
+    }
+    Some(resolved.dir.clone())
+}
+
 /// The process-wide cache directory: the environment override, else the
-/// default under the home directory, else a private temp copy. Prints one
-/// note the first time the temp copy is created; reuse is quiet.
+/// default under the home directory, else a private temp directory. Prints
+/// one note the first time the temp directory is created; reuse is quiet.
 pub fn resolve() -> Option<&'static Resolved> {
     static RESOLVED: OnceLock<Option<Resolved>> = OnceLock::new();
     RESOLVED
@@ -90,11 +93,8 @@ pub fn resolve_with(
     let root = fallback_root?;
     private_dir(root)?;
     let dir = root.join("cache");
-    let created = !dir.is_dir();
-    if created {
-        private_dir(&dir)?;
-    }
-    seed(preferred, &dir);
+    let created = fs::symlink_metadata(&dir).is_err();
+    private_dir(&dir)?;
     Some(Resolved {
         dir,
         kind: Kind::Fallback {
@@ -179,45 +179,58 @@ fn private_dir(dir: &Path) -> Option<()> {
     Some(())
 }
 
-/// Copies current cache databases that are not already present in `to`.
-/// A database with a write-ahead log beside it may be mid-update and is
-/// skipped; a copy whose source changed underneath it is discarded. The
-/// copies are only a head start: every session is re-verified on sync.
-fn seed(from: &Path, to: &Path) {
-    let pid = std::process::id();
-    let mine = format!(".seed-{pid}");
-    if let Ok(entries) = fs::read_dir(to) {
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if name.starts_with('.') && name.contains(".seed-") && !name.ends_with(&mine) {
-                let _ = fs::remove_file(entry.path());
-            }
-        }
+/// Copies one cache database into `to` unless a copy is already there. A
+/// database with a write-ahead log beside it may be mid-update and is
+/// skipped; a copy whose source changed underneath it is discarded. The copy
+/// is only a head start: every session is re-verified on the next sync.
+fn seed_file(from: &Path, to: &Path, name: &str) {
+    let source = from.join(name);
+    let target = to.join(name);
+    if target.exists() || from.join(format!("{name}-wal")).exists() {
+        return;
     }
-    for name in seedable() {
-        let source = from.join(&name);
-        let target = to.join(&name);
-        if target.exists() || from.join(format!("{name}-wal")).exists() {
+    let Ok(before) = fs::metadata(&source) else {
+        return;
+    };
+    remove_abandoned_staging(to);
+    let staging = to.join(format!(".{name}.seed-{}", std::process::id()));
+    let copied = fs::copy(&source, &staging).is_ok()
+        && fs::metadata(&source).is_ok_and(|after| {
+            after.len() == before.len() && after.modified().ok() == before.modified().ok()
+        });
+    #[cfg(unix)]
+    let copied = copied && {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&staging, fs::Permissions::from_mode(0o600)).is_ok()
+    };
+    if copied {
+        place(&staging, &target);
+    } else {
+        let _ = fs::remove_file(&staging);
+    }
+}
+
+/// A staging file belongs to a process that may still be copying. Only one
+/// untouched for longer than any copy takes is treated as abandoned.
+fn remove_abandoned_staging(dir: &Path) {
+    const ABANDONED: Duration = Duration::from_secs(3600);
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with('.') || !name.contains(".seed-") {
             continue;
         }
-        let Ok(before) = fs::metadata(&source) else {
-            continue;
-        };
-        let staging = to.join(format!(".{name}{mine}"));
-        let copied = fs::copy(&source, &staging).is_ok()
-            && fs::metadata(&source).is_ok_and(|after| {
-                after.len() == before.len() && after.modified().ok() == before.modified().ok()
-            });
-        #[cfg(unix)]
-        let copied = copied && {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&staging, fs::Permissions::from_mode(0o600)).is_ok()
-        };
-        if copied {
-            place(&staging, &target);
-        } else {
-            let _ = fs::remove_file(&staging);
+        let abandoned = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|m| m.elapsed().ok())
+            .is_some_and(|age| age >= ABANDONED);
+        if abandoned {
+            let _ = fs::remove_file(entry.path());
         }
     }
 }
@@ -231,15 +244,34 @@ fn place(staging: &Path, target: &Path) -> bool {
     placed
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
 
-    fn read_only(dir: &std::path::Path) {
+    fn read_only(dir: &Path) {
         fs::set_permissions(dir, fs::Permissions::from_mode(0o500)).unwrap();
+    }
+
+    fn age(path: &Path, secs: u64) {
+        let when = std::time::SystemTime::now() - std::time::Duration::from_secs(secs);
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(when)
+            .unwrap();
+    }
+
+    fn unwritable_cache(tmp: &TempDir) -> PathBuf {
+        let preferred = tmp.path().join("cache");
+        fs::create_dir(&preferred).unwrap();
+        fs::write(preferred.join("search-v2.db"), "index").unwrap();
+        fs::write(preferred.join("catalog-v1.db"), "catalog").unwrap();
+        read_only(&preferred);
+        preferred
     }
 
     #[test]
@@ -271,13 +303,9 @@ mod tests {
     }
 
     #[test]
-    fn unwritable_default_falls_back_to_a_private_seeded_copy() {
+    fn unwritable_default_falls_back_to_a_private_directory_without_copying() {
         let tmp = TempDir::new().unwrap();
-        let preferred = tmp.path().join("cache");
-        fs::create_dir(&preferred).unwrap();
-        fs::write(preferred.join("search-v2.db"), "index").unwrap();
-        fs::write(preferred.join("catalog-v1.db"), "catalog").unwrap();
-        read_only(&preferred);
+        let preferred = unwritable_cache(&tmp);
         let root = tmp.path().join("tmp");
         let resolved = resolve_with(&preferred, false, Some(&root)).unwrap();
         assert_eq!(resolved.dir, root.join("cache"));
@@ -288,21 +316,44 @@ mod tests {
             }
             other => panic!("expected fallback, got {other:?}"),
         }
+        for dir in [&root, &root.join("cache")] {
+            assert_eq!(
+                fs::metadata(dir).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
         assert_eq!(
-            fs::metadata(&root).unwrap().permissions().mode() & 0o777,
-            0o700
-        );
-        assert_eq!(fs::read(root.join("cache/search-v2.db")).unwrap(), b"index");
-        assert_eq!(
-            fs::read(root.join("cache/catalog-v1.db")).unwrap(),
-            b"catalog"
+            fs::read_dir(root.join("cache")).unwrap().count(),
+            0,
+            "seeding is per database, on demand"
         );
         let again = resolve_with(&preferred, false, Some(&root)).unwrap();
         assert!(matches!(again.kind, Kind::Fallback { created: false, .. }));
     }
 
     #[test]
-    fn seeding_skips_databases_with_an_open_write_ahead_log_or_existing_copies() {
+    fn each_database_is_seeded_only_when_asked_for() {
+        let tmp = TempDir::new().unwrap();
+        let preferred = unwritable_cache(&tmp);
+        let root = tmp.path().join("tmp");
+        let resolved = resolve_with(&preferred, false, Some(&root)).unwrap();
+        seed_file(&preferred, &resolved.dir, "catalog-v1.db");
+        assert_eq!(
+            fs::read(root.join("cache/catalog-v1.db")).unwrap(),
+            b"catalog"
+        );
+        assert!(!root.join("cache/search-v2.db").exists());
+        seed_file(&preferred, &resolved.dir, "search-v2.db");
+        assert_eq!(fs::read(root.join("cache/search-v2.db")).unwrap(), b"index");
+        let mode = fs::metadata(root.join("cache/search-v2.db"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[test]
+    fn seeding_skips_a_database_with_a_live_write_ahead_log_or_an_existing_copy() {
         let tmp = TempDir::new().unwrap();
         let preferred = tmp.path().join("cache");
         fs::create_dir(&preferred).unwrap();
@@ -310,20 +361,13 @@ mod tests {
         fs::write(preferred.join("search-v2.db-wal"), "frames").unwrap();
         fs::write(preferred.join("catalog-v1.db"), "new catalog").unwrap();
         read_only(&preferred);
-        let root = tmp.path().join("tmp");
-        fs::create_dir_all(root.join("cache")).unwrap();
-        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
-        fs::write(root.join("cache/catalog-v1.db"), "old catalog").unwrap();
-        let resolved = resolve_with(&preferred, false, Some(&root)).unwrap();
-        assert!(matches!(
-            resolved.kind,
-            Kind::Fallback { created: false, .. }
-        ));
-        assert!(!root.join("cache/search-v2.db").exists());
-        assert_eq!(
-            fs::read(root.join("cache/catalog-v1.db")).unwrap(),
-            b"old catalog"
-        );
+        let to = tmp.path().join("to");
+        fs::create_dir(&to).unwrap();
+        fs::write(to.join("catalog-v1.db"), "old catalog").unwrap();
+        seed_file(&preferred, &to, "search-v2.db");
+        seed_file(&preferred, &to, "catalog-v1.db");
+        assert!(!to.join("search-v2.db").exists());
+        assert_eq!(fs::read(to.join("catalog-v1.db")).unwrap(), b"old catalog");
     }
 
     #[test]
@@ -344,20 +388,20 @@ mod tests {
     }
 
     #[test]
-    fn staging_files_left_by_an_interrupted_seed_are_removed() {
+    fn only_staging_files_abandoned_for_an_hour_are_removed() {
         let tmp = TempDir::new().unwrap();
-        let preferred = tmp.path().join("cache");
-        fs::create_dir(&preferred).unwrap();
-        fs::write(preferred.join("search-v2.db"), "index").unwrap();
-        read_only(&preferred);
-        let root = tmp.path().join("tmp");
-        fs::create_dir_all(root.join("cache")).unwrap();
-        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
-        let leftover = root.join("cache/.search-v2.db.seed-99999");
-        fs::write(&leftover, "partial").unwrap();
-        resolve_with(&preferred, false, Some(&root)).unwrap();
-        assert!(!leftover.exists());
-        assert_eq!(fs::read(root.join("cache/search-v2.db")).unwrap(), b"index");
+        let preferred = unwritable_cache(&tmp);
+        let to = tmp.path().join("to");
+        fs::create_dir(&to).unwrap();
+        let abandoned = to.join(".search-v2.db.seed-99998");
+        let in_progress = to.join(".catalog-v1.db.seed-99999");
+        fs::write(&abandoned, "partial").unwrap();
+        fs::write(&in_progress, "partial").unwrap();
+        age(&abandoned, 2 * 3600);
+        seed_file(&preferred, &to, "search-v2.db");
+        assert!(!abandoned.exists());
+        assert!(in_progress.exists(), "another process may still be copying");
+        assert_eq!(fs::read(to.join("search-v2.db")).unwrap(), b"index");
     }
 
     #[test]
@@ -370,6 +414,21 @@ mod tests {
         fs::create_dir(&target).unwrap();
         let root = tmp.path().join("tmp");
         std::os::unix::fs::symlink(&target, &root).unwrap();
+        assert!(resolve_with(&preferred, false, Some(&root)).is_none());
+    }
+
+    #[test]
+    fn a_cache_child_that_is_a_symlink_is_refused_even_inside_a_valid_root() {
+        let tmp = TempDir::new().unwrap();
+        let preferred = tmp.path().join("cache");
+        fs::create_dir(&preferred).unwrap();
+        read_only(&preferred);
+        let root = tmp.path().join("tmp");
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let target = tmp.path().join("elsewhere");
+        fs::create_dir(&target).unwrap();
+        std::os::unix::fs::symlink(&target, root.join("cache")).unwrap();
         assert!(resolve_with(&preferred, false, Some(&root)).is_none());
     }
 

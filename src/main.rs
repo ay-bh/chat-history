@@ -485,7 +485,7 @@ fn main() {
                 } else {
                     cache_dir
                         .filter(|p| !p.as_os_str().is_empty())
-                        .or_else(|| chat_history::cache_dir::resolve().map(|r| r.dir.clone()))
+                        .or_else(|| chat_history::cache_dir::prepare(search_index::INDEX_FILENAME))
                 };
                 search_index::search_corpus(
                     search_corpus.as_deref().unwrap_or(&sessions),
