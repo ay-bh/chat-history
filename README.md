@@ -35,7 +35,9 @@ The skill is active immediately — no restart needed.
 
 ### Running inside agent sandboxes
 
-Codex, Claude Code and Cursor can run commands in a sandbox that allows writes only inside the project and the OS temp directory. The caches live under `~/.chat-history/cache`, so a sandboxed search cannot update them. When that happens, `chat-history` copies the existing caches into a user-private directory under the temp directory, keeps them up to date there, and prints one `Note:` line the first time. Later sandboxed searches are quiet and warm. Claude Code gives each session its own temp directory, so the copy lasts for that session.
+Codex, Claude Code and Cursor can run commands in a sandbox that allows writes only inside the project and temporary directories. The caches live under `~/.chat-history/cache`, so a sandboxed search may not be able to update them. When that happens, `chat-history` automatically uses a user-private writable temporary directory: on Unix it tries shared `/tmp` first, then the OS/session temp directory. Shared `/tmp` lets the cache survive across agent sessions; a session-specific temp directory lasts only as long as that directory is retained.
+
+Each cache is seeded from the home copy only when needed and when no SQLite sidecars are present; otherwise it is built in the fallback directory. A listing needs only the catalog, not the search index. One `Note:` line is printed when the fallback cache directory is created, and later reuse is quiet. If no writable cache directory is available, search warns and builds an in-memory index instead.
 
 To let sandboxed searches use the shared cache directly, allow writes to `~/.chat-history`:
 
