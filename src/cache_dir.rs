@@ -99,6 +99,11 @@ pub fn resolve_with(
         let Some(created) = private_dir(&dir) else {
             continue;
         };
+        // Ownership and mode prove nothing about a sandbox: a root left by an
+        // unsandboxed run may be blocked now while the next candidate is open.
+        if !writable(&dir) {
+            continue;
+        }
         return Some(Resolved {
             dir,
             kind: Kind::Fallback {
@@ -257,14 +262,12 @@ fn copy_unchanged(source: &Path, staging: &Path) -> bool {
 
 /// Moves a finished copy into place only if nothing is there yet. A hard
 /// link refuses an existing target atomically, so two processes seeding at
-/// once cannot replace a copy the other has already opened.
+/// once cannot replace a copy the other has already opened. A filesystem
+/// without hard links gets no seed at all: a rename guarded by an existence
+/// check could still replace a file another process just opened, and the
+/// backend builds its cache in the fallback directory once instead.
 fn place(staging: &Path, target: &Path) -> bool {
-    let placed = match fs::hard_link(staging, target) {
-        Ok(()) => true,
-        Err(e) if e.kind() == ErrorKind::AlreadyExists => false,
-        // No hard links on this filesystem: a guarded rename is the best left.
-        Err(_) => !target.exists() && fs::rename(staging, target).is_ok(),
-    };
+    let placed = fs::hard_link(staging, target).is_ok();
     let _ = fs::remove_file(staging);
     placed
 }
@@ -479,6 +482,22 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_hard_link_places_nothing_rather_than_racing_a_rename() {
+        // Linking across directories on the same filesystem works; a target
+        // in a directory that cannot be written stands in for a filesystem
+        // that refuses the link. Nothing must be placed and no rename tried.
+        let tmp = TempDir::new().unwrap();
+        let staging = tmp.path().join(".search-v2.db.seed-1");
+        fs::write(&staging, "mine").unwrap();
+        let locked = tmp.path().join("locked");
+        fs::create_dir(&locked).unwrap();
+        let _guard = read_only(&locked);
+        assert!(!place(&staging, &locked.join("search-v2.db")));
+        assert!(!staging.exists(), "staging copy is discarded");
+        assert!(fs::read_dir(&locked).unwrap().next().is_none());
+    }
+
+    #[test]
     fn other_processes_staging_files_are_never_touched() {
         // A copy keeps its source's timestamp on some platforms, so age says
         // nothing about whether another process is still copying.
@@ -516,6 +535,22 @@ mod tests {
         assert_eq!(resolved.dir, preferred);
         assert!(matches!(resolved.kind, Kind::Default));
         assert!(fs::read_dir(&target).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn an_existing_fallback_root_that_cannot_be_written_yields_to_the_next() {
+        // Ownership and mode say nothing about a sandbox: the root may exist
+        // from an unsandboxed run yet be blocked now.
+        let tmp = TempDir::new().unwrap();
+        let (preferred, _guard) = unwritable_cache(&tmp);
+        let blocked = tmp.path().join("blocked/chat-history-1");
+        fs::create_dir_all(blocked.join("cache")).unwrap();
+        fs::set_permissions(&blocked, fs::Permissions::from_mode(0o700)).unwrap();
+        let _blocked = read_only(&blocked.join("cache"));
+        fs::create_dir(tmp.path().join("tmp")).unwrap();
+        let open = tmp.path().join("tmp/chat-history-1");
+        let resolved = resolve_with(&preferred, false, &[blocked.clone(), open.clone()]).unwrap();
+        assert_eq!(resolved.dir, open.join("cache"));
     }
 
     #[test]
