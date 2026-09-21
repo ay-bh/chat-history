@@ -1797,3 +1797,56 @@ fn full_text_rows_are_written_once_without_an_insert_trigger() {
     let posting: String = conn.query_row(postings, [], |r| r.get(0)).unwrap();
     assert_eq!(posting, "1/1", "deleted passages leave the full-text index");
 }
+
+#[test]
+fn read_only_home_cache_falls_back_to_a_private_temp_copy_without_rebuilding() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = TempDir::new().unwrap();
+    cli_fixture(&tmp);
+    let temp_root = tmp.path().join("tmpdir");
+    fs::create_dir(&temp_root).unwrap();
+    let run = || {
+        let mut cmd = command(&tmp);
+        cmd.env("TMPDIR", &temp_root)
+            .args(["search", "uniquecli", "--json"]);
+        cmd.output().unwrap()
+    };
+    let warm = run();
+    assert!(warm.status.success());
+    let home_cache = tmp.path().join(".chat-history/cache");
+    assert!(home_cache.join(INDEX_FILENAME).exists());
+    fs::set_permissions(&home_cache, fs::Permissions::from_mode(0o500)).unwrap();
+
+    let first = run();
+    let stderr = String::from_utf8_lossy(&first.stderr);
+    assert!(first.status.success(), "{stderr}");
+    assert!(stderr.contains("not writable"), "{stderr}");
+    assert!(!stderr.contains("in-memory BM25"), "{stderr}");
+    assert!(
+        !stderr.contains("Updating search index"),
+        "seeded copy must not rebuild: {stderr}"
+    );
+    assert_eq!(first.stdout, warm.stdout);
+    let fallback = fs::read_dir(&temp_root)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| {
+            p.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("chat-history-")
+        })
+        .expect("private fallback directory");
+    assert_eq!(
+        fs::metadata(&fallback).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    assert!(fallback.join("cache").join(INDEX_FILENAME).exists());
+
+    let second = run();
+    let stderr = String::from_utf8_lossy(&second.stderr);
+    assert!(second.status.success(), "{stderr}");
+    assert!(!stderr.contains("not writable"), "quiet on reuse: {stderr}");
+    assert_eq!(second.stdout, warm.stdout);
+    fs::set_permissions(&home_cache, fs::Permissions::from_mode(0o700)).unwrap();
+}

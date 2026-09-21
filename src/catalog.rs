@@ -13,6 +13,10 @@ use std::{
 
 // Bump when cached extraction semantics or serialized types change.
 const VERSION: &str = "1";
+
+pub(crate) fn filename() -> String {
+    format!("catalog-v{VERSION}.db")
+}
 const RACY_WINDOW: Duration = Duration::from_secs(2);
 
 fn timestamp(time: SystemTime) -> i128 {
@@ -284,11 +288,8 @@ pub(crate) fn with_catalog<T>(sources: &[&str], load: impl FnOnce() -> T) -> T {
     if std::env::var_os("CHAT_HISTORY_NO_CACHE").is_some() {
         return load();
     }
-    let dir = std::env::var_os("CHAT_HISTORY_CACHE_DIR")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| crate::session::user_home().map(|p| p.join(".chat-history/cache")));
-    with_directory(dir.as_deref(), sources, load)
+    let dir = crate::cache_dir::resolve().map(|r| r.dir.as_path());
+    with_directory(dir, sources, load)
 }
 
 fn with_directory<T>(dir: Option<&Path>, sources: &[&str], load: impl FnOnce() -> T) -> T {

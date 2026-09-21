@@ -33,6 +33,20 @@ chat-history install-skill --force   # overwrite even user-edited skills
 
 The skill is active immediately — no restart needed.
 
+### Running inside agent sandboxes
+
+Codex, Claude Code and Cursor can run commands in a sandbox that allows writes only inside the project and the OS temp directory. The caches live under `~/.chat-history/cache`, so a sandboxed search cannot update them. When that happens, `chat-history` copies the existing caches into a user-private directory under the temp directory, keeps them up to date there, and prints one `Note:` line the first time. Later sandboxed searches are quiet and warm. Claude Code gives each session its own temp directory, so the copy lasts for that session.
+
+To let sandboxed searches use the shared cache directly, allow writes to `~/.chat-history`:
+
+| Tool | Setting |
+|---|---|
+| Codex | `~/.codex/config.toml`: `[sandbox_workspace_write]` `writable_roots = ["~/.chat-history"]` |
+| Claude Code | `~/.claude/settings.json`: `"sandbox": {"filesystem": {"allowWrite": ["~/.chat-history"]}}` |
+| Cursor | `~/.cursor/sandbox.json`: `"additionalReadwritePaths": ["/home/you/.chat-history"]` (absolute path) |
+
+`CHAT_HISTORY_CACHE_DIR` and `--cache-dir` are used exactly as given and never replaced.
+
 ### Build from source
 
 ```bash
@@ -163,7 +177,7 @@ Cursor Agent chats found in both transcript and IDE data are shown once as `curs
 
 Session discovery caches titles, first-prompt previews, and other extracted metadata from unchanged sources in `~/.chat-history/cache/catalog-v1.db`. This metadata cache does not store transcripts. BM25 uses a separate, disposable `search-v2.db` containing message text and full-text postings; it refreshes only changed sessions. Search results themselves are not cached. Discovery and workspace/store checks remain live, so added or deleted transcripts still appear immediately. On one local profile, a warm Claude extraction fell from about 300ms to 10ms.
 
-The cache tracks file metadata and SQLite WAL/journal changes. Unavailable, corrupt, or locked caches fall back to reading the sources. Set `CHAT_HISTORY_NO_CACHE=1` to bypass it or `CHAT_HISTORY_CACHE_DIR` to move it; deleting the cache rebuilds it on the next command. New cache directories and databases are user-private on Unix.
+The cache tracks file metadata and SQLite WAL/journal changes. Unavailable, corrupt, or locked caches fall back to reading the sources. If the default directory is not writable, for example inside an agent sandbox, both caches move to a user-private copy under the temp directory (see [Running inside agent sandboxes](#running-inside-agent-sandboxes)). Set `CHAT_HISTORY_NO_CACHE=1` to bypass it or `CHAT_HISTORY_CACHE_DIR` to move it; deleting the cache rebuilds it on the next command. New cache directories and databases are user-private on Unix.
 
 ### Optional Cursor hook
 

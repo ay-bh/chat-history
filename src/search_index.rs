@@ -110,13 +110,6 @@ fn session_key(session: &Session) -> String {
     serde_json::to_string(&(&session.source, &session.id, &session.file)).unwrap()
 }
 
-pub fn default_index_dir() -> Option<PathBuf> {
-    std::env::var_os("CHAT_HISTORY_CACHE_DIR")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| crate::session::user_home().map(|p| p.join(".chat-history/cache")))
-}
-
 fn indexed_session_keys_match(conn: &Connection, corpus: &[Session]) -> Result<bool> {
     let expected: HashSet<String> = corpus.iter().map(session_key).collect();
     let mut stmt = conn.prepare("SELECT key FROM sessions")?;
