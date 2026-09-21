@@ -212,39 +212,29 @@ fn private_dir(dir: &Path) -> Option<bool> {
     Some(created)
 }
 
-/// Copies one cache database into `to` unless a copy is already there. A
-/// write-ahead log beside it is copied as a pair, since SQLite recovers a
-/// copied database plus WAL and a WAL left by an interrupted writer must not
-/// block seeding until someone runs unsandboxed. A rollback journal means a
-/// transaction in progress and is skipped. A copy whose source changed
-/// underneath it is discarded. Each process cleans up only its own staging
-/// files: another process's may be a copy in progress, and a leftover from a
-/// crash is the temp directory's to expire. The copy is only a head start:
-/// every session is re-verified on the next sync.
+/// Copies one cache database into `to` unless a copy is already there. Any
+/// SQLite sidecar beside the source means it is in use or was left by an
+/// interrupted writer, and the copy is skipped: copying a database and its
+/// WAL separately could pair a pre-checkpoint file with post-checkpoint
+/// frames, which is inconsistent yet structurally valid. The next unsandboxed
+/// run recovers such a WAL, after which seeding proceeds. A copy whose source
+/// changed underneath it is discarded. Each process cleans up only its own
+/// staging file: another process's may be a copy in progress, and a leftover
+/// from a crash is the temp directory's to expire. The copy is only a head
+/// start: every session is re-verified on the next sync.
 fn seed_file(from: &Path, to: &Path, name: &str) {
     let target = to.join(name);
-    if target.exists() || from.join(format!("{name}-journal")).exists() {
+    let in_use = ["-wal", "-shm", "-journal"]
+        .iter()
+        .any(|suffix| from.join(format!("{name}{suffix}")).exists());
+    if target.exists() || in_use {
         return;
     }
-    let pid = std::process::id();
-    let staging = |file: &str| to.join(format!(".{file}.seed-{pid}"));
-    let mut pairs = vec![(from.join(name), target.clone(), staging(name))];
-    let wal = format!("{name}-wal");
-    if from.join(&wal).exists() {
-        pairs.push((from.join(&wal), to.join(&wal), staging(&wal)));
+    let staging = to.join(format!(".{name}.seed-{}", std::process::id()));
+    if copy_unchanged(&from.join(name), &staging) {
+        place(&staging, &target);
     }
-    let copied = pairs
-        .iter()
-        .all(|(source, _, staging)| copy_unchanged(source, staging));
-    if copied
-        && place(&pairs[0].2, &pairs[0].1)
-        && let Some((_, target, staging)) = pairs.get(1)
-    {
-        place(staging, target);
-    }
-    for (_, _, staging) in &pairs {
-        let _ = fs::remove_file(staging);
-    }
+    let _ = fs::remove_file(&staging);
 }
 
 /// Copies `source` to `staging` privately, succeeding only if the source did
@@ -410,43 +400,36 @@ mod tests {
     }
 
     #[test]
-    fn a_database_and_its_write_ahead_log_are_seeded_as_a_pair() {
-        // A WAL left by an interrupted writer must not block seeding for good:
-        // SQLite recovers a copied database plus WAL, and ignores a WAL whose
-        // salts do not match.
+    fn a_database_with_a_write_ahead_log_is_not_seeded() {
+        // Copying the database and WAL separately can pair a pre-checkpoint
+        // file with post-checkpoint frames: inconsistent, yet structurally
+        // valid. A WAL therefore means "in use", and the next unsandboxed run
+        // recovers a WAL an interrupted writer left behind.
         let tmp = TempDir::new().unwrap();
         let preferred = tmp.path().join("cache");
         fs::create_dir(&preferred).unwrap();
         fs::write(preferred.join("search-v2.db"), "index").unwrap();
         fs::write(preferred.join("search-v2.db-wal"), "frames").unwrap();
-        fs::write(preferred.join("search-v2.db-shm"), "shared").unwrap();
         let to = tmp.path().join("to");
         fs::create_dir(&to).unwrap();
         seed_file(&preferred, &to, "search-v2.db");
-        assert_eq!(fs::read(to.join("search-v2.db")).unwrap(), b"index");
-        assert_eq!(fs::read(to.join("search-v2.db-wal")).unwrap(), b"frames");
-        assert!(
-            !to.join("search-v2.db-shm").exists(),
-            "the index is rebuilt by SQLite"
-        );
-        assert_eq!(
-            fs::read_dir(&to).unwrap().count(),
-            2,
-            "no staging left behind"
-        );
+        assert!(fs::read_dir(&to).unwrap().next().is_none());
     }
 
     #[test]
-    fn a_database_with_a_rollback_journal_is_mid_transaction_and_skipped() {
+    fn a_database_with_any_other_sidecar_is_not_seeded_either() {
         let tmp = TempDir::new().unwrap();
         let preferred = tmp.path().join("cache");
         fs::create_dir(&preferred).unwrap();
-        fs::write(preferred.join("search-v2.db"), "busy").unwrap();
-        fs::write(preferred.join("search-v2.db-journal"), "x").unwrap();
         let to = tmp.path().join("to");
         fs::create_dir(&to).unwrap();
-        seed_file(&preferred, &to, "search-v2.db");
-        assert!(!to.join("search-v2.db").exists());
+        for sidecar in ["-shm", "-journal"] {
+            fs::write(preferred.join("search-v2.db"), "busy").unwrap();
+            fs::write(preferred.join(format!("search-v2.db{sidecar}")), "x").unwrap();
+            seed_file(&preferred, &to, "search-v2.db");
+            assert!(!to.join("search-v2.db").exists(), "{sidecar} means in use");
+            fs::remove_file(preferred.join(format!("search-v2.db{sidecar}"))).unwrap();
+        }
     }
 
     #[test]
