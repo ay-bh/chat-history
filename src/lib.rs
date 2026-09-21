@@ -1,3 +1,4 @@
+pub mod cache_dir;
 mod catalog;
 pub mod cursor_cli;
 pub mod cursor_hooks;

@@ -863,6 +863,10 @@ fn command(tmp: &TempDir) -> assert_cmd::Command {
     let mut cmd = assert_cmd::Command::cargo_bin("chat-history").unwrap();
     cmd.env("HOME", tmp.path())
         .env("CLAUDE_CONFIG_DIR", tmp.path())
+        .env(
+            "CHAT_HISTORY_FALLBACK_ROOT",
+            tmp.path().join("fallback-root"),
+        )
         .env_remove("CODEX_HOME")
         .env_remove("CHAT_HISTORY_SEARCH_ENGINE")
         .env_remove("CHAT_HISTORY_SEARCH_GROUP_BY")
@@ -1796,4 +1800,69 @@ fn full_text_rows_are_written_once_without_an_insert_trigger() {
     .unwrap();
     let posting: String = conn.query_row(postings, [], |r| r.get(0)).unwrap();
     assert_eq!(posting, "1/1", "deleted passages leave the full-text index");
+}
+
+#[test]
+#[cfg(unix)]
+fn read_only_home_cache_falls_back_to_a_private_temp_copy_without_rebuilding() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = TempDir::new().unwrap();
+    cli_fixture(&tmp);
+    let temp_root = tmp.path().join("tmpdir");
+    fs::create_dir(&temp_root).unwrap();
+    let fallback = temp_root.join("chat-history-test");
+    let run = || {
+        let mut cmd = command(&tmp);
+        cmd.env("CHAT_HISTORY_FALLBACK_ROOT", &fallback)
+            .args(["search", "uniquecli", "--json"]);
+        cmd.output().unwrap()
+    };
+    let warm = run();
+    assert!(warm.status.success());
+    let home_cache = tmp.path().join(".chat-history/cache");
+    assert!(home_cache.join(INDEX_FILENAME).exists());
+    struct Restore(std::path::PathBuf);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o700));
+        }
+    }
+    let _restore = Restore(home_cache.clone());
+    fs::set_permissions(&home_cache, fs::Permissions::from_mode(0o500)).unwrap();
+
+    // A listing needs the metadata catalog only; the search index is not copied.
+    let listing = command(&tmp)
+        .env("CHAT_HISTORY_FALLBACK_ROOT", &fallback)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&listing.stderr);
+    assert!(listing.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("not writable"),
+        "one note when created: {stderr}"
+    );
+    assert!(fallback.join("cache/catalog-v1.db").exists());
+    assert!(!fallback.join("cache").join(INDEX_FILENAME).exists());
+
+    let first = run();
+    let stderr = String::from_utf8_lossy(&first.stderr);
+    assert!(first.status.success(), "{stderr}");
+    assert!(!stderr.contains("not writable"), "quiet on reuse: {stderr}");
+    assert!(!stderr.contains("in-memory BM25"), "{stderr}");
+    assert!(
+        !stderr.contains("Updating search index"),
+        "seeded copy must not rebuild: {stderr}"
+    );
+    assert_eq!(first.stdout, warm.stdout);
+    assert_eq!(
+        fs::metadata(&fallback).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    assert!(fallback.join("cache").join(INDEX_FILENAME).exists());
+
+    let second = run();
+    let stderr = String::from_utf8_lossy(&second.stderr);
+    assert!(second.status.success(), "{stderr}");
+    assert!(!stderr.contains("not writable"), "quiet on reuse: {stderr}");
+    assert_eq!(second.stdout, warm.stdout);
 }

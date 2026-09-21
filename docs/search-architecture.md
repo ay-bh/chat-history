@@ -65,6 +65,9 @@ similarity calculation so the meaning of that option does not change.
 
 The index is `search-v2.db` under the cache directory, separate from the
 metadata cache. New directories and files use Unix modes 0700 and 0600.
+When the default cache directory is not writable, both caches are served from
+a user-private copy under the temp directory, seeded from the existing files
+and re-verified session by session on the next sync (`cache_dir.rs`).
 
 | Relation | Purpose |
 |---|---|

@@ -13,6 +13,10 @@ use std::{
 
 // Bump when cached extraction semantics or serialized types change.
 const VERSION: &str = "1";
+
+pub(crate) fn filename() -> String {
+    format!("catalog-v{VERSION}.db")
+}
 const RACY_WINDOW: Duration = Duration::from_secs(2);
 
 fn timestamp(time: SystemTime) -> i128 {
@@ -138,7 +142,7 @@ impl Catalog {
             builder.mode(0o700);
         }
         builder.create(dir).ok()?;
-        let path = dir.join(format!("catalog-v{VERSION}.db"));
+        let path = dir.join(filename());
         // Cached titles and prompt previews have the same sensitivity as the
         // source metadata. Create the DB privately before SQLite opens it.
         let mut options = fs::OpenOptions::new();
@@ -284,10 +288,7 @@ pub(crate) fn with_catalog<T>(sources: &[&str], load: impl FnOnce() -> T) -> T {
     if std::env::var_os("CHAT_HISTORY_NO_CACHE").is_some() {
         return load();
     }
-    let dir = std::env::var_os("CHAT_HISTORY_CACHE_DIR")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| crate::session::user_home().map(|p| p.join(".chat-history/cache")));
+    let dir = crate::cache_dir::prepare(&filename());
     with_directory(dir.as_deref(), sources, load)
 }
 
@@ -568,7 +569,7 @@ mod tests {
         assert_eq!(cached_text(&path, &path, &calls), "value");
         let dir = tmp.path().join("cache");
         fs::create_dir(&dir).unwrap();
-        let db = dir.join(format!("catalog-v{VERSION}.db"));
+        let db = dir.join(filename());
         fs::write(&db, "not sqlite").unwrap();
         assert_eq!(cached_text(&dir, &path, &calls), "value");
         fs::remove_file(&db).unwrap();
@@ -824,7 +825,7 @@ mod tests {
             0o700
         );
         assert_eq!(
-            fs::metadata(dir.join(format!("catalog-v{VERSION}.db")))
+            fs::metadata(dir.join(filename()))
                 .unwrap()
                 .permissions()
                 .mode()
