@@ -863,6 +863,10 @@ fn command(tmp: &TempDir) -> assert_cmd::Command {
     let mut cmd = assert_cmd::Command::cargo_bin("chat-history").unwrap();
     cmd.env("HOME", tmp.path())
         .env("CLAUDE_CONFIG_DIR", tmp.path())
+        .env(
+            "CHAT_HISTORY_FALLBACK_ROOT",
+            tmp.path().join("fallback-root"),
+        )
         .env_remove("CODEX_HOME")
         .env_remove("CHAT_HISTORY_SEARCH_ENGINE")
         .env_remove("CHAT_HISTORY_SEARCH_GROUP_BY")
@@ -1806,9 +1810,10 @@ fn read_only_home_cache_falls_back_to_a_private_temp_copy_without_rebuilding() {
     cli_fixture(&tmp);
     let temp_root = tmp.path().join("tmpdir");
     fs::create_dir(&temp_root).unwrap();
+    let fallback = temp_root.join("chat-history-test");
     let run = || {
         let mut cmd = command(&tmp);
-        cmd.env("TMPDIR", &temp_root)
+        cmd.env("CHAT_HISTORY_FALLBACK_ROOT", &fallback)
             .args(["search", "uniquecli", "--json"]);
         cmd.output().unwrap()
     };
@@ -1826,23 +1831,16 @@ fn read_only_home_cache_falls_back_to_a_private_temp_copy_without_rebuilding() {
     fs::set_permissions(&home_cache, fs::Permissions::from_mode(0o500)).unwrap();
 
     // A listing needs the metadata catalog only; the search index is not copied.
-    let listing = command(&tmp).env("TMPDIR", &temp_root).output().unwrap();
+    let listing = command(&tmp)
+        .env("CHAT_HISTORY_FALLBACK_ROOT", &fallback)
+        .output()
+        .unwrap();
     let stderr = String::from_utf8_lossy(&listing.stderr);
     assert!(listing.status.success(), "{stderr}");
     assert!(
         stderr.contains("not writable"),
         "one note when created: {stderr}"
     );
-    let fallback = fs::read_dir(&temp_root)
-        .unwrap()
-        .map(|e| e.unwrap().path())
-        .find(|p| {
-            p.file_name()
-                .unwrap()
-                .to_string_lossy()
-                .starts_with("chat-history-")
-        })
-        .expect("private fallback directory");
     assert!(fallback.join("cache/catalog-v1.db").exists());
     assert!(!fallback.join("cache").join(INDEX_FILENAME).exists());
 

@@ -43,10 +43,10 @@ pub fn resolve() -> Option<&'static Resolved> {
     RESOLVED
         .get_or_init(|| {
             let resolved = match std::env::var_os("CHAT_HISTORY_CACHE_DIR").filter(|v| !v.is_empty()) {
-                Some(dir) => resolve_with(Path::new(&dir), true, None),
+                Some(dir) => resolve_with(Path::new(&dir), true, &[]),
                 None => {
                     let home = crate::session::user_home()?.join(".chat-history/cache");
-                    resolve_with(&home, false, fallback_root().as_deref())
+                    resolve_with(&home, false, &fallback_roots())
                 }
             };
             if let Some(Resolved {
@@ -71,11 +71,13 @@ pub fn resolve() -> Option<&'static Resolved> {
 }
 
 /// Selection without process state, for callers and tests that supply the
-/// candidate directories. `None` means no usable persistent directory.
+/// candidate directories. When no fallback root is usable the unwritable
+/// default is returned anyway, so the backend's open fails with its usual
+/// warning rather than silently searching without a cache.
 pub fn resolve_with(
     preferred: &Path,
     explicit: bool,
-    fallback_root: Option<&Path>,
+    fallback_roots: &[PathBuf],
 ) -> Option<Resolved> {
     if explicit {
         return Some(Resolved {
@@ -89,29 +91,54 @@ pub fn resolve_with(
             kind: Kind::Default,
         });
     }
-    let root = fallback_root?;
-    private_dir(root)?;
-    let dir = root.join("cache");
-    let created = fs::symlink_metadata(&dir).is_err();
-    private_dir(&dir)?;
+    for root in fallback_roots {
+        if private_dir(root).is_none() {
+            continue;
+        }
+        let dir = root.join("cache");
+        let Some(created) = private_dir(&dir) else {
+            continue;
+        };
+        return Some(Resolved {
+            dir,
+            kind: Kind::Fallback {
+                from: preferred.to_path_buf(),
+                created,
+            },
+        });
+    }
     Some(Resolved {
-        dir,
-        kind: Kind::Fallback {
-            from: preferred.to_path_buf(),
-            created,
-        },
+        dir: preferred.to_path_buf(),
+        kind: Kind::Default,
     })
 }
 
-/// A user-private root under the OS temp directory. Sandboxes for coding
-/// agents keep the temp directory writable when the home directory is not.
-fn fallback_root() -> Option<PathBuf> {
+/// User-private roots to try in order. Sandboxes for coding agents keep temp
+/// directories writable when the home directory is not. The shared `/tmp`
+/// comes first because it outlives a session, while some agents give each
+/// session its own `$TMPDIR`; a copy there would be redone every session.
+fn fallback_roots() -> Vec<PathBuf> {
+    // Undocumented: lets tests keep their fallback out of the real /tmp.
+    if let Some(root) = std::env::var_os("CHAT_HISTORY_FALLBACK_ROOT").filter(|v| !v.is_empty()) {
+        return vec![PathBuf::from(root)];
+    }
     #[cfg(unix)]
     // SAFETY: getuid has no preconditions and cannot fail.
     let owner = unsafe { libc::getuid() }.to_string();
     #[cfg(not(unix))]
-    let owner = std::env::var("USERNAME").ok()?;
-    Some(std::env::temp_dir().join(format!("chat-history-{owner}")))
+    let owner = match std::env::var("USERNAME") {
+        Ok(name) => name,
+        Err(_) => return Vec::new(),
+    };
+    let name = format!("chat-history-{owner}");
+    let mut roots = Vec::new();
+    #[cfg(unix)]
+    roots.push(PathBuf::from("/tmp").join(&name));
+    let session = std::env::temp_dir().join(&name);
+    if !roots.contains(&session) {
+        roots.push(session);
+    }
+    roots
 }
 
 /// Whether this process can create files in `dir`, creating it if needed.
@@ -154,18 +181,19 @@ fn writable(dir: &Path) -> bool {
 /// Creates `dir` privately or accepts an existing one only if it is a real
 /// directory owned by this user. Temp directories are shared, so a symlink
 /// or foreign directory at the expected name is refused rather than used.
-fn private_dir(dir: &Path) -> Option<()> {
+/// Returns whether this call created it.
+fn private_dir(dir: &Path) -> Option<bool> {
     let mut builder = fs::DirBuilder::new();
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
         builder.mode(0o700);
     }
-    match builder.create(dir) {
-        Ok(()) => {}
-        Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
+    let created = match builder.create(dir) {
+        Ok(()) => true,
+        Err(e) if e.kind() == ErrorKind::AlreadyExists => false,
         Err(_) => return None,
-    }
+    };
     let meta = fs::symlink_metadata(dir).ok()?;
     if meta.file_type().is_symlink() || !meta.is_dir() {
         return None;
@@ -181,43 +209,60 @@ fn private_dir(dir: &Path) -> Option<()> {
             fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).ok()?;
         }
     }
-    Some(())
+    Some(created)
 }
 
 /// Copies one cache database into `to` unless a copy is already there. A
-/// database with a SQLite sidecar beside it may be mid-update and is
-/// skipped; a copy whose source changed underneath it is discarded. Each
-/// process cleans up only its own staging file: another process's file may
-/// be a copy in progress, and a leftover from a crash is the temp
-/// directory's to expire. The copy is only a head start: every session is
-/// re-verified on the next sync.
+/// write-ahead log beside it is copied as a pair, since SQLite recovers a
+/// copied database plus WAL and a WAL left by an interrupted writer must not
+/// block seeding until someone runs unsandboxed. A rollback journal means a
+/// transaction in progress and is skipped. A copy whose source changed
+/// underneath it is discarded. Each process cleans up only its own staging
+/// files: another process's may be a copy in progress, and a leftover from a
+/// crash is the temp directory's to expire. The copy is only a head start:
+/// every session is re-verified on the next sync.
 fn seed_file(from: &Path, to: &Path, name: &str) {
-    let source = from.join(name);
     let target = to.join(name);
-    let in_use = ["-wal", "-shm", "-journal"]
-        .iter()
-        .any(|suffix| from.join(format!("{name}{suffix}")).exists());
-    if target.exists() || in_use {
+    if target.exists() || from.join(format!("{name}-journal")).exists() {
         return;
     }
-    let Ok(before) = fs::metadata(&source) else {
-        return;
+    let pid = std::process::id();
+    let staging = |file: &str| to.join(format!(".{file}.seed-{pid}"));
+    let mut pairs = vec![(from.join(name), target.clone(), staging(name))];
+    let wal = format!("{name}-wal");
+    if from.join(&wal).exists() {
+        pairs.push((from.join(&wal), to.join(&wal), staging(&wal)));
+    }
+    let copied = pairs
+        .iter()
+        .all(|(source, _, staging)| copy_unchanged(source, staging));
+    if copied
+        && place(&pairs[0].2, &pairs[0].1)
+        && let Some((_, target, staging)) = pairs.get(1)
+    {
+        place(staging, target);
+    }
+    for (_, _, staging) in &pairs {
+        let _ = fs::remove_file(staging);
+    }
+}
+
+/// Copies `source` to `staging` privately, succeeding only if the source did
+/// not change while it was being read.
+fn copy_unchanged(source: &Path, staging: &Path) -> bool {
+    let Ok(before) = fs::metadata(source) else {
+        return false;
     };
-    let staging = to.join(format!(".{name}.seed-{}", std::process::id()));
-    let copied = fs::copy(&source, &staging).is_ok()
-        && fs::metadata(&source).is_ok_and(|after| {
+    let copied = fs::copy(source, staging).is_ok()
+        && fs::metadata(source).is_ok_and(|after| {
             after.len() == before.len() && after.modified().ok() == before.modified().ok()
         });
     #[cfg(unix)]
     let copied = copied && {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&staging, fs::Permissions::from_mode(0o600)).is_ok()
+        fs::set_permissions(staging, fs::Permissions::from_mode(0o600)).is_ok()
     };
-    if copied {
-        place(&staging, &target);
-    } else {
-        let _ = fs::remove_file(&staging);
-    }
+    copied
 }
 
 /// Moves a finished copy into place only if nothing is there yet. A hard
@@ -275,11 +320,23 @@ mod tests {
     }
 
     #[test]
+    fn private_dir_reports_whether_it_created_the_directory() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("private");
+        assert_eq!(private_dir(&dir), Some(true));
+        assert_eq!(private_dir(&dir), Some(false));
+        assert_eq!(
+            fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
+
+    #[test]
     fn writable_default_directory_is_used_as_is() {
         let tmp = TempDir::new().unwrap();
         let preferred = tmp.path().join("home/.chat-history/cache");
         let root = tmp.path().join("tmp");
-        let resolved = resolve_with(&preferred, false, Some(&root)).unwrap();
+        let resolved = resolve_with(&preferred, false, std::slice::from_ref(&root)).unwrap();
         assert_eq!(resolved.dir, preferred);
         assert!(matches!(resolved.kind, Kind::Default));
         assert!(preferred.is_dir());
@@ -296,7 +353,7 @@ mod tests {
         fs::create_dir(&preferred).unwrap();
         let _guard = read_only(&preferred);
         let root = tmp.path().join("tmp");
-        let resolved = resolve_with(&preferred, true, Some(&root)).unwrap();
+        let resolved = resolve_with(&preferred, true, std::slice::from_ref(&root)).unwrap();
         assert_eq!(resolved.dir, preferred);
         assert!(matches!(resolved.kind, Kind::Explicit));
         assert!(!root.exists());
@@ -307,7 +364,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let (preferred, _guard) = unwritable_cache(&tmp);
         let root = tmp.path().join("tmp");
-        let resolved = resolve_with(&preferred, false, Some(&root)).unwrap();
+        let resolved = resolve_with(&preferred, false, std::slice::from_ref(&root)).unwrap();
         assert_eq!(resolved.dir, root.join("cache"));
         match &resolved.kind {
             Kind::Fallback { from, created } => {
@@ -327,7 +384,7 @@ mod tests {
             0,
             "seeding is per database, on demand"
         );
-        let again = resolve_with(&preferred, false, Some(&root)).unwrap();
+        let again = resolve_with(&preferred, false, std::slice::from_ref(&root)).unwrap();
         assert!(matches!(again.kind, Kind::Fallback { created: false, .. }));
     }
 
@@ -336,7 +393,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let (preferred, _guard) = unwritable_cache(&tmp);
         let root = tmp.path().join("tmp");
-        let resolved = resolve_with(&preferred, false, Some(&root)).unwrap();
+        let resolved = resolve_with(&preferred, false, std::slice::from_ref(&root)).unwrap();
         seed_file(&preferred, &resolved.dir, "catalog-v1.db");
         assert_eq!(
             fs::read(root.join("cache/catalog-v1.db")).unwrap(),
@@ -353,19 +410,43 @@ mod tests {
     }
 
     #[test]
-    fn seeding_skips_a_database_with_any_sqlite_sidecar() {
+    fn a_database_and_its_write_ahead_log_are_seeded_as_a_pair() {
+        // A WAL left by an interrupted writer must not block seeding for good:
+        // SQLite recovers a copied database plus WAL, and ignores a WAL whose
+        // salts do not match.
         let tmp = TempDir::new().unwrap();
         let preferred = tmp.path().join("cache");
         fs::create_dir(&preferred).unwrap();
+        fs::write(preferred.join("search-v2.db"), "index").unwrap();
+        fs::write(preferred.join("search-v2.db-wal"), "frames").unwrap();
+        fs::write(preferred.join("search-v2.db-shm"), "shared").unwrap();
         let to = tmp.path().join("to");
         fs::create_dir(&to).unwrap();
-        for sidecar in ["-shm", "-journal"] {
-            fs::write(preferred.join("search-v2.db"), "busy").unwrap();
-            fs::write(preferred.join(format!("search-v2.db{sidecar}")), "x").unwrap();
-            seed_file(&preferred, &to, "search-v2.db");
-            assert!(!to.join("search-v2.db").exists(), "{sidecar} means in use");
-            fs::remove_file(preferred.join(format!("search-v2.db{sidecar}"))).unwrap();
-        }
+        seed_file(&preferred, &to, "search-v2.db");
+        assert_eq!(fs::read(to.join("search-v2.db")).unwrap(), b"index");
+        assert_eq!(fs::read(to.join("search-v2.db-wal")).unwrap(), b"frames");
+        assert!(
+            !to.join("search-v2.db-shm").exists(),
+            "the index is rebuilt by SQLite"
+        );
+        assert_eq!(
+            fs::read_dir(&to).unwrap().count(),
+            2,
+            "no staging left behind"
+        );
+    }
+
+    #[test]
+    fn a_database_with_a_rollback_journal_is_mid_transaction_and_skipped() {
+        let tmp = TempDir::new().unwrap();
+        let preferred = tmp.path().join("cache");
+        fs::create_dir(&preferred).unwrap();
+        fs::write(preferred.join("search-v2.db"), "busy").unwrap();
+        fs::write(preferred.join("search-v2.db-journal"), "x").unwrap();
+        let to = tmp.path().join("to");
+        fs::create_dir(&to).unwrap();
+        seed_file(&preferred, &to, "search-v2.db");
+        assert!(!to.join("search-v2.db").exists());
     }
 
     #[test]
@@ -379,25 +460,21 @@ mod tests {
         )
         .unwrap();
         let root = tmp.path().join("tmp");
-        let resolved = resolve_with(&preferred, false, Some(&root)).unwrap();
+        let resolved = resolve_with(&preferred, false, std::slice::from_ref(&root)).unwrap();
         assert!(matches!(resolved.kind, Kind::Default));
     }
 
     #[test]
-    fn seeding_skips_a_database_with_a_live_write_ahead_log_or_an_existing_copy() {
+    fn seeding_never_replaces_an_existing_copy() {
         let tmp = TempDir::new().unwrap();
         let preferred = tmp.path().join("cache");
         fs::create_dir(&preferred).unwrap();
-        fs::write(preferred.join("search-v2.db"), "busy").unwrap();
-        fs::write(preferred.join("search-v2.db-wal"), "frames").unwrap();
         fs::write(preferred.join("catalog-v1.db"), "new catalog").unwrap();
         let _guard = read_only(&preferred);
         let to = tmp.path().join("to");
         fs::create_dir(&to).unwrap();
         fs::write(to.join("catalog-v1.db"), "old catalog").unwrap();
-        seed_file(&preferred, &to, "search-v2.db");
         seed_file(&preferred, &to, "catalog-v1.db");
-        assert!(!to.join("search-v2.db").exists());
         assert_eq!(fs::read(to.join("catalog-v1.db")).unwrap(), b"old catalog");
     }
 
@@ -441,7 +518,7 @@ mod tests {
     }
 
     #[test]
-    fn a_fallback_root_that_is_a_symlink_is_refused() {
+    fn a_fallback_root_that_is_a_symlink_is_refused_and_the_default_kept() {
         let tmp = TempDir::new().unwrap();
         let preferred = tmp.path().join("cache");
         fs::create_dir(&preferred).unwrap();
@@ -450,7 +527,27 @@ mod tests {
         fs::create_dir(&target).unwrap();
         let root = tmp.path().join("tmp");
         std::os::unix::fs::symlink(&target, &root).unwrap();
-        assert!(resolve_with(&preferred, false, Some(&root)).is_none());
+        // The unwritable default is returned so its open fails with today's
+        // warning instead of a silent in-memory search.
+        let resolved = resolve_with(&preferred, false, &[root]).unwrap();
+        assert_eq!(resolved.dir, preferred);
+        assert!(matches!(resolved.kind, Kind::Default));
+        assert!(fs::read_dir(&target).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn the_first_usable_fallback_root_wins() {
+        let tmp = TempDir::new().unwrap();
+        let (preferred, _guard) = unwritable_cache(&tmp);
+        let unusable = tmp.path().join("unusable");
+        fs::create_dir(&unusable).unwrap();
+        let _unusable = read_only(&unusable);
+        let first = unusable.join("chat-history-1");
+        fs::create_dir(tmp.path().join("tmp")).unwrap();
+        let second = tmp.path().join("tmp/chat-history-1");
+        let resolved = resolve_with(&preferred, false, &[first.clone(), second.clone()]).unwrap();
+        assert_eq!(resolved.dir, second.join("cache"));
+        assert!(!first.exists());
     }
 
     #[test]
@@ -465,15 +562,19 @@ mod tests {
         let target = tmp.path().join("elsewhere");
         fs::create_dir(&target).unwrap();
         std::os::unix::fs::symlink(&target, root.join("cache")).unwrap();
-        assert!(resolve_with(&preferred, false, Some(&root)).is_none());
+        let resolved = resolve_with(&preferred, false, &[root]).unwrap();
+        assert_eq!(resolved.dir, preferred);
+        assert!(matches!(resolved.kind, Kind::Default));
     }
 
     #[test]
-    fn no_fallback_root_means_no_directory() {
+    fn no_fallback_root_keeps_the_default_so_its_failure_is_reported() {
         let tmp = TempDir::new().unwrap();
         let preferred = tmp.path().join("cache");
         fs::create_dir(&preferred).unwrap();
         let _guard = read_only(&preferred);
-        assert!(resolve_with(&preferred, false, None).is_none());
+        let resolved = resolve_with(&preferred, false, &[]).unwrap();
+        assert_eq!(resolved.dir, preferred);
+        assert!(matches!(resolved.kind, Kind::Default));
     }
 }
