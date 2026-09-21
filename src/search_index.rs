@@ -19,7 +19,11 @@ use std::time::{Duration, Instant};
 
 pub type SearchError = Box<dyn std::error::Error + Send + Sync>;
 pub type Result<T> = std::result::Result<T, SearchError>;
-pub const INDEX_FILENAME: &str = "search-v1.db";
+pub const INDEX_FILENAME: &str = "search-v2.db";
+/// Earlier generations wrote full-text rows through an insert trigger. An older
+/// binary sharing the directory would recreate that trigger, so they are not
+/// migrated in place: the file is replaced and the stale copy removed.
+const PREVIOUS_INDEX_FILENAMES: [&str; 1] = ["search-v1.db"];
 // Bump for parser, timestamp, chunking or tokenization changes that require
 // re-extracting unchanged sources without changing the relational schema.
 const EXTRACTION_VERSION: u32 = 3;
@@ -27,7 +31,9 @@ const MAX_ANALYZER_TOKENS: usize = 128;
 const MAX_PHRASE_TOKENS: usize = 32;
 const MAX_PASSAGE_CHARS: usize = 1600;
 const PASSAGE_OVERLAP: usize = 200;
-const PARSE_BATCH_SIZE: usize = 8;
+// Each batch is one transaction and one FTS5 flush. Sessions stay below a
+// few megabytes, so 64 bounds memory while cutting flushes and merges.
+const PARSE_BATCH_SIZE: usize = 64;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const WRITER_STALL: Duration = Duration::from_secs(10);
 const CACHE_MISMATCH_ATTEMPTS: usize = 3;
@@ -390,6 +396,15 @@ impl Bm25Backend {
                 builder.mode(0o700);
             }
             builder.create(dir)?;
+            for stale in PREVIOUS_INDEX_FILENAMES {
+                for suffix in ["", "-wal", "-shm"] {
+                    match fs::remove_file(dir.join(format!("{stale}{suffix}"))) {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+            }
             let path = dir.join(INDEX_FILENAME);
             let mut options = fs::OpenOptions::new();
             options.write(true).create_new(true);
@@ -448,18 +463,18 @@ impl Bm25Backend {
             return Err("Search cache has incomplete message tables; remove the disposable search database to recreate it.".into());
         }
         let initialized: bool = conn.query_row(
-            "SELECT count(*) = 8 FROM sqlite_schema WHERE name IN (
+            "SELECT count(*) = 7 FROM sqlite_schema WHERE name IN (
              'sessions', 'messages', 'messages_session', 'passages', 'passages_message',
-             'passages_fts', 'passages_insert', 'passages_delete')",
+             'passages_fts', 'passages_delete')",
             [],
             |r| r.get(0),
         )?;
         if !initialized {
             let tx = begin_immediate(&conn)?;
             let initialized: bool = tx.query_row(
-                "SELECT count(*) = 8 FROM sqlite_schema WHERE name IN (
+                "SELECT count(*) = 7 FROM sqlite_schema WHERE name IN (
                  'sessions', 'messages', 'messages_session', 'passages', 'passages_message',
-                 'passages_fts', 'passages_insert', 'passages_delete')",
+                 'passages_fts', 'passages_delete')",
                 [],
                 |r| r.get(0),
             )?;
@@ -488,10 +503,6 @@ impl Bm25Backend {
                 content='passages', content_rowid='id',
                 tokenize='unicode61 remove_diacritics 2', prefix='2 3 4'
              );
-             CREATE TRIGGER IF NOT EXISTS passages_insert AFTER INSERT ON passages BEGIN
-                INSERT INTO passages_fts(rowid, content, title, prompt, project, branch)
-                VALUES (new.id, new.content, new.title, new.prompt, new.project, new.branch);
-             END;
              CREATE TRIGGER IF NOT EXISTS passages_delete AFTER DELETE ON passages BEGIN
                 INSERT INTO passages_fts(passages_fts, rowid, content, title, prompt, project, branch)
                 VALUES ('delete', old.id, old.content, old.title, old.prompt, old.project, old.branch);
@@ -851,7 +862,12 @@ fn publish_session(
         }
         return Ok(());
     }
-    tx.execute("DELETE FROM sessions WHERE key = ?1", [key])?;
+    // The cascading delete is a multi-write statement and takes a savepoint,
+    // which makes FTS5 flush; a session absent from the index has nothing to
+    // remove.
+    if current.is_some() {
+        tx.execute("DELETE FROM sessions WHERE key = ?1", [key])?;
+    }
     tx.execute("INSERT INTO sessions VALUES (?1, ?2)", params![key, stamp])?;
     for (ordinal, message, metadata) in extracted {
         insert_message(tx, key, session, &message, ordinal, metadata)?;
@@ -950,23 +966,33 @@ fn insert_message(
         ],
     )?;
     let id = conn.last_insert_rowid();
-    let mut stmt = conn.prepare_cached(
+    // Written directly rather than through an AFTER INSERT trigger: a trigger
+    // makes each passage insert a multi-write statement with its own savepoint,
+    // and FTS5 flushes its pending index to disk on every savepoint.
+    let mut row = conn.prepare_cached(
         "INSERT INTO passages(message_id, content, title, prompt, project, branch)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
     )?;
+    let mut fts = conn.prepare_cached(
+        "INSERT INTO passages_fts(rowid, content, title, prompt, project, branch)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+    )?;
+    let mut insert = |content: &str, title: &str, prompt: &str, project: &str, branch: &str| {
+        row.execute(params![id, content, title, prompt, project, branch])?;
+        let passage = conn.last_insert_rowid();
+        fts.execute(params![passage, content, title, prompt, project, branch])?;
+        Ok::<(), rusqlite::Error>(())
+    };
     if metadata {
         let prompt = message.uuid == "index-prompt";
-        stmt.execute(params![
-            id,
-            "",
-            if prompt { "" } else { &session.summary },
-            if prompt { &session.first_prompt } else { "" },
-            if prompt { "" } else { &session.project },
-            if prompt { "" } else { &session.branch }
-        ])?;
+        if prompt {
+            insert("", "", &session.first_prompt, "", "")?;
+        } else {
+            insert("", &session.summary, "", &session.project, &session.branch)?;
+        }
     } else {
         for content in passages(&message.content) {
-            stmt.execute(params![id, content, "", "", "", ""])?;
+            insert(content, "", "", "", "")?;
         }
     }
     Ok(())

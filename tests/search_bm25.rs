@@ -1647,3 +1647,77 @@ fn benchmark_cold_warm_and_legacy() {
         "250 sessions / 5000 messages: cold={cold:?}; warm open+sync={warm:?}; BM25 query={query:?}; legacy deep query={legacy:?}"
     );
 }
+
+fn count(conn: &rusqlite::Connection, sql: &str) -> i64 {
+    conn.query_row(sql, [], |r| r.get(0)).unwrap()
+}
+
+#[test]
+fn opening_the_index_removes_the_previous_schema_generation() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join("index");
+    fs::create_dir(&dir).unwrap();
+    let stale = ["search-v1.db", "search-v1.db-wal", "search-v1.db-shm"];
+    for name in stale {
+        fs::write(dir.join(name), "stale").unwrap();
+    }
+    assert_eq!(INDEX_FILENAME, "search-v2.db");
+    drop(Bm25Backend::open(Some(&dir)).unwrap());
+    assert!(dir.join(INDEX_FILENAME).exists());
+    for name in stale {
+        assert!(!dir.join(name).exists(), "{name} should be removed");
+    }
+}
+
+#[test]
+fn full_text_rows_are_written_once_without_an_insert_trigger() {
+    let tmp = TempDir::new().unwrap();
+    let mut corpus = vec![
+        transcript(
+            &tmp,
+            "one",
+            &["Directneedle first message", "second message"],
+        ),
+        transcript(&tmp, "two", &["Directneedle in another session"]),
+    ];
+    let dir = tmp.path().join("index");
+    let mut index = Bm25Backend::open(Some(&dir)).unwrap();
+    index.sync(&corpus, false).unwrap();
+    assert_eq!(search(&mut index, &corpus, "directneedle", 10).len(), 2);
+    drop(index);
+    let conn = rusqlite::Connection::open(dir.join(INDEX_FILENAME)).unwrap();
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT count(*) FROM sqlite_schema WHERE type = 'trigger' AND name = 'passages_insert'"
+        ),
+        0,
+        "inserts must not go through a trigger"
+    );
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE temp.vocab USING fts5vocab('main', 'passages_fts', 'row')",
+    )
+    .unwrap();
+    let postings = "SELECT doc || '/' || cnt FROM vocab WHERE term = 'directneedle'";
+    let posting: String = conn.query_row(postings, [], |r| r.get(0)).unwrap();
+    assert_eq!(posting, "2/2", "each passage indexed exactly once");
+    conn.execute(
+        "INSERT INTO passages_fts(passages_fts, rank) VALUES ('integrity-check', 1)",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+    let removed = corpus.pop().unwrap();
+    fs::remove_file(&removed.file).unwrap();
+    let mut index = Bm25Backend::open(Some(&dir)).unwrap();
+    assert_eq!(index.sync(&corpus, false).unwrap().removed, 1);
+    assert_eq!(search(&mut index, &corpus, "directneedle", 10).len(), 1);
+    drop(index);
+    let conn = rusqlite::Connection::open(dir.join(INDEX_FILENAME)).unwrap();
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE temp.vocab USING fts5vocab('main', 'passages_fts', 'row')",
+    )
+    .unwrap();
+    let posting: String = conn.query_row(postings, [], |r| r.get(0)).unwrap();
+    assert_eq!(posting, "1/1", "deleted passages leave the full-text index");
+}
