@@ -1652,16 +1652,38 @@ fn count(conn: &rusqlite::Connection, sql: &str) -> i64 {
     conn.query_row(sql, [], |r| r.get(0)).unwrap()
 }
 
+fn age(path: &std::path::Path, days: u64) {
+    let when = std::time::SystemTime::now() - std::time::Duration::from_secs(days * 86_400);
+    fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(when)
+        .unwrap();
+}
+
 #[test]
-fn opening_the_index_removes_an_idle_previous_schema_generation() {
+fn opening_the_index_removes_a_previous_generation_unused_for_a_week() {
     let tmp = TempDir::new().unwrap();
     let dir = tmp.path().join("index");
     fs::create_dir(&dir).unwrap();
     fs::write(dir.join("search-v1.db"), "stale").unwrap();
+    age(&dir.join("search-v1.db"), 8);
     assert_eq!(INDEX_FILENAME, "search-v2.db");
     drop(Bm25Backend::open(Some(&dir)).unwrap());
     assert!(dir.join(INDEX_FILENAME).exists());
     assert!(!dir.join("search-v1.db").exists());
+}
+
+#[test]
+fn a_recently_used_previous_generation_is_kept_for_its_binary() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join("index");
+    fs::create_dir(&dir).unwrap();
+    fs::write(dir.join("search-v1.db"), "fresh").unwrap();
+    age(&dir.join("search-v1.db"), 2);
+    drop(Bm25Backend::open(Some(&dir)).unwrap());
+    assert!(dir.join("search-v1.db").exists());
 }
 
 #[test]
@@ -1672,6 +1694,7 @@ fn a_previous_generation_with_live_sidecars_is_left_for_its_binary() {
     let live = ["search-v1.db", "search-v1.db-wal", "search-v1.db-shm"];
     for name in live {
         fs::write(dir.join(name), "in use").unwrap();
+        age(&dir.join(name), 30);
     }
     drop(Bm25Backend::open(Some(&dir)).unwrap());
     assert!(dir.join(INDEX_FILENAME).exists());

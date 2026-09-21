@@ -22,8 +22,9 @@ pub type Result<T> = std::result::Result<T, SearchError>;
 pub const INDEX_FILENAME: &str = "search-v2.db";
 /// Earlier generations wrote full-text rows through an insert trigger. An older
 /// binary sharing the directory would recreate that trigger, so they are not
-/// migrated in place: a new file is used and an idle stale copy removed.
+/// migrated in place: a new file is used and the old one reclaimed once idle.
 const PREVIOUS_INDEX_FILENAMES: [&str; 1] = ["search-v1.db"];
+const PREVIOUS_INDEX_GRACE: Duration = Duration::from_secs(7 * 86_400);
 // Bump for parser, timestamp, chunking or tokenization changes that require
 // re-extracting unchanged sources without changing the relational schema.
 const EXTRACTION_VERSION: u32 = 3;
@@ -396,14 +397,22 @@ impl Bm25Backend {
                 builder.mode(0o700);
             }
             builder.create(dir)?;
-            // Best effort: live WAL/SHM sidecars mean an older binary still has
-            // the file open, so it is left for a later run to reclaim.
+            // Best effort reclaim of the previous generation. Nothing proves a
+            // file is unopened, so it is removed only once it has sidecars gone
+            // and no writes for a week: an older binary still in use keeps
+            // touching it, and one that was upgraded never will.
             for stale in PREVIOUS_INDEX_FILENAMES {
+                let path = dir.join(stale);
                 let in_use = ["-wal", "-shm"]
                     .iter()
                     .any(|suffix| dir.join(format!("{stale}{suffix}")).exists());
-                if !in_use {
-                    let _ = fs::remove_file(dir.join(stale));
+                let idle = fs::metadata(&path)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|m| m.elapsed().ok())
+                    .is_some_and(|age| age >= PREVIOUS_INDEX_GRACE);
+                if !in_use && idle {
+                    let _ = fs::remove_file(&path);
                 }
             }
             let path = dir.join(INDEX_FILENAME);
