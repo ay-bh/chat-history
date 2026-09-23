@@ -561,21 +561,23 @@ pub fn print_inspect_brief(info: &InspectInfo) {
     // its directory. Agents also read their
     // own skills and tool logs and write scratch files, which say nothing
     // about the work.
+    let root = format!("{}/", info.project.trim_end_matches('/'));
     let files: Vec<&String> = info
         .files_modified
         .iter()
         .filter(|f| {
+            let in_project = !info.project.is_empty() && f.starts_with(&root);
             f.trim_end_matches('/') != info.project.trim_end_matches('/')
-                && !["/tmp/", "/private/tmp/", "/private/var/", "/var/folders/"]
-                    .iter()
-                    .any(|dir| f.starts_with(dir))
+                && (in_project
+                    || !["/tmp/", "/private/tmp/", "/private/var/", "/var/folders/"]
+                        .iter()
+                        .any(|dir| f.starts_with(dir)))
                 && !["/.claude/", "/.cursor/", "/.codex/", "/.agents/"]
                     .iter()
                     .any(|dir| f.contains(dir))
         })
         .collect();
     if !files.is_empty() {
-        let root = format!("{}/", info.project.trim_end_matches('/'));
         let mut files = files;
         // Files inside the project first; the sort is stable within each group.
         files.sort_by_key(|f| info.project.is_empty() || !f.starts_with(&root));

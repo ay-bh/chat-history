@@ -78,25 +78,39 @@ static LIST_MARKER_RE: LazyLock<Regex> =
 
 /// The readable part of an assistant message: the text before its first
 /// tool call, without code blocks, tables, headings, quote or list markers,
-/// or markdown markup.
+/// or markdown markup. A blank line separates paragraphs; a removed line, a
+/// list item or a line ending in ':' starts a new one.
 fn prose(text: &str) -> String {
     let text = text.split("[Tool: ").next().unwrap_or_default();
-    let mut lines = Vec::new();
+    let mut lines: Vec<String> = Vec::new();
     let mut in_code = false;
     for line in text.lines() {
         let line = line.trim();
         if line.starts_with("```") {
             in_code = !in_code;
+            lines.push(String::new());
             continue;
         }
         if in_code || line.starts_with('|') || line.starts_with('#') {
+            lines.push(String::new());
             continue;
         }
-        let line = LIST_MARKER_RE.replace(line.trim_start_matches('>').trim_start(), "");
+        let quoted = line.trim_start_matches('>').trim_start();
+        if LIST_MARKER_RE.is_match(quoted) || lines.last().is_some_and(|l| l.ends_with(':')) {
+            lines.push(String::new());
+        }
+        let line = LIST_MARKER_RE.replace(quoted, "");
         let line = MARKDOWN_LINK_RE.replace_all(&line, "$1");
         lines.push(line.replace("**", "").replace('`', ""));
     }
     lines.join("\n")
+}
+
+/// Whether a message is one the client writes into the transcript (an API
+/// error, a usage or login notice) rather than a reply.
+fn is_client_notice(text: &str) -> bool {
+    let lower = text.trim_start().to_lowercase();
+    CLIENT_NOTICES.iter().any(|n| lower.starts_with(n))
 }
 
 const CLIENT_NOTICES: &[&str] = &[
@@ -114,9 +128,7 @@ const LEAD_INS: &[&str] = &["here is", "here are", "here's", "below is", "below 
 /// sentence ends at . ! or ? before whitespace, so file names, versions and
 /// URLs stay whole, and not after an initial.
 fn headline(text: &str) -> Option<String> {
-    // Messages the client writes into the transcript, not replies.
-    let lower = text.trim_start().to_lowercase();
-    if CLIENT_NOTICES.iter().any(|n| lower.starts_with(n)) {
+    if is_client_notice(text) {
         return None;
     }
     let informative = |s: &str| {
@@ -125,7 +137,10 @@ fn headline(text: &str) -> Option<String> {
             && !s.ends_with(':')
             && !LEAD_INS.iter().any(|l| lower.starts_with(l))
     };
-    for line in prose(text).lines() {
+    for paragraph in prose(text).split("\n\n") {
+        // Lines within a paragraph are one text: a sentence may wrap.
+        let line = paragraph.trim().replace('\n', " ");
+        let line = line.as_str();
         let mut start = 0;
         let mut chars = line.char_indices().peekable();
         while let Some((i, c)) = chars.next() {
@@ -163,6 +178,53 @@ fn clip(text: &str, max: usize) -> String {
     format!("{}…", cut.trim_end())
 }
 
+/// How a turn (a request and the assistant messages after it) ended.
+enum TurnEnd {
+    /// A reply with an informative sentence: its headline.
+    Result(String),
+    /// Replies, but none informative ("All set!").
+    Short,
+    /// No reply: nothing, tool calls, or a client notice (kept, clipped).
+    NoReply(Option<String>),
+}
+
+impl TurnEnd {
+    /// The turn's state after one more assistant message. A later message
+    /// with nothing informative ("Done.", a bare tool call, an API error)
+    /// keeps the result before it.
+    fn after(self, content: &str) -> TurnEnd {
+        if let Some(h) = headline(content) {
+            return TurnEnd::Result(h);
+        }
+        match self {
+            TurnEnd::Result(_) | TurnEnd::Short => self,
+            TurnEnd::NoReply(notice) if is_client_notice(content) => {
+                let first = content.trim().lines().next().unwrap_or_default();
+                TurnEnd::NoReply(notice.or_else(|| Some(clip(first, 80))))
+            }
+            TurnEnd::NoReply(_) if !prose(content).trim().is_empty() => TurnEnd::Short,
+            no_reply => no_reply,
+        }
+    }
+}
+
+/// The latest substantive result. A last turn with only a short reply
+/// ("thanks" / "All set!") falls back to the result before it; a last
+/// request that got no reply says so instead of showing an older result.
+fn outcome(turns: &[TurnEnd]) -> String {
+    for t in turns.iter().rev() {
+        match t {
+            TurnEnd::Result(h) => return h.clone(),
+            TurnEnd::Short => continue,
+            TurnEnd::NoReply(Some(notice)) => {
+                return format!("no reply to the last request ({notice})");
+            }
+            TurnEnd::NoReply(None) => return "no reply to the last request".to_string(),
+        }
+    }
+    String::new()
+}
+
 fn session_duration_minutes(timestamps: &[&str]) -> i64 {
     let parsed: Vec<_> = timestamps
         .iter()
@@ -186,9 +248,10 @@ pub fn inspect_session(session: &Session) -> Option<InspectInfo> {
 
     let mut tools_used: BTreeSet<String> = BTreeSet::new();
     let mut files_modified: BTreeSet<String> = BTreeSet::new();
-    // How each turn ended: the headline of its last assistant message.
-    let mut turn_ends: Vec<String> = Vec::new();
-    let mut turn_end: Option<String> = None;
+    // How each turn ended, one entry per turn.
+    let mut turns: Vec<TurnEnd> = Vec::new();
+    let mut turn = TurnEnd::NoReply(None);
+    let mut in_turn = false;
     let mut decisions = Vec::new();
     let mut errors_seen = Vec::new();
     let mut err_set: HashSet<String> = HashSet::new();
@@ -211,15 +274,16 @@ pub fn inspect_session(session: &Session) -> Option<InspectInfo> {
         match msg.role.as_str() {
             "user" => {
                 user_count += 1;
-                turn_ends.extend(turn_end.take());
+                if in_turn {
+                    turns.push(std::mem::replace(&mut turn, TurnEnd::NoReply(None)));
+                }
+                in_turn = true;
             }
             "tool" => tool_count += 1,
             _ => {
                 assistant_count += 1;
-                // A later "Done." or bare tool call keeps the reply before it.
-                if let Some(h) = headline(&msg.content) {
-                    turn_end = Some(h);
-                }
+                in_turn = true;
+                turn = turn.after(&msg.content);
             }
         }
         for t in &msg.tool_uses {
@@ -271,10 +335,18 @@ pub fn inspect_session(session: &Session) -> Option<InspectInfo> {
             }
         });
 
-    turn_ends.extend(turn_end);
-    turn_ends.dedup();
-    let outcome = turn_ends.last().cloned().unwrap_or_default();
-    let accomplishments = turn_ends.split_off(turn_ends.len().saturating_sub(10));
+    if in_turn {
+        turns.push(turn);
+    }
+    let outcome = outcome(&turns);
+    let mut accomplishments: Vec<String> = turns
+        .into_iter()
+        .filter_map(|t| match t {
+            TurnEnd::Result(h) => Some(h),
+            _ => None,
+        })
+        .collect();
+    let accomplishments = accomplishments.split_off(accomplishments.len().saturating_sub(10));
     let asked = messages
         .iter()
         .filter(|m| m.role == "user")

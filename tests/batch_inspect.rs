@@ -295,3 +295,114 @@ fn brief_files_list_the_projects_first() {
         "{out}"
     );
 }
+
+fn brief_of(tmp: &TempDir, records: Vec<(&str, Value)>) -> String {
+    write_claude(tmp.path(), ID_C, records);
+    stdout(tmp, &["inspect", "cccccccc", "--brief"])
+}
+
+#[test]
+fn a_last_request_without_a_reply_is_not_given_the_previous_result() {
+    let tmp = fixture();
+    let out = brief_of(
+        &tmp,
+        vec![
+            ("user", json!("deploy the egret service")),
+            (
+                "assistant",
+                json!("Deployed the egret service to staging and it is healthy."),
+            ),
+            ("user", json!("now roll it out to production")),
+            ("assistant", json!("API Error: 529 Overloaded.")),
+        ],
+    );
+    assert!(!out.contains("Deployed the egret service"), "{out}");
+    assert!(
+        out.contains("Outcome: no reply to the last request (API Error: 529 Overloaded.)"),
+        "{out}"
+    );
+}
+
+#[test]
+fn a_closing_pleasantry_keeps_the_previous_result() {
+    let tmp = fixture();
+    let out = brief_of(
+        &tmp,
+        vec![
+            ("user", json!("deploy the egret service")),
+            (
+                "assistant",
+                json!("Deployed the egret service to staging and it is healthy."),
+            ),
+            ("user", json!("thanks")),
+            ("assistant", json!("All set!")),
+        ],
+    );
+    assert!(
+        out.contains("Outcome: Deployed the egret service to staging and it is healthy."),
+        "{out}"
+    );
+}
+
+#[test]
+fn accomplishments_keep_one_line_per_turn() {
+    let tmp = fixture();
+    write_claude(
+        tmp.path(),
+        ID_C,
+        vec![
+            ("user", json!("run the egret checks")),
+            ("assistant", json!("All egret checks pass on this branch.")),
+            ("user", json!("run them again after the rebase")),
+            ("assistant", json!("All egret checks pass on this branch.")),
+        ],
+    );
+    let out = stdout(&tmp, &["inspect", "cccccccc"]);
+    assert_eq!(section(&out, "Accomplishments:").len(), 2, "{out}");
+}
+
+#[test]
+fn a_sentence_wrapped_across_lines_stays_whole() {
+    let tmp = fixture();
+    let out = brief_of(
+        &tmp,
+        vec![
+            ("user", json!("fix the login")),
+            (
+                "assistant",
+                json!("Rebuilt the login\nflow and deployed it."),
+            ),
+        ],
+    );
+    assert!(
+        out.contains("Outcome: Rebuilt the login flow and deployed it."),
+        "{out}"
+    );
+}
+
+#[test]
+fn brief_files_keep_a_project_that_lives_under_tmp() {
+    let tmp = fixture();
+    write_claude(
+        tmp.path(),
+        ID_C,
+        vec![
+            ("user", json!("tidy the scratch project")),
+            (
+                "assistant",
+                json!([{"type": "tool_use", "id": "w1", "name": "Edit",
+                        "input": {"file_path": "/tmp/scratch-proj/src/main.rs"}}]),
+            ),
+            ("assistant", json!("Tidied main.rs in the scratch project.")),
+        ],
+    );
+    let file = tmp
+        .path()
+        .join(format!(".claude/projects/-Users-test-proj/{ID_C}.jsonl"));
+    let text = fs::read_to_string(&file)
+        .unwrap()
+        .replace("/Users/test/proj", "/tmp/scratch-proj");
+    fs::write(&file, text).unwrap();
+    let out = stdout(&tmp, &["inspect", "cccccccc", "--brief"]);
+    assert!(out.contains("  Files: src/main.rs\n"), "{out}");
+}
