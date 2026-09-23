@@ -18,9 +18,9 @@ Search, inspect, and export Claude Code, Cursor, and Codex conversation history.
 
 **Keyword question** ("find that conversation where I..."):
 
-1. `chat-history search "<query>" --json` — always `--json` from agents. BM25 searches metadata and transcripts together (`--deep` is not needed). Each hit carries `session_id`, `score`, `snippet`, `role` (`user` = the person, `assistant`, `tool` = command output or file contents), `ordinal` (the message's position in the transcript), `timestamp`, `tools`, `files`; its `additional_matches` entries carry the same message fields and belong to the parent hit's `session_id`. Note `--json` exists only on `search`.
+1. `chat-history search "<query>" --compact` — one line per conversation: short id, date, source, directory, `#ordinal` of the best match (`-` for a title or first-prompt match), title, then `—  Role: excerpt` and `(also #a #b)` for its other matches. Role is `You` (the person), `Assistant` or `Tool` (command output or file contents). BM25 searches metadata and transcripts together (`--deep` is not needed). Use `--json` instead only when a script parses the results: each hit then carries `session_id`, `score`, `snippet`, `role`, `ordinal`, `timestamp`, `tools`, `files`, and `additional_matches` with the same message fields.
 2. Shortlist by snippet, not by raw score (see "Choosing the best hit").
-3. Read the hit in context, not the whole transcript: `chat-history view <id> --plain --around <ordinal>` (2 messages each side; `-C N` to widen, `--max-chars 1500` to cap long messages). `ordinal` is `null` for title/prompt matches — use `inspect` for those.
+3. Read the hit in context, not the whole transcript: `chat-history view <id> --plain --around <ordinal>` (2 messages each side; `-C N` to widen, `--max-chars 1500` to cap long messages), or `--around` one of the `also` ordinals. A title/prompt match has no ordinal — use `inspect` for those. `view --json` gives the same selection as data for scripts.
 4. To find something inside one session, use `chat-history view <id> --plain --grep "<regex>" --max-chars 600 --head 12` instead of piping `view` through `grep`/`sed`/`head`. To read just the conversation, add `--role user,assistant` (tool output is most of a transcript); `--role user` lists what the person asked.
 5. `chat-history inspect <id> <id> <id> --brief` on the top 2–3 candidates to confirm before answering: one call, a few lines each (what was asked, the latest substantive result, files it read or edited — the project's first). Drop `--brief` for one session's full detail. Full `view` / `export` only if the user needs the whole conversation.
 
@@ -41,7 +41,7 @@ Search, inspect, and export Claude Code, Cursor, and Codex conversation history.
 
 ## Common mistakes
 
-- Only `search` accepts `--json`; the session list and `inspect` reject it.
+- `search` and `view` accept `--json`; the session list and `inspect` reject it.
 - The subcommands are `search`, `inspect`, `view`, `export`, `resume`, `find`, `install-skill`, `completions`, and the optional `cursor-hook` receiver. Do not guess others; run `chat-history --help` when unsure. `cursor-hook` is for configured Cursor hooks, not normal history queries.
 - Cursor CLI rows labeled `[metadata only]` support `find`, `resume`, and title search when Cursor recorded a title (print-mode chats usually have none); their internal `store.db` cannot be viewed or exported as a transcript. Do not claim that metadata-only search covers message content.
 - Cursor message timestamps may be unavailable. `search --timeframe` excludes unknown message times and untimed first-prompt previews. Titles use session activity times. With `--engine legacy`, add `--deep` to bypass its metadata shortcut; use session `--from` / `--to` filters for activity-date questions. File modification times are not message timestamps.
@@ -62,11 +62,12 @@ chat-history --source claude                      # claude | cursor | cursor-age
 chat-history -L                                   # current workspace only
 chat-history --branch feature-xyz -k "auth" -v    # branch / keyword filters
 
-# Search (always --json from agents)
-chat-history search "auth error" --json
-chat-history search "fix" --scope errors --json          # only messages with error patterns
+# Search (--compact from agents; --json for scripts)
+chat-history search "auth error" --compact
+chat-history search "fix" --scope errors --compact       # only messages with error patterns
 chat-history search <full-uuid>                          # direct session lookup (with --timeframe: only if active in the window)
-chat-history search "q" --json --limit 30               # default limit is 15
+chat-history search "q" --compact --limit 30            # default limit is 15
+chat-history search "q" --json                          # structured, for scripts
 chat-history search "auth error" --engine legacy --deep --json  # compare previous ranking
 
 # Inspect / View / Export / Resume / Find
@@ -78,6 +79,7 @@ chat-history view <id> --plain --grep "cloudflare|dns" --max-chars 600 --head 12
 chat-history view <id> --plain --tail 6    # last 6 messages (--head N for the first N)
 chat-history view <id> --plain --role user # only what the person said (user | assistant | tool, comma-separated)
 chat-history view <id> --plain             # whole transcript, pipe-friendly (--tools for tool names; -n numbers messages)
+chat-history view <id> --json --around 42  # the same selections as data: ordinal, role, timestamp, content, tools
 chat-history export <id> -o session.md
 chat-history resume <id>                   # Claude Code, Codex, or any Cursor chat with a CLI store
 chat-history find <id>                     # print transcript file path for scripting

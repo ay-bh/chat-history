@@ -71,8 +71,9 @@ chat-history
 chat-history --from yesterday -s
 chat-history -L                         # current workspace only
 
-# Search — BM25 searches metadata and transcripts together; use --json for agents
-chat-history search "auth error" --deep --json
+# Search — BM25 searches metadata and transcripts together
+chat-history search "auth error" --compact        # one line per hit, for agents
+chat-history search "auth error" --json           # structured, for scripts
 chat-history search "timeout" --scope errors --json
 chat-history search "trade" --scope similar --json
 chat-history search <full-uuid> --json          # with --timeframe: only if the session was active in the window
@@ -97,7 +98,7 @@ chat-history find <id>                    # absolute path for further tooling
 chat-history completions zsh
 ```
 
-`ch` is a drop-in alias: `ch search "auth" --deep --json`.
+`ch` is a drop-in alias: `ch search "auth" --compact`.
 
 ### Narrowing scope
 
@@ -113,7 +114,7 @@ chat-history --from "3 days ago" --to today
 chat-history --sidechains                 # include hidden subagent/sidechain sessions
 
 # Apply workspace scope to a search (-L works before or after the subcommand)
-chat-history search "auth" --deep --json -L
+chat-history search "auth" --compact -L
 
 # Listing-only presentation flags
 chat-history --from yesterday -s          # group by day
@@ -130,7 +131,8 @@ Date formats: `YYYY-MM-DD`, `today`, `yesterday`, `"3 days ago"`, `"last week"`,
 | `--engine legacy` | Previous metadata-first search; add `--deep` to bypass its metadata shortcut. |
 | `--group-by session\|message` | BM25 defaults to conversations with additional matches; choose message rows explicitly. |
 | `--deep` | Accepted for compatibility; BM25 already searches full transcripts. Snippets are match-centered. |
-| `--json` | Machine-readable search output. This flag is available on `search`, not `inspect` or `view`. |
+| `--json` | Machine-readable output on `search` and `view` (the selected messages, with ordinal, role, timestamp, content, tools, and `truncated` when `--max-chars` cut them). Not available on `inspect` or the session list. |
+| `--compact` | `search` only: one line per hit with short id, date, source, directory, `#ordinal`, title, excerpt, and `(also #a #b)` for further matches. About a sixth the size of `--json` on real queries. |
 | `--rebuild-index` | Reparse all sessions into the BM25 index. |
 | `--cache-dir PATH` / `--no-cache` | Store the BM25 index elsewhere, or build it in memory for this search. |
 
