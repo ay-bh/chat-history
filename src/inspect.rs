@@ -1,5 +1,7 @@
 use crate::session::*;
+use regex::Regex;
 use std::collections::{BTreeSet, HashSet};
+use std::sync::LazyLock;
 
 pub struct InspectInfo {
     pub session_id: String,
@@ -14,6 +16,11 @@ pub struct InspectInfo {
     pub tool_results: usize,
     pub tools_used: Vec<String>,
     pub files_modified: Vec<String>,
+    /// The session's first request.
+    pub asked: String,
+    /// How the last turn ended: the first informative sentence of its reply.
+    pub outcome: String,
+    /// How each turn ended, most recent last.
     pub accomplishments: Vec<String>,
     pub decisions: Vec<String>,
     pub errors: Vec<String>,
@@ -63,6 +70,66 @@ fn extract_sentence_around(text: &str, keyword: &str) -> Option<String> {
     }
 }
 
+static MARKDOWN_LINK_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\[([^\]]*)\]\([^)]*\)").unwrap());
+static LIST_MARKER_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^(?:[-*+•]|\d+[.)])\s+").unwrap());
+
+/// The readable part of an assistant message: the text before its first
+/// tool call, without code blocks, tables, headings, quote or list markers,
+/// or markdown markup.
+fn prose(text: &str) -> String {
+    let text = text.split("[Tool: ").next().unwrap_or_default();
+    let mut lines = Vec::new();
+    let mut in_code = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with("```") {
+            in_code = !in_code;
+            continue;
+        }
+        if in_code || line.starts_with('|') || line.starts_with('#') {
+            continue;
+        }
+        let line = LIST_MARKER_RE.replace(line.trim_start_matches('>').trim_start(), "");
+        let line = MARKDOWN_LINK_RE.replace_all(&line, "$1");
+        lines.push(line.replace("**", "").replace('`', ""));
+    }
+    lines.join("\n")
+}
+
+/// The first sentence of a message that says something: four words or
+/// more, and not a lead-in ending in ':'. A sentence ends at . ! or ? before
+/// whitespace, so file names, versions and URLs stay whole.
+fn headline(text: &str) -> Option<String> {
+    let informative = |s: &str| s.split_whitespace().count() >= 4 && !s.ends_with(':');
+    for line in prose(text).lines() {
+        let mut start = 0;
+        let mut chars = line.char_indices().peekable();
+        while let Some((i, c)) = chars.next() {
+            let next = chars.peek().map(|&(_, n)| n);
+            let ends = matches!(c, '.' | '!' | '?') && next.is_none_or(char::is_whitespace);
+            if ends || next.is_none() {
+                let end = i + c.len_utf8();
+                let sentence = line[start..end].trim();
+                start = end;
+                if informative(sentence) {
+                    return Some(clip(sentence, 200));
+                }
+            }
+        }
+    }
+    None
+}
+
+fn clip(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let cut: String = text.chars().take(max - 1).collect();
+    format!("{}…", cut.trim_end())
+}
+
 fn session_duration_minutes(timestamps: &[&str]) -> i64 {
     let parsed: Vec<_> = timestamps
         .iter()
@@ -86,31 +153,17 @@ pub fn inspect_session(session: &Session) -> Option<InspectInfo> {
 
     let mut tools_used: BTreeSet<String> = BTreeSet::new();
     let mut files_modified: BTreeSet<String> = BTreeSet::new();
-    let mut accomplishments = Vec::new();
+    // How each turn ended: the headline of its last assistant message.
+    let mut turn_ends: Vec<String> = Vec::new();
+    let mut turn_end: Option<String> = None;
     let mut decisions = Vec::new();
     let mut errors_seen = Vec::new();
     let mut err_set: HashSet<String> = HashSet::new();
     let mut user_count = 0usize;
     let mut assistant_count = 0usize;
     let mut tool_count = 0usize;
-    let mut acc_set: HashSet<String> = HashSet::new();
     let mut dec_set: HashSet<String> = HashSet::new();
 
-    let accomplishment_signals = [
-        "successfully",
-        "completed",
-        "fixed",
-        "implemented",
-        "created",
-        "added",
-        "updated",
-        "resolved",
-        "built",
-        "configured",
-        "here's what we accomplished",
-        "done",
-        "finished",
-    ];
     let decision_signals = [
         "decided to",
         "chose",
@@ -123,9 +176,15 @@ pub fn inspect_session(session: &Session) -> Option<InspectInfo> {
 
     for msg in &messages {
         match msg.role.as_str() {
-            "user" => user_count += 1,
+            "user" => {
+                user_count += 1;
+                turn_ends.extend(turn_end.take());
+            }
             "tool" => tool_count += 1,
-            _ => assistant_count += 1,
+            _ => {
+                assistant_count += 1;
+                turn_end = headline(&msg.content);
+            }
         }
         for t in &msg.tool_uses {
             tools_used.insert(t.clone());
@@ -140,20 +199,11 @@ pub fn inspect_session(session: &Session) -> Option<InspectInfo> {
         }
 
         if msg.role == "assistant" && msg.content.len() > 80 {
-            let cl = msg.content_lower();
-            for sig in &accomplishment_signals {
-                if cl.contains(sig) {
-                    if let Some(snippet) = extract_sentence_around(&msg.content, sig)
-                        && acc_set.insert(snippet.clone())
-                    {
-                        accomplishments.push(snippet);
-                    }
-                    break;
-                }
-            }
+            let text = prose(&msg.content);
+            let cl = text.to_lowercase();
             for sig in &decision_signals {
                 if cl.contains(sig) {
-                    if let Some(snippet) = extract_sentence_around(&msg.content, sig)
+                    if let Some(snippet) = extract_sentence_around(&text, sig)
                         && dec_set.insert(snippet.clone())
                     {
                         decisions.push(snippet);
@@ -185,10 +235,19 @@ pub fn inspect_session(session: &Session) -> Option<InspectInfo> {
             }
         });
 
-    accomplishments.truncate(10);
+    turn_ends.extend(turn_end);
+    turn_ends.dedup();
+    let outcome = turn_ends.last().cloned().unwrap_or_default();
+    let accomplishments = turn_ends.split_off(turn_ends.len().saturating_sub(10));
+    let asked = messages
+        .iter()
+        .filter(|m| m.role == "user")
+        .map(|m| crate::parser::display_title(&m.content, 160))
+        .find(|t| !t.is_empty())
+        .unwrap_or_default();
     decisions.truncate(5);
     errors_seen.truncate(5);
-    let files_vec: Vec<String> = files_modified.into_iter().take(20).collect();
+    let files_vec: Vec<String> = files_modified.into_iter().collect();
 
     Some(InspectInfo {
         session_id: session.id.clone(),
@@ -203,6 +262,8 @@ pub fn inspect_session(session: &Session) -> Option<InspectInfo> {
         tool_results: tool_count,
         tools_used: tools_used.into_iter().collect(),
         files_modified: files_vec,
+        asked,
+        outcome,
         accomplishments,
         decisions,
         errors: errors_seen,
@@ -216,6 +277,34 @@ pub fn inspect_session(session: &Session) -> Option<InspectInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn headline_keeps_urls_versions_and_file_names_whole() {
+        assert_eq!(
+            headline("Created [PR #41](https://github.com/acme/web/pull/41) for review.")
+                .as_deref(),
+            Some("Created PR #41 for review.")
+        );
+        assert_eq!(
+            headline("Bumped to 0.7.1 and edited src/main.rs today. Then more.").as_deref(),
+            Some("Bumped to 0.7.1 and edited src/main.rs today.")
+        );
+    }
+
+    #[test]
+    fn headline_skips_lead_ins_and_non_prose() {
+        assert_eq!(headline("Done. All set."), None);
+        assert_eq!(
+            headline("## Summary\nHere is what changed:\n- **Moved** the cache into `src/cache.rs` so it loads once")
+                .as_deref(),
+            Some("Moved the cache into src/cache.rs so it loads once")
+        );
+        assert_eq!(headline("| a | b |\n```\nlet x = 1; done now\n```"), None);
+        assert_eq!(
+            headline("[Tool: Bash] for id in a b; do chat-history inspect $id; done"),
+            None
+        );
+    }
 
     #[test]
     fn extract_sentence_multibyte_boundary_no_panic() {

@@ -22,14 +22,14 @@ Search, inspect, and export Claude Code, Cursor, and Codex conversation history.
 2. Shortlist by snippet, not by raw score (see "Choosing the best hit").
 3. Read the hit in context, not the whole transcript: `chat-history view <id> --plain --around <ordinal>` (2 messages each side; `-C N` to widen, `--max-chars 1500` to cap long messages). `ordinal` is `null` for title/prompt matches — use `inspect` for those.
 4. To find something inside one session, use `chat-history view <id> --plain --grep "<regex>" --max-chars 600 --head 12` instead of piping `view` through `grep`/`sed`/`head`. To read just the conversation, add `--role user,assistant` (tool output is most of a transcript); `--role user` lists what the person asked.
-5. `chat-history inspect <partial-uuid>` on the top 2–3 candidates to confirm before answering. Full `view` / `export` only if the user needs the whole conversation.
+5. `chat-history inspect <id> <id> <id> --brief` on the top 2–3 candidates to confirm before answering: one call, a few lines each (what was asked, how it ended, the project files touched). Drop `--brief` for one session's full detail. Full `view` / `export` only if the user needs the whole conversation.
 
 **Temporal question** ("what did I work on yesterday?") — list, don't search:
 
 1. `chat-history --from yesterday --to yesterday` — every row shows a short session ID; `-s` groups by day for multi-day overviews.
    - `--from X` alone means **X through today**. Always pair with `--to` when the user means a specific day.
    - Short IDs work everywhere a session ID is accepted (`inspect`, `view`, `export`, `find`); `-v` adds full IDs and file paths. `resume` works for `claude` / `codex` rows and for Cursor Agent CLI chats; Cursor rows whose id has no `~/.cursor/chats` store (whatever their tag) print the **title** and `DIR:` — tell the user to open that folder in Cursor and pick the chat in the sidebar.
-2. `chat-history inspect <id>` for accomplishments, tools, files touched.
+2. `chat-history inspect <id>…` for accomplishments (how each turn ended), tools, files touched; `--brief` to compare several sessions.
 
 ## Choosing the best hit
 
@@ -37,7 +37,7 @@ Search, inspect, and export Claude Code, Cursor, and Codex conversation history.
 - BM25 groups matches by conversation: `--limit` counts conversations, `snippet` follows the strongest matching passage, and `additional_matches` contains up to two more excerpts. Read these before inspecting the session. Use `--group-by message` if individual matching messages are needed; legacy and `--scope similar` retain their previous message-row default.
 - Search leaves out the conversation you are running in (Claude Code, Codex and Cursor's agent tell it which one), since it would match its own query. Searching for its full UUID still finds it.
 - Tool output (`role: tool`) ranks below conversation text with the same words; chat-history's own output is never indexed.
-- When candidates are close, `inspect` each before picking — don't answer from the top score alone.
+- When candidates are close, `inspect` them together (`inspect a b c --brief`) before picking — don't answer from the top score alone, and don't loop over ids in the shell.
 
 ## Common mistakes
 
@@ -72,6 +72,7 @@ chat-history search "auth error" --engine legacy --deep --json  # compare previo
 # Inspect / View / Export / Resume / Find
 chat-history inspect --last                # accomplishments, tools, model, tokens, files
 chat-history inspect <partial-uuid>
+chat-history inspect a1b2c3d4 e5f6a7b8 --brief  # several sessions, a few lines each: asked, outcome, files
 chat-history view <id> --plain --around 42 # message #42 (a hit's ordinal) ± 2 messages; -C N to change
 chat-history view <id> --plain --grep "cloudflare|dns" --max-chars 600 --head 12  # matching messages, excerpt centred on the match
 chat-history view <id> --plain --tail 6    # last 6 messages (--head N for the first N)

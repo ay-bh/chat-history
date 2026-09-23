@@ -144,13 +144,16 @@ enum Commands {
         #[arg(long = "json")]
         json_output: bool,
     },
-    /// Summarize a session: accomplishments, tools, files, model, tokens
+    /// Summarize sessions: accomplishments, tools, files, model, tokens
     Inspect {
-        /// Session ID or unique prefix
-        session_id: Option<String>,
+        /// Session IDs or unique prefixes, inspected in the order given
+        session_ids: Vec<String>,
         /// Inspect the most recent session
-        #[arg(long)]
+        #[arg(long, conflicts_with = "session_ids")]
         last: bool,
+        /// A few lines per session: what was asked and how it ended
+        #[arg(long)]
+        brief: bool,
     },
     /// Print a session transcript
     View {
@@ -234,6 +237,15 @@ fn resolve_session_or_exit<'a>(
     sessions: &'a [session::Session],
     sid: &str,
 ) -> &'a session::Session {
+    resolve_session(sessions, sid).unwrap_or_else(|code| std::process::exit(code))
+}
+
+/// The session `sid` names, or the exit code after explaining why there is
+/// none (not found, or an ambiguous prefix).
+fn resolve_session<'a>(
+    sessions: &'a [session::Session],
+    sid: &str,
+) -> Result<&'a session::Session, i32> {
     match lookup_session(sessions, sid) {
         SessionLookup::Found(s) => {
             let copies = session_copies(sessions, s);
@@ -255,7 +267,7 @@ fn resolve_session_or_exit<'a>(
                     );
                 }
             }
-            s
+            Ok(s)
         }
         SessionLookup::Ambiguous(candidates) => {
             eprintln!("Session ID \"{sid}\" is ambiguous — it matches:");
@@ -269,11 +281,11 @@ fn resolve_session_or_exit<'a>(
                 );
             }
             eprintln!("Use a longer prefix.");
-            std::process::exit(2);
+            Err(2)
         }
         SessionLookup::NotFound => {
             eprintln!("Session not found: {sid}");
-            std::process::exit(1);
+            Err(1)
         }
     }
 }
@@ -330,6 +342,12 @@ fn transcript_or_exit<'a>(
         eprintln!("Provide a session ID or use --last");
         std::process::exit(2);
     };
+    readable(session).unwrap_or_else(|code| std::process::exit(code))
+}
+
+/// `session`, or exit code 1 after explaining that only Cursor CLI metadata
+/// exists for it.
+fn readable(session: &session::Session) -> Result<&session::Session, i32> {
     if session.is_cursor_store_only() {
         let reopen = match chat_history::cursor_cli::unresumable_reason(session) {
             Some(reason) => format!("It cannot be resumed either: {reason}"),
@@ -342,9 +360,9 @@ fn transcript_or_exit<'a>(
             "Only metadata is available for Cursor CLI session {}. Its store.db format is not a readable transcript. {reopen}",
             session.id
         );
-        std::process::exit(1);
+        return Err(1);
     }
-    session
+    Ok(session)
 }
 
 fn main() {
@@ -400,10 +418,10 @@ fn main() {
 
     let id_lookup = matches!(
         &cli.command,
-        Some(Commands::Inspect {
-            session_id: Some(_),
-            last: false
-        }) | Some(Commands::View {
+        Some(Commands::Inspect { session_ids, .. }) if !session_ids.is_empty()
+    ) || matches!(
+        &cli.command,
+        Some(Commands::View {
             session_id: Some(_),
             last: false,
             ..
@@ -565,11 +583,43 @@ fn main() {
                 display::print_search_results(&results, &query);
             }
         }
-        Some(Commands::Inspect { session_id, last }) => {
-            let session = transcript_or_exit(&sessions, &filtered, session_id.as_deref(), last);
-            match inspect::inspect_session(session) {
-                Some(info) => display::print_inspect(&info),
-                None => eprintln!("Could not inspect session (transcript may be expired)."),
+        Some(Commands::Inspect {
+            session_ids,
+            last,
+            brief,
+        }) => {
+            let targets: Vec<Result<&session::Session, i32>> = if last || session_ids.is_empty() {
+                vec![Ok(transcript_or_exit(&sessions, &filtered, None, last))]
+            } else {
+                session_ids
+                    .iter()
+                    .map(|sid| resolve_session(&sessions, sid).and_then(readable))
+                    .collect()
+            };
+            let mut failure = None;
+            for (n, target) in targets.into_iter().enumerate() {
+                let Ok(session) = target.map_err(|code| failure = failure.or(Some(code))) else {
+                    continue;
+                };
+                match inspect::inspect_session(session) {
+                    Some(info) if brief => {
+                        if n > 0 {
+                            println!();
+                        }
+                        display::print_inspect_brief(&info);
+                    }
+                    Some(info) => display::print_inspect(&info),
+                    None => {
+                        eprintln!(
+                            "Could not inspect session {} (transcript may be expired).",
+                            session.id
+                        );
+                        failure = failure.or(Some(1));
+                    }
+                }
+            }
+            if let Some(code) = failure {
+                std::process::exit(code);
             }
         }
         Some(Commands::View {
