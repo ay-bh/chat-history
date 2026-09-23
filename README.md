@@ -177,7 +177,7 @@ Example (`--engine legacy` metadata search, not `--json`):
 | Cursor IDE | `.../Cursor/User/globalStorage/state.vscdb` (`CURSOR_USER_DIR`; `--source cursor-ide`) |
 | Cursor subagents | `.../agent-transcripts/*/subagents/*.jsonl` |
 
-Cursor Agent chats found in both transcript and IDE data are shown once as `cursor-ide`. Noise is filtered automatically, and transcripts are capped at 4MB each.
+Cursor Agent chats found in both transcript and IDE data are shown once as `cursor-ide`. Noise is filtered automatically. Transcripts are read to the end; each tool output keeps its first 12 KiB and last 4 KiB.
 
 ### Metadata cache
 

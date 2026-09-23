@@ -822,8 +822,9 @@ impl ViewOptions {
         // Ordinals of the messages --role selects. Windows are ranges of this
         // list, so context counts selected messages, not skipped ones.
         let pool = self.selected(messages);
-        let window =
-            |k: usize| k.saturating_sub(context)..k.saturating_add(context + 1).min(pool.len());
+        let window = |k: usize| {
+            k.saturating_sub(context)..k.saturating_add(context).saturating_add(1).min(pool.len())
+        };
         // --head/--tail keep the first/last N items: matches (each with its
         // context) under --grep, so a match is never cut off; else messages.
         let limit = |items: &mut Vec<usize>| {

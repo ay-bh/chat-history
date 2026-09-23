@@ -422,6 +422,26 @@ fn a_huge_context_is_clamped_instead_of_overflowing() {
 }
 
 #[test]
+fn a_huge_grep_context_is_clamped_instead_of_overflowing() {
+    let tmp = fixture();
+    let out = stdout(
+        &tmp,
+        &[
+            "view",
+            ID,
+            "--plain",
+            "--grep",
+            "zebracorn",
+            "-C",
+            &usize::MAX.to_string(),
+        ],
+    );
+    for n in 0..8 {
+        assert!(out.contains(&format!("[#{n}]")), "{out}");
+    }
+}
+
+#[test]
 fn grep_head_counts_matches_so_a_match_is_never_cut_off() {
     let tmp = fixture();
     // zebracorn matches #0 and #7; with context 2 the first window is 0..=2.

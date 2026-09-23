@@ -77,19 +77,137 @@ fn truncate_for_search(s: &str, max: usize) -> String {
 
 /// Words that run the word after them as the command.
 const COMMAND_WRAPPERS: &[&str] = &["time", "command", "exec", "env", "nohup", "sudo"];
+static EMBEDDED_COMMAND_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"\b(?:cmd|command)["']?\s*:\s*([`"'])"#).unwrap());
 
 /// Whether a shell command, or a script that builds one, runs chat-history.
 /// Only the first word of each simple command counts, so a path or an
 /// argument that mentions chat-history (`cd ~/src/chat-history`) does not.
 pub fn is_history_command(command: &str) -> bool {
-    command
-        .split(['\n', ';', '&', '|', '(', ')', '{', '}', '`', '"', '\''])
-        .any(|segment| {
-            segment
-                .split_whitespace()
-                .find(|w| !w.contains('=') && !COMMAND_WRAPPERS.contains(w))
-                .is_some_and(|w| matches!(w.rsplit('/').next(), Some("chat-history" | "ch")))
-        })
+    if shell_runs_history(command) {
+        return true;
+    }
+    // Codex records the JavaScript or JSON that calls exec_command, not just
+    // its shell argument. Inspect that argument without treating quoted grep
+    // patterns in an ordinary shell command as executable commands.
+    if let Ok(args) = serde_json::from_str::<Value>(command) {
+        for key in ["cmd", "command"] {
+            if args
+                .get(key)
+                .and_then(Value::as_str)
+                .is_some_and(shell_runs_history)
+            {
+                return true;
+            }
+        }
+    }
+    if !command.contains("tools.exec_command") {
+        return false;
+    }
+    EMBEDDED_COMMAND_RE.captures_iter(command).any(|capture| {
+        let delimiter = capture[1].chars().next().unwrap();
+        let mut script = String::new();
+        let mut escaped = false;
+        for ch in command[capture.get(0).unwrap().end()..].chars() {
+            if escaped {
+                script.push(ch);
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == delimiter {
+                break;
+            } else {
+                script.push(ch);
+            }
+        }
+        shell_runs_history(&script)
+    })
+}
+
+fn shell_runs_history(command: &str) -> bool {
+    fn first_word_is_history(
+        word: &mut String,
+        command_position: &mut bool,
+        shell_launcher: &mut bool,
+        script_next: &mut bool,
+    ) -> bool {
+        if word.is_empty() {
+            return false;
+        }
+        let token = std::mem::take(word);
+        if *script_next {
+            *script_next = false;
+            return shell_runs_history(&token);
+        }
+        if *shell_launcher && token.starts_with('-') && token.contains('c') {
+            *script_next = true;
+            return false;
+        }
+        if !*command_position {
+            return false;
+        }
+        if token.contains('=') || COMMAND_WRAPPERS.contains(&token.as_str()) {
+            return false;
+        }
+        *command_position = false;
+        let basename = token.rsplit('/').next();
+        *shell_launcher = matches!(basename, Some("bash" | "sh" | "zsh"));
+        matches!(basename, Some("chat-history" | "ch"))
+    }
+
+    let mut word = String::new();
+    let mut command_position = true;
+    let mut shell_launcher = false;
+    let mut script_next = false;
+    let mut quote = None;
+    let mut escaped = false;
+    for ch in command.chars() {
+        if escaped {
+            word.push(ch);
+            escaped = false;
+            continue;
+        }
+        match quote {
+            Some('\'') if ch == '\'' => quote = None,
+            Some('"') if ch == '"' => quote = None,
+            Some('"') if ch == '\\' => escaped = true,
+            Some(_) => word.push(ch),
+            None => match ch {
+                '\\' => escaped = true,
+                '\'' | '"' => quote = Some(ch),
+                '\n' | ';' | '&' | '|' | '(' | ')' | '{' | '}' | '`' => {
+                    if first_word_is_history(
+                        &mut word,
+                        &mut command_position,
+                        &mut shell_launcher,
+                        &mut script_next,
+                    ) {
+                        return true;
+                    }
+                    command_position = true;
+                    shell_launcher = false;
+                    script_next = false;
+                }
+                ch if ch.is_whitespace() => {
+                    if first_word_is_history(
+                        &mut word,
+                        &mut command_position,
+                        &mut shell_launcher,
+                        &mut script_next,
+                    ) {
+                        return true;
+                    }
+                }
+                _ => word.push(ch),
+            },
+        }
+    }
+    first_word_is_history(
+        &mut word,
+        &mut command_position,
+        &mut shell_launcher,
+        &mut script_next,
+    )
 }
 
 /// Text of a tool's output: a string, or text blocks (images are skipped).
@@ -564,6 +682,8 @@ mod tests {
             "cd /tmp && chat-history --from yesterday",
             "(cd x; ch search q)",
             "time chat-history search q",
+            "bash -lc 'chat-history search q'",
+            "sh -c \"ch view abc --plain\"",
             "tools.exec_command({cmd:`chat-history search '${q}' --json`})",
             "{\"cmd\":\"chat-history view abc --plain\"}",
             "echo start\nchat-history search q",
@@ -573,6 +693,11 @@ mod tests {
         for cmd in [
             "cd ~/GitHub/chat-history && cargo test",
             "git log | grep chat-history",
+            "rg 'chat-history' README.md",
+            "rg \"chat-history; ch\" README.md",
+            "echo \"ch search old chats\"",
+            "bash -lc 'rg \"chat-history\" README.md'",
+            "tools.exec_command({cmd:`rg 'chat-history' README.md`})",
             "rg ch src",
             "cat chat-history.md",
             "./target/release/chat-history-bounded search q",

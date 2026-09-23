@@ -223,6 +223,22 @@ fn chat_history_output_is_viewable_but_never_indexed() {
 }
 
 #[test]
+fn quoted_history_name_in_another_command_does_not_hide_its_output() {
+    let tmp = TempDir::new().unwrap();
+    write_claude(
+        tmp.path(),
+        ID_A,
+        vec![
+            ("user", json!("search the README")),
+            ("assistant", tool_use("tu1", "rg 'chat-history' README.md")),
+            ("user", tool_result("tu1", "frobulator_unique_token = 7")),
+        ],
+    );
+    let found = hits(&search(&tmp, "frobulator_unique_token"));
+    assert_eq!(found, vec![(ID_A.to_owned(), "tool".to_owned(), Some(2))]);
+}
+
+#[test]
 fn tool_output_ranks_below_conversation_text() {
     let tmp = fixture();
     let out = search(&tmp, "heronbeak");
