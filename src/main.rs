@@ -8,6 +8,23 @@ use chat_history::skill_install::{ensure_skills, install_skill};
 use chat_history::{display, inspect, scoring, search};
 use clap::{Parser, Subcommand};
 
+fn at_least_one(value: &str) -> Result<usize, String> {
+    match value.parse::<usize>() {
+        Ok(0) => Err("must be at least 1".to_owned()),
+        Ok(n) => Ok(n),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+fn view_pattern(value: &str) -> Result<regex::Regex, String> {
+    // Line-oriented like grep: `^`/`$` match at every line of a message.
+    regex::RegexBuilder::new(value)
+        .case_insensitive(true)
+        .multi_line(true)
+        .build()
+        .map_err(|e| e.to_string())
+}
+
 fn cli_timeframe(value: &str) -> Result<String, String> {
     search::parse_timeframe_duration(value)?;
     Ok(value.to_string())
@@ -148,6 +165,27 @@ enum Commands {
         /// Plain text without formatting, pipe-friendly
         #[arg(long)]
         plain: bool,
+        /// Show message N (a search hit's `ordinal`) and --context messages around it
+        #[arg(long, value_name = "N", conflicts_with = "grep")]
+        around: Option<usize>,
+        /// Messages matching a case-insensitive regex, with --context around each
+        #[arg(long, value_name = "PATTERN", value_parser = view_pattern)]
+        grep: Option<regex::Regex>,
+        /// Messages to show on each side (default: 2 with --around, 0 with --grep)
+        #[arg(short = 'C', long, value_name = "N")]
+        context: Option<usize>,
+        /// Only the first N messages (with --grep: the first N matches and their context)
+        #[arg(long, value_name = "N", conflicts_with = "tail", value_parser = at_least_one)]
+        head: Option<usize>,
+        /// Only the last N messages (with --grep: the last N matches and their context)
+        #[arg(long, value_name = "N", value_parser = at_least_one)]
+        tail: Option<usize>,
+        /// Cut each message to N characters and note how many were left out
+        #[arg(long, value_name = "N")]
+        max_chars: Option<usize>,
+        /// Prefix messages with their ordinal ([#N]); implied by the selection flags
+        #[arg(short = 'n', long)]
+        number: bool,
     },
     /// Export a session transcript as markdown
     Export {
@@ -525,13 +563,43 @@ fn main() {
             last,
             tools,
             plain,
+            around,
+            grep,
+            context,
+            head,
+            tail,
+            max_chars,
+            number,
         }) => {
             let session = transcript_or_exit(&sessions, &filtered, session_id.as_deref(), last);
             let (messages, _) = parse_session(session, false);
+            let opts = display::ViewOptions {
+                around,
+                context,
+                grep,
+                head,
+                tail,
+                number,
+                max_chars,
+            };
+            if let Err(error) = opts.check(&messages) {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+            if let Some(pattern) = &opts.grep
+                && opts.matches(&messages).is_empty()
+            {
+                eprintln!(
+                    "No messages match {} in this transcript ({} messages).",
+                    pattern.as_str(),
+                    messages.len()
+                );
+                return;
+            }
             if plain {
-                display::print_plain(&messages);
+                display::print_plain(&messages, &opts);
             } else {
-                display::print_transcript(&messages, session, tools);
+                display::print_transcript(&messages, session, tools, &opts);
             }
         }
         Some(Commands::Export { session_id, output }) => {

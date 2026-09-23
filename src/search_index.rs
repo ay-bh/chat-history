@@ -1234,7 +1234,8 @@ impl SearchBackend for Bm25Backend {
              SELECT m.id, m.session_key,
                     -bm25(passages_fts, 1.0, 3.0, 2.0, 0.5, 0.5)
                     * (1.0 + 0.25 * (complete.rowid IS NOT NULL)
-                           + 0.15 * (phrase.rowid IS NOT NULL)) AS score, p.id
+                           + 0.15 * (phrase.rowid IS NOT NULL)) AS score, p.id,
+                    m.ordinal
              FROM passages_fts
              JOIN passages p ON p.id = passages_fts.rowid
              JOIN messages m ON m.id = p.message_id
@@ -1329,6 +1330,12 @@ impl SearchBackend for Bm25Backend {
             message.relevance_score = score;
             message.final_score = score;
             let passage_id: i64 = row.get(3)?;
+            // Stored ordinals 0 and 1 are the title and prompt rows; real
+            // messages are stored at their transcript position + 2.
+            let ordinal = (!synthetic)
+                .then(|| row.get::<_, i64>(4))
+                .transpose()?
+                .and_then(|stored| usize::try_from(stored).ok()?.checked_sub(2));
             let snippet: String =
                 excerpt.query_row(params![passage_id, query.broad], |r| r.get(0))?;
             let snippet = if snippet.trim().is_empty() {
@@ -1353,18 +1360,19 @@ impl SearchBackend for Bm25Backend {
                             && r.session.id.eq_ignore_ascii_case(&session.id)
                     })
                     .flat_map(|r| {
-                        std::iter::once((&mut r.message, &mut r.snippet)).chain(
+                        std::iter::once((&mut r.message, &mut r.snippet, &mut r.ordinal)).chain(
                             r.additional_matches
                                 .iter_mut()
-                                .map(|m| (&mut m.message, &mut m.snippet)),
+                                .map(|m| (&mut m.message, &mut m.snippet, &mut m.ordinal)),
                         )
                     })
-                    .find(|(m, _)| Some(&m.uuid) == twin_uuid.as_ref());
-                if let Some((slot_message, slot_snippet)) = slot {
+                    .find(|(m, _, _)| Some(&m.uuid) == twin_uuid.as_ref());
+                if let Some((slot_message, slot_snippet, slot_ordinal)) = slot {
                     message.relevance_score = slot_message.relevance_score;
                     message.final_score = slot_message.final_score;
                     *slot_message = message;
                     *slot_snippet = Some(snippet);
+                    *slot_ordinal = ordinal;
                 }
                 continue;
             }
@@ -1378,6 +1386,7 @@ impl SearchBackend for Bm25Backend {
                 results[group].additional_matches.push(SearchMatch {
                     message,
                     snippet: Some(snippet),
+                    ordinal,
                 });
             } else {
                 groups.insert(logical_session, results.len());
@@ -1385,6 +1394,7 @@ impl SearchBackend for Bm25Backend {
                     session: session.clone(),
                     message,
                     snippet: Some(snippet),
+                    ordinal,
                     additional_matches: Vec::new(),
                 });
             }
