@@ -22,7 +22,7 @@ Search, inspect, and export Claude Code, Cursor, and Codex conversation history.
 2. Shortlist by snippet, not by raw score (see "Choosing the best hit").
 3. Read the hit in context, not the whole transcript: `chat-history view <id> --plain --around <ordinal>` (2 messages each side; `-C N` to widen, `--max-chars 1500` to cap long messages). `ordinal` is `null` for title/prompt matches — use `inspect` for those.
 4. To find something inside one session, use `chat-history view <id> --plain --grep "<regex>" --max-chars 600 --head 12` instead of piping `view` through `grep`/`sed`/`head`. To read just the conversation, add `--role user,assistant` (tool output is most of a transcript); `--role user` lists what the person asked.
-5. `chat-history inspect <id> <id> <id> --brief` on the top 2–3 candidates to confirm before answering: one call, a few lines each (what was asked, how it ended, the project files touched). Drop `--brief` for one session's full detail. Full `view` / `export` only if the user needs the whole conversation.
+5. `chat-history inspect <id> <id> <id> --brief` on the top 2–3 candidates to confirm before answering: one call, a few lines each (what was asked, how it ended, files it read or edited — the project's first). Drop `--brief` for one session's full detail. Full `view` / `export` only if the user needs the whole conversation.
 
 **Temporal question** ("what did I work on yesterday?") — list, don't search:
 

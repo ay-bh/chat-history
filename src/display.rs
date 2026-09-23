@@ -556,7 +556,8 @@ pub fn print_inspect_brief(info: &InspectInfo) {
     if !info.outcome.is_empty() {
         println!("  Outcome: {}", tty(&info.outcome));
     }
-    // The project's files, relative to its directory. Agents also read their
+    // Files the session read or edited, the project's first and relative to
+    // its directory. Agents also read their
     // own skills and tool logs and write scratch files, which say nothing
     // about the work.
     let files: Vec<&String> = info
@@ -574,6 +575,9 @@ pub fn print_inspect_brief(info: &InspectInfo) {
         .collect();
     if !files.is_empty() {
         let root = format!("{}/", info.project.trim_end_matches('/'));
+        let mut files = files;
+        // Files inside the project first; the sort is stable within each group.
+        files.sort_by_key(|f| info.project.is_empty() || !f.starts_with(&root));
         let shown: Vec<String> = files
             .iter()
             .take(5)

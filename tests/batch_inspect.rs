@@ -238,3 +238,60 @@ fn an_unknown_id_in_a_batch_does_not_hide_the_others() {
         "a missing session still fails the command"
     );
 }
+
+const ID_C: &str = "cccccccc-1111-2222-3333-cccccccccccc";
+
+#[test]
+fn a_trailing_done_or_lead_in_does_not_hide_the_outcome() {
+    let tmp = fixture();
+    write_claude(
+        tmp.path(),
+        ID_C,
+        vec![
+            ("user", json!("audit the egret config")),
+            (
+                "assistant",
+                json!(
+                    "The egret config sets two conflicting timeouts, so requests fail after 5 seconds."
+                ),
+            ),
+            ("assistant", json!("Here are the findings.")),
+            ("assistant", json!("Done.")),
+        ],
+    );
+    let out = stdout(&tmp, &["inspect", "cccccccc", "--brief"]);
+    assert!(
+        out.contains("Outcome: The egret config sets two conflicting timeouts, so requests fail after 5 seconds."),
+        "{out}"
+    );
+}
+
+#[test]
+fn brief_files_list_the_projects_first() {
+    let tmp = fixture();
+    write_claude(
+        tmp.path(),
+        ID_C,
+        vec![
+            ("user", json!("compare with the other project")),
+            (
+                "assistant",
+                json!([
+                    {"type": "tool_use", "id": "o1", "name": "Read",
+                     "input": {"file_path": "/Users/test/another-project/notes.md"}},
+                    {"type": "tool_use", "id": "o2", "name": "Edit",
+                     "input": {"file_path": "/Users/test/proj/src/egret.rs"}}
+                ]),
+            ),
+            (
+                "assistant",
+                json!("Copied the retry settings from the other project."),
+            ),
+        ],
+    );
+    let out = stdout(&tmp, &["inspect", "cccccccc", "--brief"]);
+    assert!(
+        out.contains("  Files: src/egret.rs, /Users/test/another-project/notes.md\n"),
+        "{out}"
+    );
+}

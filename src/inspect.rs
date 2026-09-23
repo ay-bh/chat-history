@@ -98,17 +98,49 @@ fn prose(text: &str) -> String {
     lines.join("\n")
 }
 
+const CLIENT_NOTICES: &[&str] = &[
+    "api error",
+    "you're out of usage credits",
+    "login expired",
+    "[request interrupted",
+];
+
+/// Openings of sentences that announce content instead of stating it.
+const LEAD_INS: &[&str] = &["here is", "here are", "here's", "below is", "below are"];
+
 /// The first sentence of a message that says something: four words or
-/// more, and not a lead-in ending in ':'. A sentence ends at . ! or ? before
-/// whitespace, so file names, versions and URLs stay whole.
+/// more, and not a lead-in ("Here are the findings.", or ending in ':'). A
+/// sentence ends at . ! or ? before whitespace, so file names, versions and
+/// URLs stay whole, and not after an initial.
 fn headline(text: &str) -> Option<String> {
-    let informative = |s: &str| s.split_whitespace().count() >= 4 && !s.ends_with(':');
+    // Messages the client writes into the transcript, not replies.
+    let lower = text.trim_start().to_lowercase();
+    if CLIENT_NOTICES.iter().any(|n| lower.starts_with(n)) {
+        return None;
+    }
+    let informative = |s: &str| {
+        let lower = s.to_lowercase();
+        s.split_whitespace().count() >= 4
+            && !s.ends_with(':')
+            && !LEAD_INS.iter().any(|l| lower.starts_with(l))
+    };
     for line in prose(text).lines() {
         let mut start = 0;
         let mut chars = line.char_indices().peekable();
         while let Some((i, c)) = chars.next() {
             let next = chars.peek().map(|&(_, n)| n);
-            let ends = matches!(c, '.' | '!' | '?') && next.is_none_or(char::is_whitespace);
+            // "D. E. Shaw": a lone capital before the dot is an initial.
+            let initial = c == '.'
+                && line[..i]
+                    .chars()
+                    .next_back()
+                    .is_some_and(char::is_uppercase)
+                && line[..i]
+                    .chars()
+                    .nth_back(1)
+                    .is_none_or(|p| !p.is_alphanumeric());
+            let ends =
+                matches!(c, '.' | '!' | '?') && !initial && next.is_none_or(char::is_whitespace);
             if ends || next.is_none() {
                 let end = i + c.len_utf8();
                 let sentence = line[start..end].trim();
@@ -183,7 +215,10 @@ pub fn inspect_session(session: &Session) -> Option<InspectInfo> {
             "tool" => tool_count += 1,
             _ => {
                 assistant_count += 1;
-                turn_end = headline(&msg.content);
+                // A later "Done." or bare tool call keeps the reply before it.
+                if let Some(h) = headline(&msg.content) {
+                    turn_end = Some(h);
+                }
             }
         }
         for t in &msg.tool_uses {
@@ -288,6 +323,19 @@ mod tests {
         assert_eq!(
             headline("Bumped to 0.7.1 and edited src/main.rs today. Then more.").as_deref(),
             Some("Bumped to 0.7.1 and edited src/main.rs today.")
+        );
+    }
+
+    #[test]
+    fn headline_skips_client_notices_and_keeps_initials() {
+        assert_eq!(
+            headline("API Error: 529 Overloaded. Try again later."),
+            None
+        );
+        assert_eq!(headline("You're out of usage credits."), None);
+        assert_eq!(
+            headline("I put AI agents into production at D. E. Shaw for two years.").as_deref(),
+            Some("I put AI agents into production at D. E. Shaw for two years.")
         );
     }
 
