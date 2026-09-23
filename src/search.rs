@@ -257,6 +257,7 @@ pub(crate) fn direct_session_search(
                 error_patterns: Vec::new(),
                 relevance_score: 0.0,
                 final_score: 100.0,
+                history_output: false,
             };
             return Some(vec![SearchResult {
                 session: s.clone(),
@@ -366,6 +367,7 @@ pub fn scored_search(
                             error_patterns: Vec::new(),
                             relevance_score: 0.0,
                             final_score: 0.0,
+                            history_output: false,
                         },
                     ),
                 );
@@ -373,7 +375,7 @@ pub fn scored_search(
             let mut hits = Vec::new();
             for (ordinal, mut msg) in messages {
                 let cl = msg.content_lower();
-                if is_noise(&cl) {
+                if msg.history_output || is_noise(&cl) {
                     continue;
                 }
                 if scope == "errors" && msg.error_patterns.is_empty() && !cl.contains("error") {

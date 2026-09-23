@@ -186,6 +186,10 @@ enum Commands {
         /// Prefix messages with their ordinal ([#N]); implied by the selection flags
         #[arg(short = 'n', long)]
         number: bool,
+        /// Only these roles, comma-separated: user (the person), assistant, tool (tool output)
+        #[arg(long, value_name = "ROLES", value_delimiter = ',',
+              value_parser = ["user", "assistant", "tool"])]
+        role: Vec<String>,
     },
     /// Export a session transcript as markdown
     Export {
@@ -473,7 +477,17 @@ fn main() {
             timeframe,
             json_output,
         }) => {
-            let pre = filtered;
+            let mut pre = filtered;
+            // The calling conversation contains the question being searched
+            // for and would rank first; asking for it by id still finds it.
+            if !scoring::is_uuid(&query) {
+                let calling = session::calling_sessions();
+                pre.retain(|s| {
+                    !calling.iter().any(|(source, id)| {
+                        s.source.starts_with(source) && s.id.eq_ignore_ascii_case(id)
+                    })
+                });
+            }
 
             if engine == "legacy" && !deep && scope == "all" && !scoring::is_uuid(&query) {
                 let idx_results = search::index_search(&pre, &query, limit);
@@ -570,6 +584,7 @@ fn main() {
             tail,
             max_chars,
             number,
+            role,
         }) => {
             let session = transcript_or_exit(&sessions, &filtered, session_id.as_deref(), last);
             let (messages, _) = parse_session(session, false);
@@ -581,6 +596,7 @@ fn main() {
                 tail,
                 number,
                 max_chars,
+                roles: role,
             };
             if let Err(error) = opts.check(&messages) {
                 eprintln!("{error}");

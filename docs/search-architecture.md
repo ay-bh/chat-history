@@ -63,7 +63,7 @@ similarity calculation so the meaning of that option does not change.
 
 ## Storage
 
-The index is `search-v2.db` under the cache directory, separate from the
+The index is `search-v3.db` under the cache directory, separate from the
 metadata cache. New directories and files use Unix modes 0700 and 0600.
 When the default cache directory is not writable, both caches are served from
 a user-private copy under the temp directory, seeded from the existing files
@@ -76,6 +76,14 @@ and re-verified session by session on the next sync (`cache_dir.rs`).
 | `passages` | Message reference and bounded searchable text or metadata fields. |
 | `passages_fts` | External-content full-text index over the passage fields. |
 | `allowed_sessions` (temporary) | Per-request filter selection, avoiding large SQL `IN` lists. |
+
+Messages are indexed whole: no per-session size cap. Tool output (Claude
+`tool_result` blocks, Codex `function_call_output` and `custom_tool_call_output`
+records) is a `tool` message whose passages fill the `tool` column instead of
+`content`; each tool output keeps its first 12 KiB and last 4 KiB. A tool
+result whose call ran `chat-history` or `ch` (the first word of a simple
+command, so `cd ~/src/chat-history` does not count) is kept for `view` but not
+indexed: it repeats other sessions and made them match twice.
 
 Transcript passages target 1,600 Unicode characters with up to 200 characters
 of overlap, aligned to whitespace boundaries. A single longer span stays intact
@@ -160,8 +168,8 @@ Exact matches contribute their own IDF on top of the prefix contribution, so
 `WAL` outranks `wall` or `Waltham`. Single-character chunks match exactly.
 Chunks are ORed for recall.
 
-**Scoring.** Column weights are content 1, title 3, first prompt 2, project 0.5
-and branch 0.5, with BM25 length normalization over passages. FTS5 reports BM25
+**Scoring.** Column weights are content 1, title 3, first prompt 2, project 0.5,
+branch 0.5 and tool output 0.3, with BM25 length normalization over passages. FTS5 reports BM25
 as an ascending, often tiny negative number; the backend negates it so higher
 positive scores win. The score is then multiplied by
 `1 + 0.25 * complete + 0.15 * phrase`, where `complete` means every distinct
@@ -173,6 +181,18 @@ optimal. Newer timestamps break equal scores, then stable session and ordinal
 order. JSON preserves the score without rounding tiny values to zero. Scores
 are ranking signals, not probabilities, and are not comparable across engines
 or queries.
+
+**Tool-output weight.** Chosen on 185 real agent searches whose relevant
+sessions were the ones the agent opened next. At weight 1 indexing Codex tool
+output lowered MRR (0.267 to 0.250); from 0.5 down to 0.15 MRR was flat at
+0.285 to 0.289, and 0.3 sits in the middle. Labels come from what agents were
+shown, so they favour the old ranking.
+
+**The calling session.** Search drops the session named by
+`CLAUDE_CODE_SESSION_ID`, `CODEX_THREAD_ID` or `CURSOR_CONVERSATION_ID` (Cursor
+covers `cursor` and `cursor-ide` rows) before ranking, unless the query is a
+UUID. It contains the question being asked and ranked first in 21 of 31 Claude
+and 81 of 129 Cursor cases; excluding it raised MRR from 0.287 to 0.398.
 
 **Selection and grouping.** Source, timestamp and scope predicates are applied
 before the ranked stream is consumed. Within a conversation, duplicate passage

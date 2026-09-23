@@ -75,6 +75,38 @@ fn truncate_for_search(s: &str, max: usize) -> String {
     format!("{} {}", &s[..head_end], &s[tail_start..])
 }
 
+/// Words that run the word after them as the command.
+const COMMAND_WRAPPERS: &[&str] = &["time", "command", "exec", "env", "nohup", "sudo"];
+
+/// Whether a shell command, or a script that builds one, runs chat-history.
+/// Only the first word of each simple command counts, so a path or an
+/// argument that mentions chat-history (`cd ~/src/chat-history`) does not.
+pub fn is_history_command(command: &str) -> bool {
+    command
+        .split(['\n', ';', '&', '|', '(', ')', '{', '}', '`', '"', '\''])
+        .any(|segment| {
+            segment
+                .split_whitespace()
+                .find(|w| !w.contains('=') && !COMMAND_WRAPPERS.contains(w))
+                .is_some_and(|w| matches!(w.rsplit('/').next(), Some("chat-history" | "ch")))
+        })
+}
+
+/// Text of a tool's output: a string, or text blocks (images are skipped).
+/// Long output keeps its start and end, like a tool result in `extract_text`.
+pub fn tool_output_text(output: &Value) -> String {
+    let text = match output {
+        Value::String(s) => s.clone(),
+        Value::Array(items) => items
+            .iter()
+            .filter_map(|item| item.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    };
+    truncate_for_search(&text, 16 * 1024)
+}
+
 pub fn extract_text(content: &Value) -> String {
     match content {
         Value::String(s) => s.clone(),
@@ -175,22 +207,26 @@ pub fn extract_context(content: &Value) -> MessageContext {
                     _ => Vec::new(),
                 };
                 for inner in &texts {
-                    for line in inner.lines() {
-                        let ll = line.to_lowercase();
-                        if ["error", "exception", "traceback", "failed"]
-                            .iter()
-                            .any(|w| ll.contains(w))
-                        {
-                            let truncated: String = line.trim().chars().take(200).collect();
-                            ctx.errors.push(truncated);
-                        }
-                    }
+                    ctx.errors.extend(error_lines(inner));
                 }
             }
             _ => {}
         }
     }
     ctx
+}
+
+/// Lines of tool output that report an error, each cut to 200 characters.
+pub fn error_lines(text: &str) -> Vec<String> {
+    text.lines()
+        .filter(|line| {
+            let ll = line.to_lowercase();
+            ["error", "exception", "traceback", "failed"]
+                .iter()
+                .any(|w| ll.contains(w))
+        })
+        .map(|line| line.trim().chars().take(200).collect())
+        .collect()
 }
 
 pub fn clean_prompt(text: &str) -> String {
@@ -516,6 +552,51 @@ pub fn snippet_around_match(text: &str, query: &str, context_chars: usize) -> St
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn history_commands_are_recognised_in_command_position() {
+        for cmd in [
+            "chat-history search \"auth\" --json",
+            "ch view abc123 --plain | grep -n foo",
+            "~/.cargo/bin/chat-history inspect abc",
+            "./target/release/chat-history search q",
+            "FOO=1 NO_COLOR=1 chat-history search q",
+            "cd /tmp && chat-history --from yesterday",
+            "(cd x; ch search q)",
+            "time chat-history search q",
+            "tools.exec_command({cmd:`chat-history search '${q}' --json`})",
+            "{\"cmd\":\"chat-history view abc --plain\"}",
+            "echo start\nchat-history search q",
+        ] {
+            assert!(is_history_command(cmd), "{cmd}");
+        }
+        for cmd in [
+            "cd ~/GitHub/chat-history && cargo test",
+            "git log | grep chat-history",
+            "rg ch src",
+            "cat chat-history.md",
+            "./target/release/chat-history-bounded search q",
+            "python3 compare.py",
+            "echo ch",
+        ] {
+            assert!(!is_history_command(cmd), "{cmd}");
+        }
+    }
+
+    #[test]
+    fn tool_output_text_reads_strings_and_text_blocks() {
+        assert_eq!(tool_output_text(&json!("plain out")), "plain out");
+        assert_eq!(
+            tool_output_text(&json!([
+                {"type": "text", "text": "one"},
+                {"type": "image", "source": {}},
+                {"type": "input_text", "text": "two"}
+            ])),
+            "one\ntwo"
+        );
+        let long = "x".repeat(40 * 1024);
+        assert!(tool_output_text(&json!(long)).len() <= 16 * 1024 + 1);
+    }
 
     #[test]
     fn extract_text_from_string() {

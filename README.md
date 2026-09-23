@@ -87,6 +87,7 @@ chat-history view <id> --tools
 chat-history view <id> --plain --around 42        # a search hit's ordinal ± 2 messages
 chat-history view <id> --plain --grep "cloudflare|dns" --max-chars 600 --head 12
 chat-history view <id> --plain --tail 6
+chat-history view <id> --plain --role user        # only the person's messages (user | assistant | tool)
 chat-history export <id> -o session.md
 chat-history resume <id>                  # Claude / Codex / Cursor chats with a CLI store; others print a hint
 chat-history find <id>                    # absolute path for further tooling
@@ -132,7 +133,7 @@ Date formats: `YYYY-MM-DD`, `today`, `yesterday`, `"3 days ago"`, `"last week"`,
 | `--rebuild-index` | Reparse all sessions into the BM25 index. |
 | `--cache-dir PATH` / `--no-cache` | Store the BM25 index elsewhere, or build it in memory for this search. |
 
-All JSON output uses a `{ "query", "count", "results" }` envelope. BM25 and legacy deep-search result items include `session_id`, `source`, `also_ide`, `date`, `summary`, `project`, `score`, `role`, `ordinal`, `timestamp`, `snippet`, `tools`, and `files` (`additional_matches` items carry `ordinal` and `timestamp` too). `ordinal` is the message's position in the transcript — pass it to `view <id> --around <ordinal>` — and is `null` for title and first-prompt matches. Legacy metadata-index result items include `matched_field` instead of `role`, `tools`, and `files`, and the envelope includes `"search_type": "index"`. Items also carry `metadata_only`, true for Cursor CLI sessions without a readable transcript.
+All JSON output uses a `{ "query", "count", "results" }` envelope. BM25 and legacy deep-search result items include `session_id`, `source`, `also_ide`, `date`, `summary`, `project`, `score`, `role`, `ordinal`, `timestamp`, `snippet`, `tools`, and `files` (`additional_matches` items carry `ordinal` and `timestamp` too). `role` is `user` (the person), `assistant`, or `tool` (command output, file contents and other tool results, which Claude Code stores as user records). `ordinal` is the message's position in the transcript — pass it to `view <id> --around <ordinal>` — and is `null` for title and first-prompt matches. Legacy metadata-index result items include `matched_field` instead of `role`, `tools`, and `files`, and the envelope includes `"search_type": "index"`. Items also carry `metadata_only`, true for Cursor CLI sessions without a readable transcript.
 
 Scopes: `all` (default), `errors`, `similar`, `tools`, `files`. Use `--timeframe today|week|month|Nd` and `--limit N` (default 15) to constrain results.
 
@@ -180,7 +181,7 @@ Cursor Agent chats found in both transcript and IDE data are shown once as `curs
 
 ### Metadata cache
 
-Session discovery caches titles, first-prompt previews, and other extracted metadata from unchanged sources in `~/.chat-history/cache/catalog-v1.db`. This metadata cache does not store transcripts. BM25 uses a separate, disposable `search-v2.db` containing message text and full-text postings; it refreshes only changed sessions. Search results themselves are not cached. Discovery and workspace/store checks remain live, so added or deleted transcripts still appear immediately. On one local profile, a warm Claude extraction fell from about 300ms to 10ms.
+Session discovery caches titles, first-prompt previews, and other extracted metadata from unchanged sources in `~/.chat-history/cache/catalog-v1.db`. This metadata cache does not store transcripts. BM25 uses a separate, disposable `search-v3.db` containing message text and full-text postings; it refreshes only changed sessions. Search results themselves are not cached. Discovery and workspace/store checks remain live, so added or deleted transcripts still appear immediately. On one local profile, a warm Claude extraction fell from about 300ms to 10ms.
 
 The cache tracks file metadata and SQLite WAL/journal changes. Unavailable, corrupt, or locked caches fall back to reading the sources. If the default directory is not writable, for example inside an agent sandbox, both caches move to a user-private copy under the temp directory (see [Running inside agent sandboxes](#running-inside-agent-sandboxes)). Set `CHAT_HISTORY_NO_CACHE=1` to bypass it or `CHAT_HISTORY_CACHE_DIR` to move it; deleting the cache rebuilds it on the next command. New cache directories and databases are user-private on Unix.
 
@@ -202,6 +203,8 @@ The hook is opt-in and does not backfill old or cloud history. It records transc
 ## Search scoring
 
 **BM25 (default):** Unicode token and prefix matching over overlapping transcript passages, titles, first prompts, project paths, and branches. Rare terms contribute more; repeated mentions saturate, and exact terms receive additional weight over prefix-only matches. Matching all query chunks and matching their ordered phrase add small ranking bonuses while partial matches remain eligible. Recency breaks score ties. JSON retains small positive scores at full precision; scores are not confidence values and cannot be compared across engines or queries.
+
+Tool output is indexed in its own field at 0.3× the weight of conversation text, so a log that repeats a term does not outrank the message where it was discussed; it still matches when nothing else does. Output of chat-history itself (a tool call that ran `chat-history` or `ch`) is shown by `view` but never indexed, since it repeats other sessions. Search leaves out the conversation it runs inside, identified by `CLAUDE_CODE_SESSION_ID` (Claude Code), `CODEX_THREAD_ID` (Codex) or `CURSOR_CONVERSATION_ID` (Cursor's agent); a full-UUID lookup still finds it, and clearing the variable (`CLAUDE_CODE_SESSION_ID= chat-history search …`) includes it.
 
 BM25 returns one row per conversation, with a match-aware excerpt from its strongest passage and up to two additional matching messages. `--limit` counts conversations. JSON preserves the primary result fields and adds `additional_matches` with each extra match's score, role, snippet, tools and files. Use `--group-by message` for individual message rows (at most three per conversation). `CHAT_HISTORY_SEARCH_GROUP_BY=session|message` sets this preference; explicit flags override it. Legacy and `--scope similar` keep their previous message-row default.
 

@@ -320,11 +320,7 @@ pub fn print_search_results(results: &[SearchResult], query: &str) {
             },
             c!("reset")
         );
-        let role_str = if r.message.role == "user" {
-            format!("{}You{}", c!("green"), c!("reset"))
-        } else {
-            format!("{}Assistant{}", c!("blue"), c!("reset"))
-        };
+        let role_str = role_chip(&r.message.role);
         let title = title_of(&r.session.summary, &r.session.first_prompt, 100);
         println!(
             "  {}{:3}.{} {} {}{}{} {} {}{}",
@@ -349,11 +345,7 @@ pub fn print_search_results(results: &[SearchResult], query: &str) {
         );
         print_hit_details(&r.message, "       ");
         for other in &r.additional_matches {
-            let role = if other.message.role == "user" {
-                format!("{}You{}", c!("green"), c!("reset"))
-            } else {
-                format!("{}Assistant{}", c!("blue"), c!("reset"))
-            };
+            let role = role_chip(&other.message.role);
             let snippet =
                 usable_search_snippet(other.snippet.as_deref(), &other.message.content, query, 200);
             println!(
@@ -365,6 +357,20 @@ pub fn print_search_results(results: &[SearchResult], query: &str) {
         }
         println!();
     }
+}
+
+/// Colour and display name of a message role.
+fn role_style(role: &str) -> (&'static str, &'static str) {
+    match role {
+        "user" => ("green", "You"),
+        "tool" => ("yellow", "Tool"),
+        _ => ("blue", "Assistant"),
+    }
+}
+
+fn role_chip(role: &str) -> String {
+    let (color, name) = role_style(role);
+    format!("{}{name}{}", c!(color), c!("reset"))
 }
 
 /// `  #12` after a hit's excerpt: the message position `view --around` takes.
@@ -562,8 +568,13 @@ pub fn print_inspect(info: &InspectInfo) {
     } else {
         format!("  tokens: {}", info.total_tokens)
     };
+    let tool_str = if info.tool_results == 0 {
+        String::new()
+    } else {
+        format!(", {} tool results", info.tool_results)
+    };
     println!(
-        "  {}duration: {}min  messages: {} ({} user, {} assistant){}{}{}",
+        "  {}duration: {}min  messages: {} ({} user, {} assistant{tool_str}){}{}{}",
         c!("dim"),
         info.duration_minutes,
         info.message_count,
@@ -686,16 +697,8 @@ pub fn print_transcript(
         } else {
             String::new()
         };
-        if msg.role == "user" {
-            println!("{}{}▌ You{}{number}", c!("green"), c!("bold"), c!("reset"));
-        } else {
-            println!(
-                "{}{}▌ Assistant{}{number}",
-                c!("blue"),
-                c!("bold"),
-                c!("reset")
-            );
-        }
+        let (color, name) = role_style(&msg.role);
+        println!("{}{}▌ {name}{}{number}", c!(color), c!("bold"), c!("reset"));
         if show_tools && !msg.tool_uses.is_empty() {
             println!(
                 "  {}tools: {}{}",
@@ -719,7 +722,11 @@ pub fn print_plain(messages: &[Message], opts: &ViewOptions) {
             continue;
         };
         let msg = &messages[ordinal];
-        let role = if msg.role == "user" { "You" } else { "Claude" };
+        let role = match msg.role.as_str() {
+            "user" => "You",
+            "tool" => "Tool",
+            _ => "Claude",
+        };
         let text = tty(&opts.clip(&view_text(msg)));
         if opts.numbered() {
             // A numbered view accounts for every ordinal: `…` alone marks
@@ -767,6 +774,9 @@ pub struct ViewOptions {
     pub tail: Option<usize>,
     pub number: bool,
     pub max_chars: Option<usize>,
+    /// Only messages with these roles (`user`, `assistant`, `tool`); empty
+    /// means all. Context and --head/--tail count the selected messages.
+    pub roles: Vec<String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -778,7 +788,11 @@ pub enum Slot {
 
 impl ViewOptions {
     fn bounded(&self) -> bool {
-        self.around.is_some() || self.grep.is_some() || self.head.is_some() || self.tail.is_some()
+        self.around.is_some()
+            || self.grep.is_some()
+            || self.head.is_some()
+            || self.tail.is_some()
+            || !self.roles.is_empty()
     }
 
     /// Numbering is opt-in for a full view (scripts parse today's format)
@@ -802,11 +816,14 @@ impl ViewOptions {
     }
 
     pub fn slots(&self, messages: &[Message]) -> Vec<Slot> {
-        let len = messages.len();
         let context = self
             .context
             .unwrap_or(if self.around.is_some() { 2 } else { 0 });
-        let window = |n: usize| n.saturating_sub(context)..=n.saturating_add(context).min(len - 1);
+        // Ordinals of the messages --role selects. Windows are ranges of this
+        // list, so context counts selected messages, not skipped ones.
+        let pool = self.selected(messages);
+        let window =
+            |k: usize| k.saturating_sub(context)..k.saturating_add(context + 1).min(pool.len());
         // --head/--tail keep the first/last N items: matches (each with its
         // context) under --grep, so a match is never cut off; else messages.
         let limit = |items: &mut Vec<usize>| {
@@ -817,24 +834,37 @@ impl ViewOptions {
                 items.drain(..items.len().saturating_sub(n));
             }
         };
-        let picked: Vec<usize> = if let Some(n) = self.around.filter(|&n| n < len) {
-            let mut picked: Vec<usize> = window(n).collect();
+        let picked: Vec<usize> = if let Some(n) = self.around.filter(|&n| n < messages.len()) {
+            // Message n itself is shown only when selected; either way the
+            // window reaches `context` selected messages on each side.
+            let at = pool.partition_point(|&i| i < n);
+            let after = if pool.get(at) == Some(&n) { at + 1 } else { at };
+            let mut picked = pool
+                [at.saturating_sub(context)..after.saturating_add(context).min(pool.len())]
+                .to_vec();
             limit(&mut picked);
             picked
         } else if self.grep.is_some() {
-            let mut matches = self.matches(messages);
+            let mut matches: Vec<usize> = self
+                .matches(messages)
+                .into_iter()
+                .filter_map(|i| pool.binary_search(&i).ok())
+                .collect();
             limit(&mut matches);
-            let mut keep = vec![false; len];
-            for i in matches {
-                for j in window(i) {
+            let mut keep = vec![false; pool.len()];
+            for k in matches {
+                for j in window(k) {
                     keep[j] = true;
                 }
             }
-            (0..len).filter(|&i| keep[i]).collect()
+            (0..pool.len())
+                .filter(|&k| keep[k])
+                .map(|k| pool[k])
+                .collect()
         } else if self.around.is_some() {
             Vec::new()
         } else {
-            let mut picked: Vec<usize> = (0..len).collect();
+            let mut picked = pool;
             limit(&mut picked);
             picked
         };
@@ -848,12 +878,20 @@ impl ViewOptions {
         slots
     }
 
-    /// Ordinals of the messages --grep matches.
+    /// Ordinals of the messages --role selects, in order.
+    fn selected(&self, messages: &[Message]) -> Vec<usize> {
+        (0..messages.len())
+            .filter(|&i| self.roles.is_empty() || self.roles.contains(&messages[i].role))
+            .collect()
+    }
+
+    /// Ordinals of the selected messages --grep matches.
     pub fn matches(&self, messages: &[Message]) -> Vec<usize> {
         let Some(pattern) = &self.grep else {
             return Vec::new();
         };
-        (0..messages.len())
+        self.selected(messages)
+            .into_iter()
             .filter(|&i| pattern.is_match(&view_text(&messages[i])))
             .collect()
     }
@@ -946,11 +984,7 @@ pub fn export_transcript(messages: &[Message], session: &Session, out_path: Opti
     ));
     lines.push(format!("- **Session ID:** {}\n\n---\n", session.id));
     for msg in messages {
-        let role = if msg.role == "user" {
-            "You"
-        } else {
-            "Assistant"
-        };
+        let role = role_style(&msg.role).1;
         let text = if msg.role == "user" {
             clean_prompt(&msg.content)
         } else {

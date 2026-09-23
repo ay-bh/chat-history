@@ -189,6 +189,7 @@ fn message_from_bubble(session: &Session, entry: &Value) -> Option<Message> {
         error_patterns: Vec::new(),
         relevance_score: 0.0,
         final_score: 0.0,
+        history_output: false,
     })
 }
 
@@ -335,19 +336,11 @@ fn first_user_text(conn: &Connection, composer_id: &str, headers: Option<&[Value
 }
 
 fn load_bubbles_as_messages(conn: &Connection, session: &Session) -> Vec<Message> {
-    let mut messages = Vec::new();
-    let mut total_chars: usize = 0;
     let (entries, ordered) = load_bubble_entries(conn, &session.id);
-    for entry in entries {
-        if total_chars > 4 * 1024 * 1024 {
-            break;
-        }
-        let Some(msg) = message_from_bubble(session, &entry) else {
-            continue;
-        };
-        total_chars += msg.content.len();
-        messages.push(msg);
-    }
+    let mut messages: Vec<Message> = entries
+        .iter()
+        .filter_map(|entry| message_from_bubble(session, entry))
+        .collect();
     if !ordered {
         sort_messages_stable(&mut messages);
     }

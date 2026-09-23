@@ -19,11 +19,12 @@ use std::time::{Duration, Instant};
 
 pub type SearchError = Box<dyn std::error::Error + Send + Sync>;
 pub type Result<T> = std::result::Result<T, SearchError>;
-pub const INDEX_FILENAME: &str = "search-v2.db";
-/// Earlier generations wrote full-text rows through an insert trigger. An older
-/// binary sharing the directory would recreate that trigger, so they are not
-/// migrated in place: a new file is used and the old one emptied once idle.
-const PREVIOUS_INDEX_FILENAMES: [&str; 1] = ["search-v1.db"];
+pub const INDEX_FILENAME: &str = "search-v3.db";
+/// Earlier generations have another schema: v1 wrote full-text rows through
+/// an insert trigger, v2 had no tool-output column. An older binary sharing the
+/// directory would recreate its own schema, so they are not migrated in place:
+/// a new file is used and the old one emptied once idle.
+const PREVIOUS_INDEX_FILENAMES: [&str; 2] = ["search-v1.db", "search-v2.db"];
 const PREVIOUS_INDEX_GRACE: Duration = Duration::from_secs(7 * 86_400);
 /// An emptied database is a few pages; anything at or below this is done.
 const RECLAIMED_SIZE: u64 = 64 * 1024;
@@ -41,13 +42,18 @@ const PASSAGE_OVERLAP: usize = 200;
 // hold the write lock for long.
 const PARSE_BATCH_SIZE: usize = 64;
 const PARSE_BATCH_BYTES: u64 = 32 << 20;
-// Transcripts are parsed up to this size, so a larger source file weighs no
-// more than this in a batch (a shared Cursor database is much larger).
-const PARSE_SESSION_BYTES: u64 = 4 << 20;
+// A Cursor IDE conversation lives in a database shared by every chat, and a
+// CLI store is read for metadata only, so their file sizes say nothing about
+// the text parsed; they weigh at most this much in a batch.
+const SHARED_DATABASE_WEIGHT: u64 = 4 << 20;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const WRITER_STALL: Duration = Duration::from_secs(10);
 const CACHE_MISMATCH_ATTEMPTS: usize = 3;
 const SNIPPET_CHARS: usize = 400;
+/// BM25 weight of tool output (command output, file reads) relative to the
+/// conversation text at 1.0: long logs repeat a term many times and would
+/// otherwise outrank the message where it was discussed.
+const TOOL_OUTPUT_WEIGHT: f64 = 0.3;
 
 pub(crate) fn grouped_message_oversample(limit: usize) -> usize {
     limit.saturating_mul(6)
@@ -529,17 +535,17 @@ impl Bm25Backend {
                 id INTEGER PRIMARY KEY,
                 message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
                 content TEXT NOT NULL, title TEXT NOT NULL, prompt TEXT NOT NULL,
-                project TEXT NOT NULL, branch TEXT NOT NULL
+                project TEXT NOT NULL, branch TEXT NOT NULL, tool TEXT NOT NULL
              );
              CREATE INDEX IF NOT EXISTS passages_message ON passages(message_id);
              CREATE VIRTUAL TABLE IF NOT EXISTS passages_fts USING fts5(
-                content, title, prompt, project, branch,
+                content, title, prompt, project, branch, tool,
                 content='passages', content_rowid='id',
                 tokenize='unicode61 remove_diacritics 2', prefix='2 3 4'
              );
              CREATE TRIGGER IF NOT EXISTS passages_delete AFTER DELETE ON passages BEGIN
-                INSERT INTO passages_fts(passages_fts, rowid, content, title, prompt, project, branch)
-                VALUES ('delete', old.id, old.content, old.title, old.prompt, old.project, old.branch);
+                INSERT INTO passages_fts(passages_fts, rowid, content, title, prompt, project, branch, tool)
+                VALUES ('delete', old.id, old.content, old.title, old.prompt, old.project, old.branch, old.tool);
              END;",
         )?;
                 tx.execute(
@@ -645,10 +651,12 @@ impl Bm25Backend {
         todo.sort_by_cached_key(|&i| order.hash_one(&plan[i].0));
         let mut done = stats.unchanged;
         let source_bytes = |i: usize| {
-            fs::metadata(&corpus[i].file)
-                .map(|m| m.len())
-                .unwrap_or(0)
-                .min(PARSE_SESSION_BYTES)
+            let size = fs::metadata(&corpus[i].file).map(|m| m.len()).unwrap_or(0);
+            if corpus[i].source == "cursor-ide" || corpus[i].is_cursor_store_only() {
+                size.min(SHARED_DATABASE_WEIGHT)
+            } else {
+                size
+            }
         };
         for batch in batches(&todo, source_bytes, PARSE_BATCH_SIZE, PARSE_BATCH_BYTES) {
             let mut need = Vec::with_capacity(batch.len());
@@ -881,7 +889,7 @@ fn extract_session(
         extracted.push((1, prompt, true));
     }
     for (ordinal, mut message) in messages.into_iter().enumerate() {
-        if is_noise(&message.content_lower()) {
+        if message.history_output || is_noise(&message.content_lower()) {
             continue;
         }
         message.session_id = session.id.clone();
@@ -971,6 +979,7 @@ fn metadata_message(session: &Session) -> Message {
         error_patterns: Vec::new(),
         relevance_score: 0.0,
         final_score: 0.0,
+        history_output: false,
     }
 }
 
@@ -1038,29 +1047,42 @@ fn insert_message(
     // makes each passage insert a multi-write statement with its own savepoint,
     // and FTS5 flushes its pending index to disk on every savepoint.
     let mut row = conn.prepare_cached(
-        "INSERT INTO passages(message_id, content, title, prompt, project, branch)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT INTO passages(message_id, content, title, prompt, project, branch, tool)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
     )?;
     let mut fts = conn.prepare_cached(
-        "INSERT INTO passages_fts(rowid, content, title, prompt, project, branch)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT INTO passages_fts(rowid, content, title, prompt, project, branch, tool)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
     )?;
-    let mut insert = |content: &str, title: &str, prompt: &str, project: &str, branch: &str| {
-        row.execute(params![id, content, title, prompt, project, branch])?;
+    let mut insert = |[content, title, prompt, project, branch, tool]: [&str; 6]| {
+        row.execute(params![id, content, title, prompt, project, branch, tool])?;
         let passage = conn.last_insert_rowid();
-        fts.execute(params![passage, content, title, prompt, project, branch])?;
+        fts.execute(params![
+            passage, content, title, prompt, project, branch, tool
+        ])?;
         Ok::<(), rusqlite::Error>(())
     };
     if metadata {
         let prompt = message.uuid == "index-prompt";
         if prompt {
-            insert("", "", &session.first_prompt, "", "")?;
+            insert(["", "", &session.first_prompt, "", "", ""])?;
         } else {
-            insert("", &session.summary, "", &session.project, &session.branch)?;
+            insert([
+                "",
+                &session.summary,
+                "",
+                &session.project,
+                &session.branch,
+                "",
+            ])?;
+        }
+    } else if message.role == "tool" {
+        for passage in passages(&message.content) {
+            insert(["", "", "", "", "", passage])?;
         }
     } else {
-        for content in passages(&message.content) {
-            insert(content, "", "", "", "")?;
+        for passage in passages(&message.content) {
+            insert([passage, "", "", "", "", ""])?;
         }
     }
     Ok(())
@@ -1232,7 +1254,7 @@ impl SearchBackend for Bm25Backend {
                 SELECT rowid FROM passages_fts WHERE ?5 IS NOT NULL AND passages_fts MATCH ?5
              )
              SELECT m.id, m.session_key,
-                    -bm25(passages_fts, 1.0, 3.0, 2.0, 0.5, 0.5)
+                    -bm25(passages_fts, 1.0, 3.0, 2.0, 0.5, 0.5, ?6)
                     * (1.0 + 0.25 * (complete.rowid IS NOT NULL)
                            + 0.15 * (phrase.rowid IS NOT NULL)) AS score, p.id,
                     m.ordinal
@@ -1255,7 +1277,8 @@ impl SearchBackend for Bm25Backend {
             cutoff,
             request.scope,
             query.complete,
-            query.phrase
+            query.phrase,
+            TOOL_OUTPUT_WEIGHT
         ])?;
         // Keep full message JSON out of SQLite's candidate sorter. A long
         // message can have thousands of matching passages but is hydrated once.

@@ -1668,7 +1668,11 @@ fn age(path: &std::path::Path, days: u64) {
 
 /// A previous-generation database with enough content to be worth reclaiming.
 fn previous_generation(dir: &std::path::Path) -> std::path::PathBuf {
-    let path = dir.join("search-v1.db");
+    previous_generation_named(dir, "search-v1.db")
+}
+
+fn previous_generation_named(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+    let path = dir.join(name);
     let conn = rusqlite::Connection::open(&path).unwrap();
     conn.execute_batch("CREATE TABLE sessions (key TEXT PRIMARY KEY, fingerprint TEXT NOT NULL)")
         .unwrap();
@@ -1690,16 +1694,23 @@ fn opening_the_index_empties_a_previous_generation_unused_for_a_week_in_place() 
     let tmp = TempDir::new().unwrap();
     let dir = tmp.path().join("index");
     fs::create_dir(&dir).unwrap();
-    let v1 = previous_generation(&dir);
-    age(&v1, 8);
-    assert_eq!(INDEX_FILENAME, "search-v2.db");
+    let old: Vec<_> = ["search-v1.db", "search-v2.db"]
+        .into_iter()
+        .map(|name| previous_generation_named(&dir, name))
+        .collect();
+    for path in &old {
+        age(path, 8);
+    }
+    assert_eq!(INDEX_FILENAME, "search-v3.db");
     drop(Bm25Backend::open(Some(&dir)).unwrap());
     assert!(dir.join(INDEX_FILENAME).exists());
-    // Never unlinked: another binary may hold it open. Reset through SQLite instead.
-    assert!(v1.exists());
-    assert!(fs::metadata(&v1).unwrap().len() < 64 * 1024);
-    let conn = rusqlite::Connection::open(&v1).unwrap();
-    assert_eq!(count(&conn, "SELECT count(*) FROM sqlite_schema"), 0);
+    for path in &old {
+        // Never unlinked: another binary may hold it open. Reset through SQLite instead.
+        assert!(path.exists());
+        assert!(fs::metadata(path).unwrap().len() < 64 * 1024);
+        let conn = rusqlite::Connection::open(path).unwrap();
+        assert_eq!(count(&conn, "SELECT count(*) FROM sqlite_schema"), 0);
+    }
 }
 
 #[test]
