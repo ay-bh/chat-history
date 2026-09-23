@@ -77,6 +77,8 @@ fn truncate_for_search(s: &str, max: usize) -> String {
 
 /// Words that run the word after them as the command.
 const COMMAND_WRAPPERS: &[&str] = &["time", "command", "exec", "env", "nohup", "sudo"];
+/// Shell keywords that a command follows (`for …; do chat-history …`).
+const SHELL_KEYWORDS: &[&str] = &["do", "then", "else", "elif", "if", "while", "until", "!"];
 static EMBEDDED_COMMAND_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"\b(?:cmd|command)["']?\s*:\s*([`"'])"#).unwrap());
 
@@ -146,7 +148,10 @@ fn shell_runs_history(command: &str) -> bool {
         if !*command_position {
             return false;
         }
-        if token.contains('=') || COMMAND_WRAPPERS.contains(&token.as_str()) {
+        if token.contains('=')
+            || COMMAND_WRAPPERS.contains(&token.as_str())
+            || SHELL_KEYWORDS.contains(&token.as_str())
+        {
             return false;
         }
         *command_position = false;
@@ -161,7 +166,8 @@ fn shell_runs_history(command: &str) -> bool {
     let mut script_next = false;
     let mut quote = None;
     let mut escaped = false;
-    for ch in command.chars() {
+    let mut chars = command.chars();
+    while let Some(ch) = chars.next() {
         if escaped {
             word.push(ch);
             escaped = false;
@@ -171,6 +177,12 @@ fn shell_runs_history(command: &str) -> bool {
             Some('\'') if ch == '\'' => quote = None,
             Some('"') if ch == '"' => quote = None,
             Some('"') if ch == '\\' => escaped = true,
+            // "$(…)" and "`…`" still run their contents.
+            Some('"') if ch == '`' || (ch == '$' && chars.clone().next() == Some('(')) => {
+                if shell_runs_history(&substitution(&mut chars, ch)) {
+                    return true;
+                }
+            }
             Some(_) => word.push(ch),
             None => match ch {
                 '\\' => escaped = true,
@@ -208,6 +220,32 @@ fn shell_runs_history(command: &str) -> bool {
         &mut shell_launcher,
         &mut script_next,
     )
+}
+
+/// The body of a command substitution whose opener (`` ` `` or `$`) was just
+/// read, consuming it through the closing `` ` `` or matching `)`.
+fn substitution(chars: &mut std::str::Chars, opener: char) -> String {
+    let mut body = String::new();
+    if opener == '`' {
+        body.extend(chars.take_while(|&c| c != '`'));
+        return body;
+    }
+    chars.next();
+    let mut depth = 1;
+    for c in chars.by_ref() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+            _ => {}
+        }
+        body.push(c);
+    }
+    body
 }
 
 /// Text of a tool's output: a string, or text blocks (images are skipped).
@@ -682,6 +720,12 @@ mod tests {
             "cd /tmp && chat-history --from yesterday",
             "(cd x; ch search q)",
             "time chat-history search q",
+            "for id in a b; do chat-history inspect $id; done",
+            "if true; then ch search q; fi",
+            "while read id; do ch view $id --plain; done < ids",
+            "echo \"$(chat-history search q)\"",
+            "out=\"$(ch search q --json)\"",
+            "echo \"`chat-history search q`\"",
             "bash -lc 'chat-history search q'",
             "sh -c \"ch view abc --plain\"",
             "tools.exec_command({cmd:`chat-history search '${q}' --json`})",
@@ -699,6 +743,9 @@ mod tests {
             "bash -lc 'rg \"chat-history\" README.md'",
             "tools.exec_command({cmd:`rg 'chat-history' README.md`})",
             "rg ch src",
+            "for f in chat-history ch; do echo $f; done",
+            "echo \"$(rg chat-history README.md)\"",
+            "echo \"cost: $5 (chat-history)\"",
             "cat chat-history.md",
             "./target/release/chat-history-bounded search q",
             "python3 compare.py",
