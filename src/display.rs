@@ -721,13 +721,27 @@ pub fn print_plain(messages: &[Message], opts: &ViewOptions) {
         let msg = &messages[ordinal];
         let role = if msg.role == "user" { "You" } else { "Claude" };
         let text = tty(&opts.clip(&view_text(msg)));
-        if !text.trim().is_empty() {
-            if opts.numbered() {
-                println!("[#{ordinal}] {role}: {text}\n");
+        if opts.numbered() {
+            // A numbered view accounts for every ordinal: `…` alone marks
+            // skipped messages, so an empty one is shown, not dropped.
+            let text = if text.trim().is_empty() {
+                empty_stub(msg)
             } else {
-                println!("{role}: {text}\n");
-            }
+                text
+            };
+            println!("[#{ordinal}] {role}: {text}\n");
+        } else if !text.trim().is_empty() {
+            println!("{role}: {text}\n");
         }
+    }
+}
+
+/// Stands in for a message with no text (e.g. only a thinking block).
+fn empty_stub(msg: &Message) -> String {
+    if msg.tool_uses.is_empty() {
+        "(no text)".to_owned()
+    } else {
+        format!("(no text; tools: {})", msg.tool_uses.join(", "))
     }
 }
 
@@ -792,30 +806,38 @@ impl ViewOptions {
         let context = self
             .context
             .unwrap_or(if self.around.is_some() { 2 } else { 0 });
-        let window = |n: usize| n.saturating_sub(context)..=(n + context).min(len - 1);
-        let mut picked: Vec<usize> = if let Some(n) = self.around.filter(|&n| n < len) {
-            window(n).collect()
-        } else if let Some(pattern) = &self.grep {
+        let window = |n: usize| n.saturating_sub(context)..=n.saturating_add(context).min(len - 1);
+        // --head/--tail keep the first/last N items: matches (each with its
+        // context) under --grep, so a match is never cut off; else messages.
+        let limit = |items: &mut Vec<usize>| {
+            if let Some(n) = self.head {
+                items.truncate(n);
+            }
+            if let Some(n) = self.tail {
+                items.drain(..items.len().saturating_sub(n));
+            }
+        };
+        let picked: Vec<usize> = if let Some(n) = self.around.filter(|&n| n < len) {
+            let mut picked: Vec<usize> = window(n).collect();
+            limit(&mut picked);
+            picked
+        } else if self.grep.is_some() {
+            let mut matches = self.matches(messages);
+            limit(&mut matches);
             let mut keep = vec![false; len];
-            for (i, msg) in messages.iter().enumerate() {
-                if pattern.is_match(&view_text(msg)) {
-                    for j in window(i) {
-                        keep[j] = true;
-                    }
+            for i in matches {
+                for j in window(i) {
+                    keep[j] = true;
                 }
             }
             (0..len).filter(|&i| keep[i]).collect()
         } else if self.around.is_some() {
             Vec::new()
         } else {
-            (0..len).collect()
+            let mut picked: Vec<usize> = (0..len).collect();
+            limit(&mut picked);
+            picked
         };
-        if let Some(n) = self.head {
-            picked.truncate(n);
-        }
-        if let Some(n) = self.tail {
-            picked.drain(..picked.len().saturating_sub(n));
-        }
         let mut slots = Vec::with_capacity(picked.len());
         for (k, &i) in picked.iter().enumerate() {
             if k > 0 && picked[k - 1] + 1 != i {
@@ -824,6 +846,16 @@ impl ViewOptions {
             slots.push(Slot::Message(i));
         }
         slots
+    }
+
+    /// Ordinals of the messages --grep matches.
+    pub fn matches(&self, messages: &[Message]) -> Vec<usize> {
+        let Some(pattern) = &self.grep else {
+            return Vec::new();
+        };
+        (0..messages.len())
+            .filter(|&i| pattern.is_match(&view_text(&messages[i])))
+            .collect()
     }
 
     /// Cuts a message to `max_chars` characters and says how much was left

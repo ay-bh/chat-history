@@ -8,6 +8,14 @@ use chat_history::skill_install::{ensure_skills, install_skill};
 use chat_history::{display, inspect, scoring, search};
 use clap::{Parser, Subcommand};
 
+fn at_least_one(value: &str) -> Result<usize, String> {
+    match value.parse::<usize>() {
+        Ok(0) => Err("must be at least 1".to_owned()),
+        Ok(n) => Ok(n),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 fn view_pattern(value: &str) -> Result<regex::Regex, String> {
     // Line-oriented like grep: `^`/`$` match at every line of a message.
     regex::RegexBuilder::new(value)
@@ -166,11 +174,11 @@ enum Commands {
         /// Messages to show on each side (default: 2 with --around, 0 with --grep)
         #[arg(short = 'C', long, value_name = "N")]
         context: Option<usize>,
-        /// Only the first N selected messages
-        #[arg(long, value_name = "N", conflicts_with = "tail")]
+        /// Only the first N messages (with --grep: the first N matches and their context)
+        #[arg(long, value_name = "N", conflicts_with = "tail", value_parser = at_least_one)]
         head: Option<usize>,
-        /// Only the last N selected messages
-        #[arg(long, value_name = "N")]
+        /// Only the last N messages (with --grep: the last N matches and their context)
+        #[arg(long, value_name = "N", value_parser = at_least_one)]
         tail: Option<usize>,
         /// Cut each message to N characters and note how many were left out
         #[arg(long, value_name = "N")]
@@ -579,7 +587,7 @@ fn main() {
                 std::process::exit(1);
             }
             if let Some(pattern) = &opts.grep
-                && opts.slots(&messages).is_empty()
+                && opts.matches(&messages).is_empty()
             {
                 eprintln!(
                     "No messages match {} in this transcript ({} messages).",

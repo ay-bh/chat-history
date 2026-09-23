@@ -18,7 +18,7 @@ Search, inspect, and export Claude Code, Cursor, and Codex conversation history.
 
 **Keyword question** ("find that conversation where I..."):
 
-1. `chat-history search "<query>" --json` — always `--json` from agents. BM25 searches metadata and transcripts together (`--deep` is not needed). Each hit and each `additional_matches` entry carries `session_id`, `score`, `snippet`, `ordinal` (the message's position in the transcript), `timestamp`, `tools`, `files`. Note `--json` exists only on `search`.
+1. `chat-history search "<query>" --json` — always `--json` from agents. BM25 searches metadata and transcripts together (`--deep` is not needed). Each hit carries `session_id`, `score`, `snippet`, `ordinal` (the message's position in the transcript), `timestamp`, `tools`, `files`; its `additional_matches` entries carry the same message fields and belong to the parent hit's `session_id`. Note `--json` exists only on `search`.
 2. Shortlist by snippet, not by raw score (see "Choosing the best hit").
 3. Read the hit in context, not the whole transcript: `chat-history view <id> --plain --around <ordinal>` (2 messages each side; `-C N` to widen, `--max-chars 1500` to cap long messages). `ordinal` is `null` for title/prompt matches — use `inspect` for those.
 4. To find something inside one session, use `chat-history view <id> --plain --grep "<regex>" --max-chars 600 --head 12` instead of piping `view` through `grep`/`sed`/`head`.
@@ -48,7 +48,7 @@ Search, inspect, and export Claude Code, Cursor, and Codex conversation history.
 - Don't dump raw JSON or full transcripts at the user — summarize, cite the session ID and date (or title + directory for `cursor-ide`).
 - `cursor-ide` rows (and `--json` items with `"also_ide": true`) resume only when the Agent CLI has a `~/.cursor/chats` store for the id; otherwise `resume` prints a sidebar hint instead of launching the Agent CLI. Run `resume` and follow its output rather than assuming.
 - Some Cursor sessions have thin metadata (`(no summary)`, `duration: 0min`, raw first-message titles). If `inspect` is thin, fall back to `chat-history view <id> --plain --tail 6` (or `--grep`) rather than the whole transcript.
-- Don't pipe `view` through `grep -A40 | head` or `sed -n 'A,Bp'`: use `--around`, `--grep`, `--head`/`--tail` and `--max-chars`. Messages are numbered `[#N]` in those modes (`-n` numbers a full view); `[-K chars] …` / `… [+K chars]` mark cut text, `…` on its own line marks skipped messages.
+- Don't pipe `view` through `grep -A40 | head` or `sed -n 'A,Bp'`: use `--around`, `--grep`, `--head`/`--tail` (with `--grep` these count matches, each kept whole with its context) and `--max-chars`. Messages are numbered `[#N]` in those modes (`-n` numbers a full view); `[-K chars] …` / `… [+K chars]` mark cut text, `…` on its own line marks skipped messages.
 
 ## Commands
 

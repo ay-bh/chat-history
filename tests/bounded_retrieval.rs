@@ -400,3 +400,109 @@ fn view_grep_anchors_match_at_any_line_start_like_grep() {
     let out = stdout(&tmp, &["view", id, "--plain", "--grep", "^## option"]);
     assert!(out.contains("[#1]") && out.contains("## Option B"), "{out}");
 }
+
+#[test]
+fn a_huge_context_is_clamped_instead_of_overflowing() {
+    let tmp = fixture();
+    let out = stdout(
+        &tmp,
+        &[
+            "view",
+            ID,
+            "--plain",
+            "--around",
+            "1",
+            "-C",
+            &usize::MAX.to_string(),
+        ],
+    );
+    for n in 0..8 {
+        assert!(out.contains(&format!("[#{n}]")), "{out}");
+    }
+}
+
+#[test]
+fn grep_head_counts_matches_so_a_match_is_never_cut_off() {
+    let tmp = fixture();
+    // zebracorn matches #0 and #7; with context 2 the first window is 0..=2.
+    let out = stdout(
+        &tmp,
+        &[
+            "view",
+            ID,
+            "--plain",
+            "--grep",
+            "zebracorn",
+            "-C",
+            "2",
+            "--head",
+            "1",
+        ],
+    );
+    assert!(out.contains("[#0]"), "{out}");
+    assert!(!out.contains("[#7]"), "only the first match: {out}");
+    // quokkafield matches #4 and #5; the last match keeps its leading context.
+    let out = stdout(
+        &tmp,
+        &[
+            "view",
+            ID,
+            "--plain",
+            "--grep",
+            "quokkafield",
+            "-C",
+            "1",
+            "--tail",
+            "1",
+        ],
+    );
+    assert!(
+        out.contains("[#5]") && out.contains("[#4]") && out.contains("[#6]"),
+        "{out}"
+    );
+    assert!(!out.contains("[#3]"), "{out}");
+}
+
+#[test]
+fn head_or_tail_of_zero_is_a_usage_error_not_a_false_no_match() {
+    let tmp = fixture();
+    for flag in ["--head", "--tail"] {
+        cmd(&tmp)
+            .args(["view", ID, "--plain", "--grep", "zebracorn", flag, "0"])
+            .assert()
+            .code(2);
+    }
+}
+
+#[test]
+fn a_message_without_text_is_shown_as_a_stub_in_bounded_views() {
+    let tmp = fixture();
+    let dir = tmp.path().join(".claude/projects/-Users-test-proj");
+    let id = "eeeeeeee-1111-2222-3333-ffffffffffff";
+    let lines = [
+        json!({"type": "user", "cwd": "/Users/test/proj", "message": {"role": "user", "content": "think about it"},
+               "timestamp": "2026-09-03T10:00:00Z", "uuid": "e0", "sessionId": id}),
+        json!({"type": "assistant", "message": {"role": "assistant", "content": [{"type": "thinking", "thinking": "hmm"}]},
+               "timestamp": "2026-09-03T10:01:00Z", "uuid": "e1", "sessionId": id}),
+        json!({"type": "assistant", "message": {"role": "assistant", "content": "Here is the answer."},
+               "timestamp": "2026-09-03T10:02:00Z", "uuid": "e2", "sessionId": id}),
+    ];
+    fs::write(
+        dir.join(format!("{id}.jsonl")),
+        lines
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+    .unwrap();
+    let out = stdout(&tmp, &["view", id, "--plain", "--around", "1", "-C", "0"]);
+    assert!(out.contains("[#1] Claude: (no text)"), "{out}");
+    let out = stdout(&tmp, &["view", id, "--plain", "--around", "1"]);
+    for n in 0..3 {
+        assert!(out.contains(&format!("[#{n}]")), "no silent gap: {out}");
+    }
+    // A plain full view is unchanged: empty messages stay skipped.
+    let out = stdout(&tmp, &["view", id, "--plain"]);
+    assert!(!out.contains("(no text)"), "{out}");
+}
