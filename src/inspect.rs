@@ -11,6 +11,7 @@ pub struct InspectInfo {
     pub message_count: usize,
     pub user_messages: usize,
     pub assistant_messages: usize,
+    pub tool_results: usize,
     pub tools_used: Vec<String>,
     pub files_modified: Vec<String>,
     pub accomplishments: Vec<String>,
@@ -91,6 +92,7 @@ pub fn inspect_session(session: &Session) -> Option<InspectInfo> {
     let mut err_set: HashSet<String> = HashSet::new();
     let mut user_count = 0usize;
     let mut assistant_count = 0usize;
+    let mut tool_count = 0usize;
     let mut acc_set: HashSet<String> = HashSet::new();
     let mut dec_set: HashSet<String> = HashSet::new();
 
@@ -120,10 +122,10 @@ pub fn inspect_session(session: &Session) -> Option<InspectInfo> {
     ];
 
     for msg in &messages {
-        if msg.role == "user" {
-            user_count += 1;
-        } else {
-            assistant_count += 1;
+        match msg.role.as_str() {
+            "user" => user_count += 1,
+            "tool" => tool_count += 1,
+            _ => assistant_count += 1,
         }
         for t in &msg.tool_uses {
             tools_used.insert(t.clone());
@@ -198,6 +200,7 @@ pub fn inspect_session(session: &Session) -> Option<InspectInfo> {
         message_count: messages.len(),
         user_messages: user_count,
         assistant_messages: assistant_count,
+        tool_results: tool_count,
         tools_used: tools_used.into_iter().collect(),
         files_modified: files_vec,
         accomplishments,

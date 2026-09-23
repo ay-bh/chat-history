@@ -18,10 +18,10 @@ Search, inspect, and export Claude Code, Cursor, and Codex conversation history.
 
 **Keyword question** ("find that conversation where I..."):
 
-1. `chat-history search "<query>" --json` — always `--json` from agents. BM25 searches metadata and transcripts together (`--deep` is not needed). Each hit carries `session_id`, `score`, `snippet`, `ordinal` (the message's position in the transcript), `timestamp`, `tools`, `files`; its `additional_matches` entries carry the same message fields and belong to the parent hit's `session_id`. Note `--json` exists only on `search`.
+1. `chat-history search "<query>" --json` — always `--json` from agents. BM25 searches metadata and transcripts together (`--deep` is not needed). Each hit carries `session_id`, `score`, `snippet`, `role` (`user` = the person, `assistant`, `tool` = command output or file contents), `ordinal` (the message's position in the transcript), `timestamp`, `tools`, `files`; its `additional_matches` entries carry the same message fields and belong to the parent hit's `session_id`. Note `--json` exists only on `search`.
 2. Shortlist by snippet, not by raw score (see "Choosing the best hit").
 3. Read the hit in context, not the whole transcript: `chat-history view <id> --plain --around <ordinal>` (2 messages each side; `-C N` to widen, `--max-chars 1500` to cap long messages). `ordinal` is `null` for title/prompt matches — use `inspect` for those.
-4. To find something inside one session, use `chat-history view <id> --plain --grep "<regex>" --max-chars 600 --head 12` instead of piping `view` through `grep`/`sed`/`head`.
+4. To find something inside one session, use `chat-history view <id> --plain --grep "<regex>" --max-chars 600 --head 12` instead of piping `view` through `grep`/`sed`/`head`. To read just the conversation, add `--role user,assistant` (tool output is most of a transcript); `--role user` lists what the person asked.
 5. `chat-history inspect <partial-uuid>` on the top 2–3 candidates to confirm before answering. Full `view` / `export` only if the user needs the whole conversation.
 
 **Temporal question** ("what did I work on yesterday?") — list, don't search:
@@ -35,7 +35,8 @@ Search, inspect, and export Claude Code, Cursor, and Codex conversation history.
 
 - Scores rank lexical relevance (BM25 by default), not intent. They are not confidence values or comparable across queries or engines. Use scores only to shortlist; decide from snippets and `inspect`.
 - BM25 groups matches by conversation: `--limit` counts conversations, `snippet` follows the strongest matching passage, and `additional_matches` contains up to two more excerpts. Read these before inspecting the session. Use `--group-by message` if individual matching messages are needed; legacy and `--scope similar` retain their previous message-row default.
-- The conversation you are currently in can match its own query and score highest. Ignore hits whose session is the current one.
+- Search leaves out the conversation you are running in (Claude Code, Codex and Cursor's agent tell it which one), since it would match its own query. Searching for its full UUID still finds it.
+- Tool output (`role: tool`) ranks below conversation text with the same words; chat-history's own output is never indexed.
 - When candidates are close, `inspect` each before picking — don't answer from the top score alone.
 
 ## Common mistakes
@@ -74,6 +75,7 @@ chat-history inspect <partial-uuid>
 chat-history view <id> --plain --around 42 # message #42 (a hit's ordinal) ± 2 messages; -C N to change
 chat-history view <id> --plain --grep "cloudflare|dns" --max-chars 600 --head 12  # matching messages, excerpt centred on the match
 chat-history view <id> --plain --tail 6    # last 6 messages (--head N for the first N)
+chat-history view <id> --plain --role user # only what the person said (user | assistant | tool, comma-separated)
 chat-history view <id> --plain             # whole transcript, pipe-friendly (--tools for tool names; -n numbers messages)
 chat-history export <id> -o session.md
 chat-history resume <id>                   # Claude Code, Codex, or any Cursor chat with a CLI store

@@ -75,6 +75,194 @@ fn truncate_for_search(s: &str, max: usize) -> String {
     format!("{} {}", &s[..head_end], &s[tail_start..])
 }
 
+/// Words that run the word after them as the command.
+const COMMAND_WRAPPERS: &[&str] = &["time", "command", "exec", "env", "nohup", "sudo"];
+/// Shell keywords that a command follows (`for …; do chat-history …`).
+const SHELL_KEYWORDS: &[&str] = &["do", "then", "else", "elif", "if", "while", "until", "!"];
+static EMBEDDED_COMMAND_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"\b(?:cmd|command)["']?\s*:\s*([`"'])"#).unwrap());
+
+/// Whether a shell command, or a script that builds one, runs chat-history.
+/// Only the first word of each simple command counts, so a path or an
+/// argument that mentions chat-history (`cd ~/src/chat-history`) does not.
+pub fn is_history_command(command: &str) -> bool {
+    if shell_runs_history(command) {
+        return true;
+    }
+    // Codex records the JavaScript or JSON that calls exec_command, not just
+    // its shell argument. Inspect that argument without treating quoted grep
+    // patterns in an ordinary shell command as executable commands.
+    if let Ok(args) = serde_json::from_str::<Value>(command) {
+        for key in ["cmd", "command"] {
+            if args
+                .get(key)
+                .and_then(Value::as_str)
+                .is_some_and(shell_runs_history)
+            {
+                return true;
+            }
+        }
+    }
+    if !command.contains("tools.exec_command") {
+        return false;
+    }
+    EMBEDDED_COMMAND_RE.captures_iter(command).any(|capture| {
+        let delimiter = capture[1].chars().next().unwrap();
+        let mut script = String::new();
+        let mut escaped = false;
+        for ch in command[capture.get(0).unwrap().end()..].chars() {
+            if escaped {
+                script.push(ch);
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == delimiter {
+                break;
+            } else {
+                script.push(ch);
+            }
+        }
+        shell_runs_history(&script)
+    })
+}
+
+fn shell_runs_history(command: &str) -> bool {
+    fn first_word_is_history(
+        word: &mut String,
+        command_position: &mut bool,
+        shell_launcher: &mut bool,
+        script_next: &mut bool,
+    ) -> bool {
+        if word.is_empty() {
+            return false;
+        }
+        let token = std::mem::take(word);
+        if *script_next {
+            *script_next = false;
+            return shell_runs_history(&token);
+        }
+        if *shell_launcher && token.starts_with('-') && token.contains('c') {
+            *script_next = true;
+            return false;
+        }
+        if !*command_position {
+            return false;
+        }
+        if token.contains('=')
+            || COMMAND_WRAPPERS.contains(&token.as_str())
+            || SHELL_KEYWORDS.contains(&token.as_str())
+        {
+            return false;
+        }
+        *command_position = false;
+        let basename = token.rsplit('/').next();
+        *shell_launcher = matches!(basename, Some("bash" | "sh" | "zsh"));
+        matches!(basename, Some("chat-history" | "ch"))
+    }
+
+    let mut word = String::new();
+    let mut command_position = true;
+    let mut shell_launcher = false;
+    let mut script_next = false;
+    let mut quote = None;
+    let mut escaped = false;
+    let mut chars = command.chars();
+    while let Some(ch) = chars.next() {
+        if escaped {
+            word.push(ch);
+            escaped = false;
+            continue;
+        }
+        match quote {
+            Some('\'') if ch == '\'' => quote = None,
+            Some('"') if ch == '"' => quote = None,
+            Some('"') if ch == '\\' => escaped = true,
+            // "$(…)" and "`…`" still run their contents.
+            Some('"') if ch == '`' || (ch == '$' && chars.clone().next() == Some('(')) => {
+                if shell_runs_history(&substitution(&mut chars, ch)) {
+                    return true;
+                }
+            }
+            Some(_) => word.push(ch),
+            None => match ch {
+                '\\' => escaped = true,
+                '\'' | '"' => quote = Some(ch),
+                '\n' | ';' | '&' | '|' | '(' | ')' | '{' | '}' | '`' => {
+                    if first_word_is_history(
+                        &mut word,
+                        &mut command_position,
+                        &mut shell_launcher,
+                        &mut script_next,
+                    ) {
+                        return true;
+                    }
+                    command_position = true;
+                    shell_launcher = false;
+                    script_next = false;
+                }
+                ch if ch.is_whitespace() => {
+                    if first_word_is_history(
+                        &mut word,
+                        &mut command_position,
+                        &mut shell_launcher,
+                        &mut script_next,
+                    ) {
+                        return true;
+                    }
+                }
+                _ => word.push(ch),
+            },
+        }
+    }
+    first_word_is_history(
+        &mut word,
+        &mut command_position,
+        &mut shell_launcher,
+        &mut script_next,
+    )
+}
+
+/// The body of a command substitution whose opener (`` ` `` or `$`) was just
+/// read, consuming it through the closing `` ` `` or matching `)`.
+fn substitution(chars: &mut std::str::Chars, opener: char) -> String {
+    let mut body = String::new();
+    if opener == '`' {
+        body.extend(chars.take_while(|&c| c != '`'));
+        return body;
+    }
+    chars.next();
+    let mut depth = 1;
+    for c in chars.by_ref() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+            _ => {}
+        }
+        body.push(c);
+    }
+    body
+}
+
+/// Text of a tool's output: a string, or text blocks (images are skipped).
+/// Long output keeps its start and end, like a tool result in `extract_text`.
+pub fn tool_output_text(output: &Value) -> String {
+    let text = match output {
+        Value::String(s) => s.clone(),
+        Value::Array(items) => items
+            .iter()
+            .filter_map(|item| item.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    };
+    truncate_for_search(&text, 16 * 1024)
+}
+
 pub fn extract_text(content: &Value) -> String {
     match content {
         Value::String(s) => s.clone(),
@@ -175,22 +363,26 @@ pub fn extract_context(content: &Value) -> MessageContext {
                     _ => Vec::new(),
                 };
                 for inner in &texts {
-                    for line in inner.lines() {
-                        let ll = line.to_lowercase();
-                        if ["error", "exception", "traceback", "failed"]
-                            .iter()
-                            .any(|w| ll.contains(w))
-                        {
-                            let truncated: String = line.trim().chars().take(200).collect();
-                            ctx.errors.push(truncated);
-                        }
-                    }
+                    ctx.errors.extend(error_lines(inner));
                 }
             }
             _ => {}
         }
     }
     ctx
+}
+
+/// Lines of tool output that report an error, each cut to 200 characters.
+pub fn error_lines(text: &str) -> Vec<String> {
+    text.lines()
+        .filter(|line| {
+            let ll = line.to_lowercase();
+            ["error", "exception", "traceback", "failed"]
+                .iter()
+                .any(|w| ll.contains(w))
+        })
+        .map(|line| line.trim().chars().take(200).collect())
+        .collect()
 }
 
 pub fn clean_prompt(text: &str) -> String {
@@ -516,6 +708,67 @@ pub fn snippet_around_match(text: &str, query: &str, context_chars: usize) -> St
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn history_commands_are_recognised_in_command_position() {
+        for cmd in [
+            "chat-history search \"auth\" --json",
+            "ch view abc123 --plain | grep -n foo",
+            "~/.cargo/bin/chat-history inspect abc",
+            "./target/release/chat-history search q",
+            "FOO=1 NO_COLOR=1 chat-history search q",
+            "cd /tmp && chat-history --from yesterday",
+            "(cd x; ch search q)",
+            "time chat-history search q",
+            "for id in a b; do chat-history inspect $id; done",
+            "if true; then ch search q; fi",
+            "while read id; do ch view $id --plain; done < ids",
+            "echo \"$(chat-history search q)\"",
+            "out=\"$(ch search q --json)\"",
+            "echo \"`chat-history search q`\"",
+            "bash -lc 'chat-history search q'",
+            "sh -c \"ch view abc --plain\"",
+            "tools.exec_command({cmd:`chat-history search '${q}' --json`})",
+            "{\"cmd\":\"chat-history view abc --plain\"}",
+            "echo start\nchat-history search q",
+        ] {
+            assert!(is_history_command(cmd), "{cmd}");
+        }
+        for cmd in [
+            "cd ~/GitHub/chat-history && cargo test",
+            "git log | grep chat-history",
+            "rg 'chat-history' README.md",
+            "rg \"chat-history; ch\" README.md",
+            "echo \"ch search old chats\"",
+            "bash -lc 'rg \"chat-history\" README.md'",
+            "tools.exec_command({cmd:`rg 'chat-history' README.md`})",
+            "rg ch src",
+            "for f in chat-history ch; do echo $f; done",
+            "echo \"$(rg chat-history README.md)\"",
+            "echo \"cost: $5 (chat-history)\"",
+            "cat chat-history.md",
+            "./target/release/chat-history-bounded search q",
+            "python3 compare.py",
+            "echo ch",
+        ] {
+            assert!(!is_history_command(cmd), "{cmd}");
+        }
+    }
+
+    #[test]
+    fn tool_output_text_reads_strings_and_text_blocks() {
+        assert_eq!(tool_output_text(&json!("plain out")), "plain out");
+        assert_eq!(
+            tool_output_text(&json!([
+                {"type": "text", "text": "one"},
+                {"type": "image", "source": {}},
+                {"type": "input_text", "text": "two"}
+            ])),
+            "one\ntwo"
+        );
+        let long = "x".repeat(40 * 1024);
+        assert!(tool_output_text(&json!(long)).len() <= 16 * 1024 + 1);
+    }
 
     #[test]
     fn extract_text_from_string() {

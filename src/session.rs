@@ -63,6 +63,10 @@ pub struct Message {
     pub error_patterns: Vec<String>,
     pub relevance_score: f64,
     pub final_score: f64,
+    /// Output of a chat-history command. `view` shows it; search never
+    /// indexes it, since it repeats other sessions' text.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub history_output: bool,
 }
 
 impl Message {
@@ -1257,8 +1261,9 @@ pub fn parse_claude_jsonl(
     // repeating the same message id and usage — count usage once per id.
     let mut counted_usage_ids: HashSet<String> = HashSet::new();
     let mut user_texts = Vec::new();
-    let mut total_chars: usize = 0;
-    let max_chars: usize = 4 * 1024 * 1024;
+    // Tool calls that ran chat-history, by tool_use id: their results repeat
+    // other sessions and are marked so search skips them.
+    let mut history_calls: HashSet<String> = HashSet::new();
 
     for line in reader.lines() {
         let line = match line {
@@ -1311,10 +1316,55 @@ pub fn parse_claude_jsonl(
             .get("message")
             .cloned()
             .unwrap_or(Value::Object(Default::default()));
-        let content_raw = msg_obj
+        let mut content_raw = msg_obj
             .get("content")
             .cloned()
             .unwrap_or(Value::String(String::new()));
+        if etype == "assistant" {
+            for block in content_raw.as_array().into_iter().flatten() {
+                if block.get("type").and_then(Value::as_str) == Some("tool_use")
+                    && let Some(command) = block.pointer("/input/command").and_then(Value::as_str)
+                    && crate::parser::is_history_command(command)
+                    && let Some(id) = block.get("id").and_then(Value::as_str)
+                {
+                    history_calls.insert(id.to_owned());
+                }
+            }
+        }
+        // Tool results arrive as user records but are not the person's words:
+        // they become a `tool` message, and any text beside them stays `user`.
+        if etype == "user"
+            && let Value::Array(blocks) = &content_raw
+            && blocks
+                .iter()
+                .any(|b| b.get("type").and_then(Value::as_str) == Some("tool_result"))
+        {
+            let (results, rest): (Vec<Value>, Vec<Value>) = blocks
+                .iter()
+                .cloned()
+                .partition(|b| b.get("type").and_then(Value::as_str) == Some("tool_result"));
+            let text = results
+                .iter()
+                .map(|b| crate::parser::tool_output_text(b.get("content").unwrap_or(&Value::Null)))
+                .filter(|t| !t.trim().is_empty())
+                .collect::<Vec<_>>()
+                .join("\n");
+            // One message per record, even without text (an image), so
+            // positions match earlier versions and `view -n`.
+            let history_output = results.iter().any(|b| {
+                b.get("tool_use_id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| history_calls.contains(id))
+            });
+            let ctx = crate::parser::extract_context(&Value::Array(results));
+            let mut message = claude_message(&entry, "tool", text, ctx);
+            message.history_output = history_output;
+            messages.push(message);
+            if rest.is_empty() {
+                continue;
+            }
+            content_raw = Value::Array(rest);
+        }
         let mut text = extract_text(&content_raw);
         let is_meta = etype == "user" && entry.get("isMeta").and_then(Value::as_bool) == Some(true);
 
@@ -1371,48 +1421,12 @@ pub fn parse_claude_jsonl(
         }
 
         let ctx = crate::parser::extract_context(&content_raw);
-
-        if total_chars < max_chars {
-            let role = msg_obj
-                .get("role")
-                .and_then(Value::as_str)
-                .unwrap_or(etype)
-                .to_string();
-            let uuid = entry
-                .get("uuid")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
-            let timestamp = entry
-                .get("timestamp")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
-            let session_id = entry
-                .get("sessionId")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
-            let cwd = entry
-                .get("cwd")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
-            total_chars += text.len();
-            messages.push(Message {
-                uuid,
-                timestamp,
-                role,
-                content: text,
-                session_id,
-                project_path: cwd,
-                tool_uses: ctx.tools,
-                files_referenced: ctx.files,
-                error_patterns: ctx.errors,
-                relevance_score: 0.0,
-                final_score: 0.0,
-            });
-        }
+        let role = msg_obj
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or(etype)
+            .to_string();
+        messages.push(claude_message(&entry, &role, text, ctx));
     }
 
     if extract_meta {
@@ -1422,6 +1436,35 @@ pub fn parse_claude_jsonl(
         return (messages, Some(meta));
     }
     (messages, None)
+}
+
+fn claude_message(
+    entry: &Value,
+    role: &str,
+    text: String,
+    ctx: crate::parser::MessageContext,
+) -> Message {
+    let field = |key: &str| {
+        entry
+            .get(key)
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string()
+    };
+    Message {
+        uuid: field("uuid"),
+        timestamp: field("timestamp"),
+        role: role.to_owned(),
+        content: text,
+        session_id: field("sessionId"),
+        project_path: field("cwd"),
+        tool_uses: ctx.tools,
+        files_referenced: ctx.files,
+        error_patterns: ctx.errors,
+        relevance_score: 0.0,
+        final_score: 0.0,
+        history_output: false,
+    }
 }
 
 // Commentary-phase assistant messages are dropped only for turns that reach a
@@ -1471,8 +1514,8 @@ pub fn parse_codex_jsonl(filepath: &str) -> Vec<Message> {
     // output: tool calls must wait for the turn's final answer instead of
     // attaching to the previous turn's message.
     let mut route_tools_forward = false;
-    let mut total_chars: usize = 0;
-    let max_chars: usize = 4 * 1024 * 1024;
+    // Calls that ran chat-history, by call_id; see `Message::history_output`.
+    let mut history_calls: HashSet<String> = HashSet::new();
 
     for (i, entry) in entries.iter().enumerate() {
         // session_meta carries id/cwd; legacy files put them flat on line 1.
@@ -1520,40 +1563,76 @@ pub fn parse_codex_jsonl(filepath: &str) -> Vec<Message> {
                     continue;
                 }
                 let ctx = crate::parser::extract_context(&content_raw);
-                if total_chars < max_chars {
-                    total_chars += text.len();
-                    let mut tool_uses = ctx.tools;
-                    if role == "assistant" {
-                        tool_uses.append(&mut pending_tools);
-                        route_tools_forward = false;
-                    }
-                    messages.push(Message {
-                        uuid: String::new(),
-                        timestamp,
-                        role: role.to_string(),
-                        content: text,
-                        session_id: session_id.clone(),
-                        project_path: project_path.clone(),
-                        tool_uses,
-                        files_referenced: ctx.files,
-                        error_patterns: ctx.errors,
-                        relevance_score: 0.0,
-                        final_score: 0.0,
-                    });
+                let mut tool_uses = ctx.tools;
+                if role == "assistant" {
+                    tool_uses.append(&mut pending_tools);
+                    route_tools_forward = false;
                 }
+                messages.push(Message {
+                    uuid: String::new(),
+                    timestamp,
+                    role: role.to_string(),
+                    content: text,
+                    session_id: session_id.clone(),
+                    project_path: project_path.clone(),
+                    tool_uses,
+                    files_referenced: ctx.files,
+                    error_patterns: ctx.errors,
+                    relevance_score: 0.0,
+                    final_score: 0.0,
+                    history_output: false,
+                });
             }
             // Tool calls are separate records in Codex rollouts; attach the
             // tool name to the assistant message that initiated it, or hold
             // it for the next assistant message if none exists yet.
-            Some("function_call") => {
+            Some(kind @ ("function_call" | "custom_tool_call")) => {
+                let call = payload
+                    .get(if kind == "function_call" {
+                        "arguments"
+                    } else {
+                        "input"
+                    })
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                if crate::parser::is_history_command(call)
+                    && let Some(id) = payload.get("call_id").and_then(Value::as_str)
+                {
+                    history_calls.insert(id.to_owned());
+                }
                 if let Some(name) = payload.get("name").and_then(Value::as_str) {
-                    match messages.last_mut() {
+                    match messages.iter_mut().rev().find(|m| m.role != "tool") {
                         Some(last) if last.role == "assistant" && !route_tools_forward => {
                             last.tool_uses.push(name.to_string());
                         }
                         _ => pending_tools.push(name.to_string()),
                     }
                 }
+            }
+            Some("function_call_output" | "custom_tool_call_output") => {
+                let text =
+                    crate::parser::tool_output_text(payload.get("output").unwrap_or(&Value::Null));
+                if text.trim().is_empty() {
+                    continue;
+                }
+                let errors = crate::parser::error_lines(&text);
+                messages.push(Message {
+                    uuid: String::new(),
+                    timestamp,
+                    role: "tool".to_owned(),
+                    content: text,
+                    session_id: session_id.clone(),
+                    project_path: project_path.clone(),
+                    tool_uses: Vec::new(),
+                    files_referenced: Vec::new(),
+                    error_patterns: errors,
+                    relevance_score: 0.0,
+                    final_score: 0.0,
+                    history_output: payload
+                        .get("call_id")
+                        .and_then(Value::as_str)
+                        .is_some_and(|id| history_calls.contains(id)),
+                });
             }
             _ => {}
         }
@@ -1618,6 +1697,7 @@ pub fn parse_cursor_jsonl(filepath: &str) -> Vec<Message> {
                 error_patterns: ctx.errors,
                 relevance_score: 0.0,
                 final_score: 0.0,
+                history_output: false,
             });
         }
     }
@@ -1650,6 +1730,7 @@ pub fn parse_cursor_txt(filepath: &str) -> Vec<Message> {
                         error_patterns: Vec::new(),
                         relevance_score: 0.0,
                         final_score: 0.0,
+                        history_output: false,
                     });
                 }
             }
@@ -1671,6 +1752,7 @@ pub fn parse_cursor_txt(filepath: &str) -> Vec<Message> {
                         error_patterns: Vec::new(),
                         relevance_score: 0.0,
                         final_score: 0.0,
+                        history_output: false,
                     });
                 }
             }
@@ -1695,6 +1777,7 @@ pub fn parse_cursor_txt(filepath: &str) -> Vec<Message> {
                 error_patterns: Vec::new(),
                 relevance_score: 0.0,
                 final_score: 0.0,
+                history_output: false,
             });
         }
     }
@@ -1799,6 +1882,25 @@ fn parse_session_inner(
     } else {
         (messages, None)
     }
+}
+
+/// The sessions this process runs inside, as the agent running it reports
+/// them to the commands it runs: Claude Code exports `CLAUDE_CODE_SESSION_ID`,
+/// Codex `CODEX_THREAD_ID` and Cursor's agent `CURSOR_CONVERSATION_ID`.
+/// Pairs of (source prefix, id); `cursor` covers `cursor-ide` rows too.
+pub fn calling_sessions() -> Vec<(&'static str, String)> {
+    [
+        ("claude", "CLAUDE_CODE_SESSION_ID"),
+        ("codex", "CODEX_THREAD_ID"),
+        ("cursor", "CURSOR_CONVERSATION_ID"),
+    ]
+    .into_iter()
+    .filter_map(|(source, var)| {
+        let id = std::env::var(var).ok()?;
+        let id = id.trim();
+        (!id.is_empty()).then(|| (source, id.to_owned()))
+    })
+    .collect()
 }
 
 pub fn filter_sessions(
@@ -2836,9 +2938,11 @@ mod tests {
         let messages = parse_codex_jsonl(tmp.path().to_str().unwrap());
         assert_eq!(
             messages.len(),
-            2,
+            3,
             "developer and environment_context messages should be filtered"
         );
+        assert_eq!(messages[2].role, "tool");
+        assert_eq!(messages[2].content, "src tests");
         assert_eq!(messages[0].role, "user");
         assert_eq!(
             messages[0].content,
