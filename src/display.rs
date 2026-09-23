@@ -526,7 +526,8 @@ pub fn print_index_results_json(results: &[IndexResult], query: &str) {
 }
 
 /// A few lines per session, for comparing search candidates: where and when,
-/// the title, what was asked, how it ended, and the first files it touched.
+/// the title, what was asked, the latest substantive result, and the first
+/// files it read or edited.
 pub fn print_inspect_brief(info: &InspectInfo) {
     let tag = src_tag(&info.source, info.also_ide);
     let short: String = info.session_id.chars().take(8).collect();

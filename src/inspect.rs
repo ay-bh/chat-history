@@ -18,7 +18,8 @@ pub struct InspectInfo {
     pub files_modified: Vec<String>,
     /// The session's first request.
     pub asked: String,
-    /// How the last turn ended: the first informative sentence of its reply.
+    /// The latest substantive result: the last turn-ending reply with an
+    /// informative sentence, so a closing "All set" does not hide it.
     pub outcome: String,
     /// How each turn ended, most recent last.
     pub accomplishments: Vec<String>,

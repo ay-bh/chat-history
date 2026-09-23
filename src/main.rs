@@ -151,7 +151,7 @@ enum Commands {
         /// Inspect the most recent session
         #[arg(long, conflicts_with = "session_ids")]
         last: bool,
-        /// A few lines per session: what was asked and how it ended
+        /// A few lines per session: what was asked and the latest substantive result
         #[arg(long)]
         brief: bool,
     },
