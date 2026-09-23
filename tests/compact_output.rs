@@ -273,3 +273,43 @@ fn view_json_with_no_grep_match_is_still_json() {
     assert_eq!(json["messages"], json!([]), "{json}");
     assert_eq!(json["message_count"], 6);
 }
+
+#[test]
+fn a_long_first_prompt_hit_keeps_what_the_title_cuts() {
+    let tmp = fixture();
+    let prompt = "plan the heron migration across every regional warehouse and \
+                  its loading docks, then check the zanzibar route";
+    write_claude(
+        tmp.path(),
+        "cccccccc-1111-2222-3333-cccccccccccc",
+        vec![("user", json!(prompt)), ("assistant", json!("Planned it."))],
+    );
+    let out = stdout(&tmp, &["search", "zanzibar", "--compact"]);
+    let line = out.lines().find(|l| l.starts_with("cccccccc")).unwrap();
+    assert!(line.contains("zanzibar"), "{line}");
+}
+
+#[test]
+fn compact_marks_metadata_only_sessions() {
+    let tmp = fixture();
+    let id = "dddddddd-1111-2222-3333-dddddddddddd";
+    let dir = tmp
+        .path()
+        .join(format!(".cursor/chats/workspace-hash/{id}"));
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("meta.json"),
+        json!({"schemaVersion": 1, "cwd": "/Users/test/proj",
+               "title": "Kingfisher store notes", "createdAtMs": 1788220800000i64,
+               "updatedAtMs": 1788307200000i64, "hasConversation": true})
+        .to_string(),
+    )
+    .unwrap();
+    rusqlite::Connection::open(dir.join("store.db"))
+        .unwrap()
+        .execute_batch("CREATE TABLE blobs (id TEXT PRIMARY KEY, data BLOB);")
+        .unwrap();
+    let out = stdout(&tmp, &["search", "kingfisher", "--compact"]);
+    let line = out.lines().find(|l| l.starts_with("dddddddd")).expect(&out);
+    assert!(line.contains("[metadata only]"), "{line}");
+}

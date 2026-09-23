@@ -385,9 +385,12 @@ pub fn print_search_results_compact(results: &[SearchResult], query: &str) {
         };
         let title = title_of(&r.session.summary, &r.session.first_prompt, 80);
         let excerpt = tty(&clip_chars(&compact_search_preview(&snippet), 160));
-        // A title or first-prompt hit has no ordinal; its excerpt is usually
-        // the title again.
-        let excerpt = if r.ordinal.is_none() && excerpt.starts_with(title.trim_end_matches('…')) {
+        // A title or first-prompt hit has no ordinal; its excerpt is often
+        // the title again, and is dropped unless it shows more than the title.
+        let excerpt = if r.ordinal.is_none()
+            && excerpt.starts_with(title.trim_end_matches('…'))
+            && excerpt.chars().count() <= title.chars().count()
+        {
             String::new()
         } else {
             let (_, role) = role_style(&r.message.role);
@@ -431,8 +434,14 @@ fn compact_row(session: &Session, ordinal: Option<usize>, title: &str) -> String
         tty(&abbreviate_home(&session.project))
     };
     let ordinal = ordinal.map_or_else(|| "-".to_string(), |o| format!("#{o}"));
+    // Only find and resume work on these; inspect, view and export refuse.
+    let availability = if session.is_cursor_store_only() {
+        "  [metadata only]"
+    } else {
+        ""
+    };
     format!(
-        "{}  {}  {}  {dir}  {ordinal}  {title}",
+        "{}  {}  {}  {dir}  {ordinal}  {title}{availability}",
         tty(&short),
         tty(&session.date),
         src_label(&session.source, session.also_ide)
