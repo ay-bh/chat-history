@@ -63,7 +63,9 @@ similarity calculation so the meaning of that option does not change.
 
 ## Storage
 
-The index is `search-v2.db` under the cache directory, separate from the
+The index is `search-v2-x3.db` under the cache directory (`v2` is the schema
+generation, `x3` the extraction generation, so binaries on different
+extraction versions never share one file), separate from the
 metadata cache. New directories and files use Unix modes 0700 and 0600.
 When the default cache directory is not writable, both caches are served from
 a user-private copy under the temp directory, seeded from the existing files

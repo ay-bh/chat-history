@@ -1,5 +1,5 @@
 use chat_history::search_index::{
-    Bm25Backend, INDEX_FILENAME, LegacyBackend, SearchBackend, SearchRequest,
+    Bm25Backend, EXTRACTION_VERSION, LegacyBackend, SearchBackend, SearchRequest, index_filename,
 };
 use chat_history::session::Session;
 use serde_json::json;
@@ -440,7 +440,7 @@ fn source_refresh_with_identical_messages_keeps_existing_postings() {
     let cache = tmp.path().join("cache");
     let mut index = Bm25Backend::open(Some(&cache)).unwrap();
     index.sync(&corpus, false).unwrap();
-    let conn = rusqlite::Connection::open(cache.join(INDEX_FILENAME)).unwrap();
+    let conn = rusqlite::Connection::open(cache.join(index_filename())).unwrap();
     conn.execute_batch(
         "CREATE TRIGGER reject_rewrite BEFORE DELETE ON messages
         BEGIN SELECT RAISE(ABORT, 'unchanged messages must retain postings'); END;",
@@ -834,7 +834,7 @@ fn persistent_index_refreshes_edits_metadata_deletions_and_rebuilds() {
     fs::remove_file(&corpus[0].file).unwrap();
     assert_eq!(index.sync(&[], false).unwrap().removed, 1);
     assert!(search(&mut index, &corpus, "uniqueafter", 10).is_empty());
-    let conn = rusqlite::Connection::open(dir.join(INDEX_FILENAME)).unwrap();
+    let conn = rusqlite::Connection::open(dir.join(index_filename())).unwrap();
     conn.execute(
         "INSERT INTO passages_fts(passages_fts) VALUES ('integrity-check')",
         [],
@@ -849,7 +849,7 @@ fn persistent_index_refreshes_edits_metadata_deletions_and_rebuilds() {
     {
         use std::os::unix::fs::PermissionsExt;
         assert_eq!(
-            fs::metadata(dir.join(INDEX_FILENAME))
+            fs::metadata(dir.join(index_filename()))
                 .unwrap()
                 .permissions()
                 .mode()
@@ -1024,7 +1024,7 @@ fn cli_defaults_to_bm25_and_supports_engine_environment_and_no_cache() {
     assert!(
         !tmp.path()
             .join(".chat-history/cache")
-            .join(INDEX_FILENAME)
+            .join(index_filename())
             .exists()
     );
     command(&tmp)
@@ -1035,7 +1035,7 @@ fn cli_defaults_to_bm25_and_supports_engine_environment_and_no_cache() {
     assert!(
         tmp.path()
             .join(".chat-history/cache")
-            .join(INDEX_FILENAME)
+            .join(index_filename())
             .exists()
     );
     command(&tmp)
@@ -1062,7 +1062,7 @@ fn corrupt_cache_falls_back_without_changing_search_results() {
     cli_fixture(&tmp);
     let dir = tmp.path().join("index");
     fs::create_dir(&dir).unwrap();
-    fs::write(dir.join(INDEX_FILENAME), "not a database").unwrap();
+    fs::write(dir.join(index_filename()), "not a database").unwrap();
     let broken = command(&tmp)
         .env("CHAT_HISTORY_CACHE_DIR", &dir)
         .args(["search", "uniquecli", "--json"])
@@ -1100,7 +1100,7 @@ fn corruption_outside_the_sessions_table_is_repaired_once() {
     let healthy = run();
     assert!(healthy.status.success());
     // The sessions table stays readable; only the FTS segments are damaged.
-    let conn = rusqlite::Connection::open(dir.join(INDEX_FILENAME)).unwrap();
+    let conn = rusqlite::Connection::open(dir.join(index_filename())).unwrap();
     conn.execute("DELETE FROM passages_fts_data WHERE id > 10", [])
         .unwrap();
     drop(conn);
@@ -1131,7 +1131,7 @@ fn readable_transcripts_without_messages_are_not_reparsed_every_search() {
     index.sync(&corpus, false).unwrap();
     drop(index);
     // A null signature never matches, so the session is parsed on every sync.
-    let stamp: String = rusqlite::Connection::open(dir.join(INDEX_FILENAME))
+    let stamp: String = rusqlite::Connection::open(dir.join(index_filename()))
         .unwrap()
         .query_row("SELECT fingerprint FROM sessions", [], |r| r.get(0))
         .unwrap();
@@ -1153,7 +1153,7 @@ fn deleted_session_text_is_not_recoverable_from_index_bytes() {
     index.sync(&[], false).unwrap();
     drop(index);
     for suffix in ["", "-wal", "-shm"] {
-        let path = dir.join(format!("{INDEX_FILENAME}{suffix}"));
+        let path = dir.join(format!("{}{suffix}", index_filename()));
         let Ok(bytes) = fs::read(&path) else {
             continue;
         };
@@ -1308,9 +1308,12 @@ fn locked_cache_uses_ephemeral_bm25_and_preserves_json() {
             .join("projects/demo/11111111-2222-3333-4444-555555555555.jsonl"),
         &["Investigate uniquecli authentication failures during login. extra uniquecli refresh"],
     );
-    let conn =
-        rusqlite::Connection::open(tmp.path().join(".chat-history/cache").join(INDEX_FILENAME))
-            .unwrap();
+    let conn = rusqlite::Connection::open(
+        tmp.path()
+            .join(".chat-history/cache")
+            .join(index_filename()),
+    )
+    .unwrap();
     conn.execute_batch("BEGIN IMMEDIATE").unwrap();
     // The recent source needs a refresh, so a held write lock must trigger fallback.
     let output = command(&tmp)
@@ -1539,7 +1542,7 @@ fn cache_commit_failure_does_not_discard_valid_results() {
     cli_fixture(&tmp);
     let dir = tmp.path().join("index");
     drop(Bm25Backend::open(Some(&dir)).unwrap());
-    let conn = rusqlite::Connection::open(dir.join(INDEX_FILENAME)).unwrap();
+    let conn = rusqlite::Connection::open(dir.join(index_filename())).unwrap();
     // Deterministically fail COMMIT after synchronization and retrieval succeed.
     conn.execute_batch(
         "CREATE TABLE commit_guard (
@@ -1586,13 +1589,13 @@ fn missing_fts_asset_is_rebuilt_from_existing_message_rows() {
     let mut index = Bm25Backend::open(Some(&dir)).unwrap();
     index.sync(&corpus, false).unwrap();
     drop(index);
-    let conn = rusqlite::Connection::open(dir.join(INDEX_FILENAME)).unwrap();
+    let conn = rusqlite::Connection::open(dir.join(index_filename())).unwrap();
     conn.execute_batch("DROP TABLE passages_fts").unwrap();
     drop(conn);
     let mut index = Bm25Backend::open(Some(&dir)).unwrap();
     assert_eq!(index.sync(&corpus, false).unwrap().unchanged, 1);
     assert_eq!(search(&mut index, &corpus, "repairneedle", 10).len(), 1);
-    let conn = rusqlite::Connection::open(dir.join(INDEX_FILENAME)).unwrap();
+    let conn = rusqlite::Connection::open(dir.join(index_filename())).unwrap();
     conn.execute(
         "INSERT INTO passages_fts(passages_fts, rank) VALUES ('integrity-check', 1)",
         [],
@@ -1667,8 +1670,8 @@ fn age(path: &std::path::Path, days: u64) {
 }
 
 /// A previous-generation database with enough content to be worth reclaiming.
-fn previous_generation(dir: &std::path::Path) -> std::path::PathBuf {
-    let path = dir.join("search-v1.db");
+fn previous_generation(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+    let path = dir.join(name);
     let conn = rusqlite::Connection::open(&path).unwrap();
     conn.execute_batch("CREATE TABLE sessions (key TEXT PRIMARY KEY, fingerprint TEXT NOT NULL)")
         .unwrap();
@@ -1690,11 +1693,10 @@ fn opening_the_index_empties_a_previous_generation_unused_for_a_week_in_place() 
     let tmp = TempDir::new().unwrap();
     let dir = tmp.path().join("index");
     fs::create_dir(&dir).unwrap();
-    let v1 = previous_generation(&dir);
+    let v1 = previous_generation(&dir, "search-v1.db");
     age(&v1, 8);
-    assert_eq!(INDEX_FILENAME, "search-v2.db");
     drop(Bm25Backend::open(Some(&dir)).unwrap());
-    assert!(dir.join(INDEX_FILENAME).exists());
+    assert!(dir.join(index_filename()).exists());
     // Never unlinked: another binary may hold it open. Reset through SQLite instead.
     assert!(v1.exists());
     assert!(fs::metadata(&v1).unwrap().len() < 64 * 1024);
@@ -1707,7 +1709,7 @@ fn a_previous_generation_with_a_writer_in_progress_is_left_alone() {
     let tmp = TempDir::new().unwrap();
     let dir = tmp.path().join("index");
     fs::create_dir(&dir).unwrap();
-    let v1 = previous_generation(&dir);
+    let v1 = previous_generation(&dir, "search-v1.db");
     age(&v1, 30);
     let holder = rusqlite::Connection::open(&v1).unwrap();
     holder.execute_batch("BEGIN IMMEDIATE").unwrap();
@@ -1740,13 +1742,61 @@ fn a_previous_generation_with_live_sidecars_is_left_for_its_binary() {
         age(&dir.join(name), 30);
     }
     drop(Bm25Backend::open(Some(&dir)).unwrap());
-    assert!(dir.join(INDEX_FILENAME).exists());
+    assert!(dir.join(index_filename()).exists());
     for name in live {
         assert!(
             dir.join(name).exists(),
             "{name} must not be removed while open"
         );
     }
+}
+
+#[test]
+fn the_index_filename_carries_the_extraction_version() {
+    // Two installed binaries with different extraction versions must not share
+    // one file, or each run re-extracts every session the other one wrote.
+    let name = index_filename();
+    let version = name
+        .strip_prefix("search-v2-x")
+        .and_then(|rest| rest.strip_suffix(".db"))
+        .and_then(|digits| digits.parse::<u32>().ok())
+        .unwrap_or_else(|| panic!("unexpected index filename {name}"));
+    assert_eq!(version, EXTRACTION_VERSION);
+    assert_ne!(name, "search-v2.db");
+}
+
+#[test]
+fn a_recently_used_unversioned_index_is_kept_for_its_binary() {
+    // The 0.7.x file is still that binary's live cache; only the new file is
+    // created beside it.
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join("index");
+    fs::create_dir(&dir).unwrap();
+    fs::write(dir.join("search-v2.db"), "an older binary's cache").unwrap();
+    age(&dir.join("search-v2.db"), 2);
+    drop(Bm25Backend::open(Some(&dir)).unwrap());
+    assert!(dir.join(index_filename()).exists());
+    assert_eq!(
+        fs::read(dir.join("search-v2.db")).unwrap(),
+        b"an older binary's cache"
+    );
+}
+
+#[test]
+fn an_unversioned_index_idle_for_a_week_is_emptied_in_place() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join("index");
+    fs::create_dir(&dir).unwrap();
+    let v2 = previous_generation(&dir, "search-v2.db");
+    age(&v2, 8);
+    drop(Bm25Backend::open(Some(&dir)).unwrap());
+    assert!(
+        v2.exists(),
+        "never unlinked: another binary may hold it open"
+    );
+    assert!(fs::metadata(&v2).unwrap().len() < 64 * 1024);
+    let conn = rusqlite::Connection::open(&v2).unwrap();
+    assert_eq!(count(&conn, "SELECT count(*) FROM sqlite_schema"), 0);
 }
 
 #[test]
@@ -1765,7 +1815,7 @@ fn full_text_rows_are_written_once_without_an_insert_trigger() {
     index.sync(&corpus, false).unwrap();
     assert_eq!(search(&mut index, &corpus, "directneedle", 10).len(), 2);
     drop(index);
-    let conn = rusqlite::Connection::open(dir.join(INDEX_FILENAME)).unwrap();
+    let conn = rusqlite::Connection::open(dir.join(index_filename())).unwrap();
     assert_eq!(
         count(
             &conn,
@@ -1793,7 +1843,7 @@ fn full_text_rows_are_written_once_without_an_insert_trigger() {
     assert_eq!(index.sync(&corpus, false).unwrap().removed, 1);
     assert_eq!(search(&mut index, &corpus, "directneedle", 10).len(), 1);
     drop(index);
-    let conn = rusqlite::Connection::open(dir.join(INDEX_FILENAME)).unwrap();
+    let conn = rusqlite::Connection::open(dir.join(index_filename())).unwrap();
     conn.execute_batch(
         "CREATE VIRTUAL TABLE temp.vocab USING fts5vocab('main', 'passages_fts', 'row')",
     )
@@ -1820,7 +1870,7 @@ fn read_only_home_cache_falls_back_to_a_private_temp_copy_without_rebuilding() {
     let warm = run();
     assert!(warm.status.success());
     let home_cache = tmp.path().join(".chat-history/cache");
-    assert!(home_cache.join(INDEX_FILENAME).exists());
+    assert!(home_cache.join(index_filename()).exists());
     struct Restore(std::path::PathBuf);
     impl Drop for Restore {
         fn drop(&mut self) {
@@ -1842,7 +1892,7 @@ fn read_only_home_cache_falls_back_to_a_private_temp_copy_without_rebuilding() {
         "one note when created: {stderr}"
     );
     assert!(fallback.join("cache/catalog-v1.db").exists());
-    assert!(!fallback.join("cache").join(INDEX_FILENAME).exists());
+    assert!(!fallback.join("cache").join(index_filename()).exists());
 
     let first = run();
     let stderr = String::from_utf8_lossy(&first.stderr);
@@ -1858,7 +1908,7 @@ fn read_only_home_cache_falls_back_to_a_private_temp_copy_without_rebuilding() {
         fs::metadata(&fallback).unwrap().permissions().mode() & 0o777,
         0o700
     );
-    assert!(fallback.join("cache").join(INDEX_FILENAME).exists());
+    assert!(fallback.join("cache").join(index_filename()).exists());
 
     let second = run();
     let stderr = String::from_utf8_lossy(&second.stderr);

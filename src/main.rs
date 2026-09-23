@@ -483,9 +483,9 @@ fn main() {
                 let directory = if no_cache || std::env::var_os("CHAT_HISTORY_NO_CACHE").is_some() {
                     None
                 } else {
-                    cache_dir
-                        .filter(|p| !p.as_os_str().is_empty())
-                        .or_else(|| chat_history::cache_dir::prepare(search_index::INDEX_FILENAME))
+                    cache_dir.filter(|p| !p.as_os_str().is_empty()).or_else(|| {
+                        chat_history::cache_dir::prepare(&search_index::index_filename())
+                    })
                 };
                 search_index::search_corpus(
                     search_corpus.as_deref().unwrap_or(&sessions),

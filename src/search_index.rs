@@ -19,18 +19,30 @@ use std::time::{Duration, Instant};
 
 pub type SearchError = Box<dyn std::error::Error + Send + Sync>;
 pub type Result<T> = std::result::Result<T, SearchError>;
-pub const INDEX_FILENAME: &str = "search-v2.db";
-/// Earlier generations wrote full-text rows through an insert trigger. An older
-/// binary sharing the directory would recreate that trigger, so they are not
-/// migrated in place: a new file is used and the old one emptied once idle.
-const PREVIOUS_INDEX_FILENAMES: [&str; 1] = ["search-v1.db"];
+/// The relational schema generation; changing it changes the file.
+const SCHEMA_VERSION: u32 = 2;
+/// Bump for parser, timestamp, chunking or tokenization changes that require
+/// re-extracting unchanged sources without changing the relational schema.
+/// Part of the filename: two installed binaries on different extraction
+/// versions each keep their own index instead of re-extracting every session
+/// the other one wrote on every alternate run.
+pub const EXTRACTION_VERSION: u32 = 3;
+
+/// The disposable BM25 index for this binary's schema and extraction versions.
+pub fn index_filename() -> String {
+    format!("search-v{SCHEMA_VERSION}-x{EXTRACTION_VERSION}.db")
+}
+
+/// Files earlier binaries used. Nothing is migrated in place, since an older
+/// binary sharing the directory would keep writing its own format (v1
+/// recreated a full-text insert trigger; the unversioned v2 file is rewritten
+/// by any extraction version): a new file is used and the old one emptied once
+/// idle for a week.
+const PREVIOUS_INDEX_FILENAMES: [&str; 2] = ["search-v1.db", "search-v2.db"];
 const PREVIOUS_INDEX_GRACE: Duration = Duration::from_secs(7 * 86_400);
 /// An emptied database is a few pages; anything at or below this is done.
 const RECLAIMED_SIZE: u64 = 64 * 1024;
 const RECLAIM_TIMEOUT: Duration = Duration::from_millis(250);
-// Bump for parser, timestamp, chunking or tokenization changes that require
-// re-extracting unchanged sources without changing the relational schema.
-const EXTRACTION_VERSION: u32 = 3;
 const MAX_ANALYZER_TOKENS: usize = 128;
 const MAX_PHRASE_TOKENS: usize = 32;
 const MAX_PASSAGE_CHARS: usize = 1600;
@@ -164,7 +176,7 @@ fn cache_is_healthy(conn: &Connection) -> bool {
 }
 
 fn reset_in_place(dir: &Path) -> Result<()> {
-    let conn = Connection::open(dir.join(INDEX_FILENAME))?;
+    let conn = Connection::open(dir.join(index_filename()))?;
     conn.busy_timeout(BUSY_TIMEOUT)?;
     if cache_is_healthy(&conn) {
         return Ok(());
@@ -439,7 +451,7 @@ impl Bm25Backend {
             }
             builder.create(dir)?;
             reclaim_previous_generations(dir);
-            let path = dir.join(INDEX_FILENAME);
+            let path = dir.join(index_filename());
             let mut options = fs::OpenOptions::new();
             options.write(true).create_new(true);
             #[cfg(unix)]
@@ -1459,5 +1471,16 @@ mod tests {
         assert!(parsed.phrase.is_none());
         assert!(parsed.broad.contains("term0"));
         assert!(parsed.broad.contains("term99"));
+    }
+
+    #[test]
+    fn the_live_index_is_never_on_the_reclaim_list() {
+        let live = super::index_filename();
+        assert!(
+            !super::PREVIOUS_INDEX_FILENAMES.contains(&live.as_str()),
+            "{live} would be emptied under its own binary"
+        );
+        // The unversioned 0.7.x file is reclaimed once idle, like search-v1.db.
+        assert!(super::PREVIOUS_INDEX_FILENAMES.contains(&"search-v2.db"));
     }
 }
