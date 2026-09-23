@@ -416,3 +416,26 @@ fn brief_files_keep_a_project_that_lives_under_tmp() {
     let out = stdout(&tmp, &["inspect", "cccccccc", "--brief"]);
     assert!(out.contains("  Files: src/main.rs\n"), "{out}");
 }
+
+#[test]
+fn only_the_final_turn_can_report_no_reply() {
+    let tmp = fixture();
+    let out = brief_of(
+        &tmp,
+        vec![
+            ("user", json!("deploy the egret service")),
+            (
+                "assistant",
+                json!("Deployed the egret service to staging and it is healthy."),
+            ),
+            ("user", json!("also run the load test")),
+            ("assistant", json!("API Error: 529 Overloaded.")),
+            ("user", json!("never mind, thanks")),
+            ("assistant", json!("No problem!")),
+        ],
+    );
+    assert!(
+        out.contains("Outcome: Deployed the egret service to staging and it is healthy."),
+        "{out}"
+    );
+}

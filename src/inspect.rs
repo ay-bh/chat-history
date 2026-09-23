@@ -212,17 +212,20 @@ impl TurnEnd {
 /// ("thanks" / "All set!") falls back to the result before it; a last
 /// request that got no reply says so instead of showing an older result.
 fn outcome(turns: &[TurnEnd]) -> String {
-    for t in turns.iter().rev() {
-        match t {
-            TurnEnd::Result(h) => return h.clone(),
-            TurnEnd::Short => continue,
-            TurnEnd::NoReply(Some(notice)) => {
-                return format!("no reply to the last request ({notice})");
-            }
-            TurnEnd::NoReply(None) => return "no reply to the last request".to_string(),
+    match turns.last() {
+        Some(TurnEnd::NoReply(Some(notice))) => {
+            format!("no reply to the last request ({notice})")
         }
+        Some(TurnEnd::NoReply(None)) => "no reply to the last request".to_string(),
+        _ => turns
+            .iter()
+            .rev()
+            .find_map(|t| match t {
+                TurnEnd::Result(h) => Some(h.clone()),
+                _ => None,
+            })
+            .unwrap_or_default(),
     }
-    String::new()
 }
 
 fn session_duration_minutes(timestamps: &[&str]) -> i64 {
