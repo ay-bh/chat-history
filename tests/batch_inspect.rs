@@ -212,6 +212,16 @@ fn brief_files_are_the_projects_not_the_agents() {
 #[test]
 fn brief_works_with_last() {
     let tmp = fixture();
+    // Sessions are dated by file time; make A clearly the older one.
+    fs::File::options()
+        .write(true)
+        .open(
+            tmp.path()
+                .join(format!(".claude/projects/-Users-test-proj/{ID_A}.jsonl")),
+        )
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(3600))
+        .unwrap();
     let out = stdout(&tmp, &["inspect", "--last", "--brief"]);
     assert!(
         out.contains("bbbbbbbb") && !out.contains("aaaaaaaa"),
