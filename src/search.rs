@@ -21,6 +21,9 @@ pub struct SearchResult {
     pub message: Message,
     /// Match-aware excerpt from the ranked passage, when the backend provides it.
     pub snippet: Option<String>,
+    /// Position of `message` in the parsed transcript, as `view --around`
+    /// takes it. None for title/prompt rows and session stubs.
+    pub ordinal: Option<usize>,
     /// Up to two further matches when the request groups by conversation.
     pub additional_matches: Vec<SearchMatch>,
 }
@@ -28,6 +31,7 @@ pub struct SearchResult {
 pub struct SearchMatch {
     pub message: Message,
     pub snippet: Option<String>,
+    pub ordinal: Option<usize>,
 }
 
 /// Preserve first-hit order while collapsing message results into conversations.
@@ -41,6 +45,7 @@ pub fn group_results(results: Vec<SearchResult>, limit: usize) -> Vec<SearchResu
                 grouped[index].additional_matches.push(SearchMatch {
                     message: hit.message,
                     snippet: hit.snippet,
+                    ordinal: hit.ordinal,
                 });
             }
         } else if grouped.len() < limit {
@@ -216,12 +221,17 @@ pub(crate) fn direct_session_search(
         let in_window = |ts: &str| {
             tf_cutoff.is_none_or(|cutoff| parse_any_timestamp(ts).is_some_and(|t| t >= cutoff))
         };
-        if let Some(mut msg) = messages.into_iter().find(|m| in_window(&m.timestamp)) {
+        if let Some((ordinal, mut msg)) = messages
+            .into_iter()
+            .enumerate()
+            .find(|(_, m)| in_window(&m.timestamp))
+        {
             msg.final_score = 100.0;
             return Some(vec![SearchResult {
                 session: s.clone(),
                 message: msg,
                 snippet: None,
+                ordinal: Some(ordinal),
                 additional_matches: Vec::new(),
             }]);
         }
@@ -252,6 +262,7 @@ pub(crate) fn direct_session_search(
                 session: s.clone(),
                 message: stub,
                 snippet: None,
+                ordinal: None,
                 additional_matches: Vec::new(),
             }]);
         }
@@ -317,42 +328,50 @@ pub fn scored_search(
 
     let use_similar = scope == "similar";
 
-    let candidates: Vec<(Session, Message, String)> = sessions
+    let candidates: Vec<(Session, Message, String, Option<usize>)> = sessions
         .par_iter()
         .filter(|s| !s.file.is_empty() && std::path::Path::new(&s.file).exists())
         .flat_map(|s| {
             // Recovered times feed recency scoring, so recover them for every
             // deep search: the same hit must score the same with and without
             // --timeframe.
-            let (mut messages, _) = parse_session_recovering_timestamps(s, false);
+            let (messages, _) = parse_session_recovering_timestamps(s, false);
             let title = s.summary.clone();
-            if !title.is_empty() && !messages.iter().any(|m| m.content == title) {
+            let mut messages: Vec<(Option<usize>, Message)> = messages
+                .into_iter()
+                .enumerate()
+                .map(|(i, m)| (Some(i), m))
+                .collect();
+            if !title.is_empty() && !messages.iter().any(|(_, m)| m.content == title) {
                 messages.insert(
                     0,
-                    Message {
-                        uuid: "index-title".into(),
-                        // The title entry carries the session's activity time
-                        // for every source (Cursor's own updatedAtMs for CLI
-                        // stores); message times come from the transcript.
-                        timestamp: if s.modified.is_empty() {
-                            s.created.clone()
-                        } else {
-                            s.modified.clone()
+                    (
+                        None,
+                        Message {
+                            uuid: "index-title".into(),
+                            // The title entry carries the session's activity time
+                            // for every source (Cursor's own updatedAtMs for CLI
+                            // stores); message times come from the transcript.
+                            timestamp: if s.modified.is_empty() {
+                                s.created.clone()
+                            } else {
+                                s.modified.clone()
+                            },
+                            role: "user".into(),
+                            content: title,
+                            session_id: s.id.clone(),
+                            project_path: s.project.clone(),
+                            tool_uses: Vec::new(),
+                            files_referenced: Vec::new(),
+                            error_patterns: Vec::new(),
+                            relevance_score: 0.0,
+                            final_score: 0.0,
                         },
-                        role: "user".into(),
-                        content: title,
-                        session_id: s.id.clone(),
-                        project_path: s.project.clone(),
-                        tool_uses: Vec::new(),
-                        files_referenced: Vec::new(),
-                        error_patterns: Vec::new(),
-                        relevance_score: 0.0,
-                        final_score: 0.0,
-                    },
+                    ),
                 );
             }
             let mut hits = Vec::new();
-            for mut msg in messages {
+            for (ordinal, mut msg) in messages {
                 let cl = msg.content_lower();
                 if is_noise(&cl) {
                     continue;
@@ -395,15 +414,15 @@ pub fn scored_search(
                 }
                 msg.session_id = s.id.clone();
                 msg.project_path = s.project.clone();
-                hits.push((s.clone(), msg, cl));
+                hits.push((s.clone(), msg, cl, ordinal));
             }
             hits
         })
         .collect();
 
-    let mut results: Vec<(Session, Message)> = candidates
+    let mut results: Vec<(Session, Message, Option<usize>)> = candidates
         .into_iter()
-        .map(|(s, mut msg, cl)| {
+        .map(|(s, mut msg, cl, ordinal)| {
             let mut score = msg.relevance_score;
             let match_count = query_terms
                 .iter()
@@ -412,7 +431,7 @@ pub fn scored_search(
 
             if query_terms.len() >= 2 && score == 0.0 && match_count == 0 {
                 msg.final_score = 0.0;
-                return (s, msg);
+                return (s, msg, ordinal);
             }
 
             if match_count == 0 {
@@ -483,58 +502,61 @@ pub fn scored_search(
 
             score *= boost.min(MAX_TOTAL_BOOST);
             msg.final_score = score;
-            (s, msg)
+            (s, msg, ordinal)
         })
         .collect();
 
     // Deduplicate
     let mut seen: HashMap<String, usize> = HashMap::new();
-    let mut deduped: Vec<(Session, Message)> = Vec::new();
+    let mut deduped: Vec<(Session, Message, Option<usize>)> = Vec::new();
     results.sort_by(|a, b| {
         b.1.final_score
             .partial_cmp(&a.1.final_score)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-    for (s, msg) in results {
+    for (s, msg, ordinal) in results {
         if msg.final_score <= 0.0 {
             continue;
         }
         let sig = content_signature(&msg.content, &msg.tool_uses, &msg.files_referenced);
         if let Some(idx) = seen.get(&sig) {
             if msg.final_score > deduped[*idx].1.final_score {
-                deduped[*idx] = (s, msg);
+                deduped[*idx] = (s, msg, ordinal);
             }
         } else {
             seen.insert(sig, deduped.len());
-            deduped.push((s, msg));
+            deduped.push((s, msg, ordinal));
         }
     }
 
     // Per-session cap
     let mut session_counts: HashMap<String, usize> = HashMap::new();
     let mut capped = Vec::new();
-    for (s, m) in deduped {
+    for (s, m, o) in deduped {
         let count = session_counts.entry(s.id.clone()).or_insert(0);
         if *count < MAX_MATCHES_PER_SESSION {
             *count += 1;
-            capped.push((s, m));
+            capped.push((s, m, o));
         }
     }
 
     // Quality gate with fallback (matches Python behavior)
-    let quality: Vec<(Session, Message)> = capped
+    let quality: Vec<(Session, Message, Option<usize>)> = capped
         .iter()
-        .filter(|(_, m)| m.final_score >= 0.5 && (m.content.len() >= 40 || m.uuid == "index-title"))
+        .filter(|(_, m, _)| {
+            m.final_score >= 0.5 && (m.content.len() >= 40 || m.uuid == "index-title")
+        })
         .cloned()
         .collect();
     let mut final_results = if quality.is_empty() { capped } else { quality };
     final_results.truncate(limit);
     final_results
         .into_iter()
-        .map(|(session, message)| SearchResult {
+        .map(|(session, message, ordinal)| SearchResult {
             session,
             message,
             snippet: None,
+            ordinal,
             additional_matches: Vec::new(),
         })
         .collect()

@@ -342,9 +342,10 @@ pub fn print_search_results(results: &[SearchResult], query: &str) {
         print_title_line(&title, &r.session);
         let snippet = usable_search_snippet(r.snippet.as_deref(), &r.message.content, query, 200);
         println!(
-            "        {}: {}",
+            "        {}: {}{}",
             role_str,
-            format_search_preview(&snippet, query)
+            format_search_preview(&snippet, query),
+            ordinal_tag(r.ordinal)
         );
         print_hit_details(&r.message, "       ");
         for other in &r.additional_matches {
@@ -356,13 +357,21 @@ pub fn print_search_results(results: &[SearchResult], query: &str) {
             let snippet =
                 usable_search_snippet(other.snippet.as_deref(), &other.message.content, query, 200);
             println!(
-                "          also {role}: {}",
-                format_search_preview(&snippet, query)
+                "          also {role}: {}{}",
+                format_search_preview(&snippet, query),
+                ordinal_tag(other.ordinal)
             );
             print_hit_details(&other.message, "            ");
         }
         println!();
     }
+}
+
+/// `  #12` after a hit's excerpt: the message position `view --around` takes.
+fn ordinal_tag(ordinal: Option<usize>) -> String {
+    ordinal
+        .map(|o| format!("  {}#{o}{}", c!("dim"), c!("reset")))
+        .unwrap_or_default()
 }
 
 fn usable_search_snippet(
@@ -467,12 +476,16 @@ pub fn print_search_results_json(results: &[SearchResult], query: &str) {
                 "project": r.session.project,
                 "score": r.message.final_score,
                 "role": r.message.role,
+                "ordinal": r.ordinal,
+                "timestamp": r.message.timestamp,
                 "snippet": usable_search_snippet(r.snippet.as_deref(), &r.message.content, query, 300),
                 "tools": r.message.tool_uses,
                 "files": r.message.files_referenced,
                 "additional_matches": r.additional_matches.iter().map(|hit| serde_json::json!({
                     "score": hit.message.final_score,
                     "role": hit.message.role,
+                    "ordinal": hit.ordinal,
+                    "timestamp": hit.message.timestamp,
                     "snippet": usable_search_snippet(hit.snippet.as_deref(), &hit.message.content, query, 300),
                     "tools": hit.message.tool_uses,
                     "files": hit.message.files_referenced,
@@ -620,7 +633,12 @@ pub fn print_inspect(info: &InspectInfo) {
     }
 }
 
-pub fn print_transcript(messages: &[Message], session: &Session, show_tools: bool) {
+pub fn print_transcript(
+    messages: &[Message],
+    session: &Session,
+    show_tools: bool,
+    opts: &ViewOptions,
+) {
     let tag = src_tag(&session.source, session.also_ide);
     let cleaned = title_of(&session.summary, &session.first_prompt, 120);
     let summary = if cleaned == "(untitled)" {
@@ -657,11 +675,26 @@ pub fn print_transcript(messages: &[Message], session: &Session, show_tools: boo
         );
         return;
     }
-    for msg in messages {
-        if msg.role == "user" {
-            println!("{}{}▌ You{}", c!("green"), c!("bold"), c!("reset"));
+    for slot in opts.slots(messages) {
+        let Slot::Message(ordinal) = slot else {
+            println!("  {}…{}\n", c!("dim"), c!("reset"));
+            continue;
+        };
+        let msg = &messages[ordinal];
+        let number = if opts.numbered() {
+            format!("  {}#{ordinal}{}", c!("dim"), c!("reset"))
         } else {
-            println!("{}{}▌ Assistant{}", c!("blue"), c!("bold"), c!("reset"));
+            String::new()
+        };
+        if msg.role == "user" {
+            println!("{}{}▌ You{}{number}", c!("green"), c!("bold"), c!("reset"));
+        } else {
+            println!(
+                "{}{}▌ Assistant{}{number}",
+                c!("blue"),
+                c!("bold"),
+                c!("reset")
+            );
         }
         if show_tools && !msg.tool_uses.is_empty() {
             println!(
@@ -671,11 +704,7 @@ pub fn print_transcript(messages: &[Message], session: &Session, show_tools: boo
                 c!("reset")
             );
         }
-        let text = tty(&if msg.role == "user" {
-            clean_prompt(&msg.content)
-        } else {
-            msg.content.clone()
-        });
+        let text = tty(&opts.clip(&view_text(msg)));
         for line in text.lines() {
             println!("  {line}");
         }
@@ -683,17 +712,152 @@ pub fn print_transcript(messages: &[Message], session: &Session, show_tools: boo
     }
 }
 
-pub fn print_plain(messages: &[Message]) {
-    for msg in messages {
+pub fn print_plain(messages: &[Message], opts: &ViewOptions) {
+    for slot in opts.slots(messages) {
+        let Slot::Message(ordinal) = slot else {
+            println!("…\n");
+            continue;
+        };
+        let msg = &messages[ordinal];
         let role = if msg.role == "user" { "You" } else { "Claude" };
-        let text = tty(&if msg.role == "user" {
-            clean_prompt(&msg.content)
-        } else {
-            msg.content.clone()
-        });
+        let text = tty(&opts.clip(&view_text(msg)));
         if !text.trim().is_empty() {
-            println!("{role}: {text}\n");
+            if opts.numbered() {
+                println!("[#{ordinal}] {role}: {text}\n");
+            } else {
+                println!("{role}: {text}\n");
+            }
         }
+    }
+}
+
+/// The text `view` shows for a message (and `--grep` matches against).
+fn view_text(msg: &Message) -> String {
+    if msg.role == "user" {
+        clean_prompt(&msg.content)
+    } else {
+        msg.content.clone()
+    }
+}
+
+/// Which messages `view` prints. Ordinals are positions in the parsed
+/// transcript, the same numbers search hits report, so an agent can read a
+/// bounded slice around a hit instead of piping the whole transcript.
+#[derive(Default)]
+pub struct ViewOptions {
+    pub around: Option<usize>,
+    /// Messages on each side; defaults to 2 for --around and 0 for --grep.
+    pub context: Option<usize>,
+    pub grep: Option<regex::Regex>,
+    pub head: Option<usize>,
+    pub tail: Option<usize>,
+    pub number: bool,
+    pub max_chars: Option<usize>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum Slot {
+    Message(usize),
+    /// Messages were skipped between the neighbouring slots.
+    Gap,
+}
+
+impl ViewOptions {
+    fn bounded(&self) -> bool {
+        self.around.is_some() || self.grep.is_some() || self.head.is_some() || self.tail.is_some()
+    }
+
+    /// Numbering is opt-in for a full view (scripts parse today's format)
+    /// and always on for a bounded one, whose output is new.
+    pub fn numbered(&self) -> bool {
+        self.number || self.bounded()
+    }
+
+    /// Rejects an ordinal the transcript does not have, naming the valid range.
+    pub fn check(&self, messages: &[Message]) -> Result<(), String> {
+        match self.around {
+            Some(n) if messages.is_empty() => Err(format!(
+                "message #{n} does not exist; this transcript has no messages"
+            )),
+            Some(n) if n >= messages.len() => Err(format!(
+                "message #{n} does not exist; this transcript has messages 0..={}",
+                messages.len() - 1
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    pub fn slots(&self, messages: &[Message]) -> Vec<Slot> {
+        let len = messages.len();
+        let context = self
+            .context
+            .unwrap_or(if self.around.is_some() { 2 } else { 0 });
+        let window = |n: usize| n.saturating_sub(context)..=(n + context).min(len - 1);
+        let mut picked: Vec<usize> = if let Some(n) = self.around.filter(|&n| n < len) {
+            window(n).collect()
+        } else if let Some(pattern) = &self.grep {
+            let mut keep = vec![false; len];
+            for (i, msg) in messages.iter().enumerate() {
+                if pattern.is_match(&view_text(msg)) {
+                    for j in window(i) {
+                        keep[j] = true;
+                    }
+                }
+            }
+            (0..len).filter(|&i| keep[i]).collect()
+        } else if self.around.is_some() {
+            Vec::new()
+        } else {
+            (0..len).collect()
+        };
+        if let Some(n) = self.head {
+            picked.truncate(n);
+        }
+        if let Some(n) = self.tail {
+            picked.drain(..picked.len().saturating_sub(n));
+        }
+        let mut slots = Vec::with_capacity(picked.len());
+        for (k, &i) in picked.iter().enumerate() {
+            if k > 0 && picked[k - 1] + 1 != i {
+                slots.push(Slot::Gap);
+            }
+            slots.push(Slot::Message(i));
+        }
+        slots
+    }
+
+    /// Cuts a message to `max_chars` characters and says how much was left
+    /// out. With --grep the kept window starts a little before the first
+    /// match, so a match deep inside a long message is not cut away.
+    fn clip(&self, text: &str) -> String {
+        let Some(max) = self.max_chars else {
+            return text.to_owned();
+        };
+        let total = text.chars().count();
+        if total <= max {
+            return text.to_owned();
+        }
+        let first_match = self
+            .grep
+            .as_ref()
+            .and_then(|pattern| pattern.find(text))
+            .map(|m| text[..m.start()].chars().count());
+        let start = first_match
+            .map(|at| at.saturating_sub(max / 4).min(total - max))
+            .unwrap_or(0);
+        let kept: String = text.chars().skip(start).take(max).collect();
+        let before = if start > 0 {
+            format!("[-{start} chars] … ")
+        } else {
+            String::new()
+        };
+        let rest = total - start - max;
+        let after = if rest > 0 {
+            format!(" … [+{rest} chars]")
+        } else {
+            String::new()
+        };
+        format!("{before}{kept}{after}")
     }
 }
 

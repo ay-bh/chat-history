@@ -84,6 +84,9 @@ chat-history inspect <partial-uuid>
 # Read / export / resume / locate
 chat-history view --last --plain
 chat-history view <id> --tools
+chat-history view <id> --plain --around 42        # a search hit's ordinal ± 2 messages
+chat-history view <id> --plain --grep "cloudflare|dns" --max-chars 600 --head 12
+chat-history view <id> --plain --tail 6
 chat-history export <id> -o session.md
 chat-history resume <id>                  # Claude / Codex / Cursor chats with a CLI store; others print a hint
 chat-history find <id>                    # absolute path for further tooling
@@ -129,7 +132,7 @@ Date formats: `YYYY-MM-DD`, `today`, `yesterday`, `"3 days ago"`, `"last week"`,
 | `--rebuild-index` | Reparse all sessions into the BM25 index. |
 | `--cache-dir PATH` / `--no-cache` | Store the BM25 index elsewhere, or build it in memory for this search. |
 
-All JSON output uses a `{ "query", "count", "results" }` envelope. BM25 and legacy deep-search result items include `session_id`, `source`, `also_ide`, `date`, `summary`, `project`, `score`, `role`, `snippet`, `tools`, and `files`. Legacy metadata-index result items include `matched_field` instead of `role`, `tools`, and `files`, and the envelope includes `"search_type": "index"`. Items also carry `metadata_only`, true for Cursor CLI sessions without a readable transcript.
+All JSON output uses a `{ "query", "count", "results" }` envelope. BM25 and legacy deep-search result items include `session_id`, `source`, `also_ide`, `date`, `summary`, `project`, `score`, `role`, `ordinal`, `timestamp`, `snippet`, `tools`, and `files` (`additional_matches` items carry `ordinal` and `timestamp` too). `ordinal` is the message's position in the transcript — pass it to `view <id> --around <ordinal>` — and is `null` for title and first-prompt matches. Legacy metadata-index result items include `matched_field` instead of `role`, `tools`, and `files`, and the envelope includes `"search_type": "index"`. Items also carry `metadata_only`, true for Cursor CLI sessions without a readable transcript.
 
 Scopes: `all` (default), `errors`, `similar`, `tools`, `files`. Use `--timeframe today|week|month|Nd` and `--limit N` (default 15) to constrain results.
 
