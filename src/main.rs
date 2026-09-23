@@ -674,6 +674,10 @@ fn main() {
                     pattern.as_str(),
                     messages.len()
                 );
+                // Scripts still get a document to parse, with no messages.
+                if json_output {
+                    display::print_view_json(&messages, session, &opts);
+                }
                 return;
             }
             if json_output {

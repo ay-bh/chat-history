@@ -264,3 +264,12 @@ fn view_json_and_plain_cannot_be_combined() {
         .unwrap();
     assert!(!out.status.success());
 }
+
+#[test]
+fn view_json_with_no_grep_match_is_still_json() {
+    let tmp = fixture();
+    let out = stdout(&tmp, &["view", "aaaaaaaa", "--json", "--grep", "albatross"]);
+    let json: Value = serde_json::from_str(&out).expect("valid JSON");
+    assert_eq!(json["messages"], json!([]), "{json}");
+    assert_eq!(json["message_count"], 6);
+}

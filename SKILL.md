@@ -19,7 +19,7 @@ Search, inspect, and export Claude Code, Cursor, and Codex conversation history.
 **Keyword question** ("find that conversation where I..."):
 
 1. `chat-history search "<query>" --compact` — one line per conversation: short id, date, source, directory, `#ordinal` of the best match (`-` for a title or first-prompt match), title, then `—  Role: excerpt` and `(also #a #b)` for its other matches. Role is `You` (the person), `Assistant` or `Tool` (command output or file contents). BM25 searches metadata and transcripts together (`--deep` is not needed). Use `--json` instead only when a script parses the results: each hit then carries `session_id`, `score`, `snippet`, `role`, `ordinal`, `timestamp`, `tools`, `files`, and `additional_matches` with the same message fields.
-2. Shortlist by snippet, not by raw score (see "Choosing the best hit").
+2. Shortlist by title and excerpt (see "Choosing the best hit").
 3. Read the hit in context, not the whole transcript: `chat-history view <id> --plain --around <ordinal>` (2 messages each side; `-C N` to widen, `--max-chars 1500` to cap long messages), or `--around` one of the `also` ordinals. A title/prompt match has no ordinal — use `inspect` for those. `view --json` gives the same selection as data for scripts.
 4. To find something inside one session, use `chat-history view <id> --plain --grep "<regex>" --max-chars 600 --head 12` instead of piping `view` through `grep`/`sed`/`head`. To read just the conversation, add `--role user,assistant` (tool output is most of a transcript); `--role user` lists what the person asked.
 5. `chat-history inspect <id> <id> <id> --brief` on the top 2–3 candidates to confirm before answering: one call, a few lines each (what was asked, the latest substantive result, files it read or edited — the project's first). Drop `--brief` for one session's full detail. Full `view` / `export` only if the user needs the whole conversation.
@@ -33,8 +33,8 @@ Search, inspect, and export Claude Code, Cursor, and Codex conversation history.
 
 ## Choosing the best hit
 
-- Scores rank lexical relevance (BM25 by default), not intent. They are not confidence values or comparable across queries or engines. Use scores only to shortlist; decide from snippets and `inspect`.
-- BM25 groups matches by conversation: `--limit` counts conversations, `snippet` follows the strongest matching passage, and `additional_matches` contains up to two more excerpts. Read these before inspecting the session. Use `--group-by message` if individual matching messages are needed; legacy and `--scope similar` retain their previous message-row default.
+- Results are ranked by lexical relevance (BM25 by default), not intent. `--json` scores are not confidence values or comparable across queries or engines. Use the order only to shortlist; decide from excerpts and `inspect`.
+- BM25 groups matches by conversation: `--limit` counts conversations, the excerpt follows the strongest matching passage, and `(also #a #b)` names up to two more matching messages — read them with `view --around` before inspecting the session (`--json` includes their excerpts under `additional_matches`). Use `--group-by message` if individual matching messages are needed; legacy and `--scope similar` retain their previous message-row default.
 - Search leaves out the conversation you are running in (Claude Code, Codex and Cursor's agent tell it which one), since it would match its own query. Searching for its full UUID still finds it.
 - Tool output (`role: tool`) ranks below conversation text with the same words; chat-history's own output is never indexed.
 - When candidates are close, `inspect` them together (`inspect a b c --brief`) before picking — don't answer from the top score alone, and don't loop over ids in the shell.
