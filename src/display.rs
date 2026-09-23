@@ -525,6 +525,80 @@ pub fn print_index_results_json(results: &[IndexResult], query: &str) {
     println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
 }
 
+/// A few lines per session, for comparing search candidates: where and when,
+/// the title, what was asked, the latest substantive result, and the first
+/// files it read or edited.
+pub fn print_inspect_brief(info: &InspectInfo) {
+    let tag = src_tag(&info.source, info.also_ide);
+    let short: String = info.session_id.chars().take(8).collect();
+    let cwd = if info.project.is_empty() {
+        "-".to_string()
+    } else {
+        tty(&abbreviate_home(&info.project))
+    };
+    println!(
+        "{tag}  {}{}{}  {}  {cwd}  {}min  {} msgs",
+        c!("bold"),
+        tty(&short),
+        c!("reset"),
+        tty(&info.date),
+        info.duration_minutes,
+        info.message_count
+    );
+    let title = tty(&display_title(&info.summary, 120));
+    let asked = tty(&info.asked);
+    // A title that is just the first prompt would repeat the Asked line.
+    if !title.is_empty() && !asked.starts_with(title.trim_end_matches('…')) {
+        println!("  {title}");
+    }
+    if !asked.is_empty() {
+        println!("  Asked: {asked}");
+    }
+    if !info.outcome.is_empty() {
+        println!("  Outcome: {}", tty(&info.outcome));
+    }
+    // Files the session read or edited, the project's first and relative to
+    // its directory. Agents also read their
+    // own skills and tool logs and write scratch files, which say nothing
+    // about the work.
+    let root = format!("{}/", info.project.trim_end_matches('/'));
+    let files: Vec<&String> = info
+        .files_modified
+        .iter()
+        .filter(|f| {
+            let in_project = !info.project.is_empty() && f.starts_with(&root);
+            f.trim_end_matches('/') != info.project.trim_end_matches('/')
+                && (in_project
+                    || !["/tmp/", "/private/tmp/", "/private/var/", "/var/folders/"]
+                        .iter()
+                        .any(|dir| f.starts_with(dir)))
+                && !["/.claude/", "/.cursor/", "/.codex/", "/.agents/"]
+                    .iter()
+                    .any(|dir| f.contains(dir))
+        })
+        .collect();
+    if !files.is_empty() {
+        let mut files = files;
+        // Files inside the project first; the sort is stable within each group.
+        files.sort_by_key(|f| info.project.is_empty() || !f.starts_with(&root));
+        let shown: Vec<String> = files
+            .iter()
+            .take(5)
+            .map(|f| match f.strip_prefix(&root) {
+                Some(rel) if !info.project.is_empty() => tty(rel),
+                _ => tty(&abbreviate_home(f)),
+            })
+            .collect();
+        let more = files.len().saturating_sub(shown.len());
+        let more = if more > 0 {
+            format!(" (+{more} more)")
+        } else {
+            String::new()
+        };
+        println!("  Files: {}{more}", shown.join(", "));
+    }
+}
+
 pub fn print_inspect(info: &InspectInfo) {
     let tag = src_tag(&info.source, info.also_ide);
     let cleaned = tty(&display_title(&info.summary, 120));
@@ -600,8 +674,11 @@ pub fn print_inspect(info: &InspectInfo) {
             c!("bold"),
             c!("reset")
         );
-        for f in &info.files_modified {
+        for f in info.files_modified.iter().take(20) {
             println!("    • {}", tty(&abbreviate_home(f)));
+        }
+        if info.files_modified.len() > 20 {
+            println!("    … {} more", info.files_modified.len() - 20);
         }
         println!();
     }

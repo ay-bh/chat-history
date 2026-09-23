@@ -80,6 +80,7 @@ chat-history search <full-uuid> --json          # with --timeframe: only if the 
 # Summarize a session
 chat-history inspect --last
 chat-history inspect <partial-uuid>
+chat-history inspect <id> <id> --brief   # several sessions, a few lines each
 
 # Read / export / resume / locate
 chat-history view --last --plain
@@ -161,7 +162,7 @@ Example (`--engine legacy` metadata search, not `--json`):
 - Title / match text is on the following indented line
 - `★ N.N` = relevance (higher is better)
 - `INDEX_FIELD:` is `summary`, `first_prompt`, or `branch`
-- `inspect` → duration, messages, model, tokens, tools, files, accomplishments, key decisions
+- `inspect` → duration, messages, model, tokens, tools, files, accomplishments (the first informative sentence of the reply that ended each turn), key decisions. It takes several ids; `--brief` prints each as a header, what was asked, its latest substantive result (the last reply with an informative sentence, so a closing "All set" does not hide it), and up to five files it read or edited, the project's first (agent config and scratch files left out). Files come from tool calls, so a listed file was not necessarily changed
 - Claude Code titles come from `ai-title` / `custom-title` JSONL when available
 - Subagent/sidechain sessions are omitted unless `--sidechains`; this includes Cursor transcripts under `agent-transcripts/*/subagents/` (tagged `[subagent]`)
 - Codex commentary-phase messages are hidden once a turn has a final answer; interrupted turns keep commentary
