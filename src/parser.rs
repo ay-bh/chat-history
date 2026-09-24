@@ -76,9 +76,64 @@ fn truncate_for_search(s: &str, max: usize) -> String {
 }
 
 /// Words that run the word after them as the command.
-const COMMAND_WRAPPERS: &[&str] = &["time", "command", "exec", "env", "nohup", "sudo"];
+const COMMAND_WRAPPERS: &[&str] = &[
+    "time", "command", "exec", "env", "nohup", "sudo", "nice", "timeout",
+];
 /// Shell keywords that a command follows (`for …; do chat-history …`).
 const SHELL_KEYWORDS: &[&str] = &["do", "then", "else", "elif", "if", "while", "until", "!"];
+/// Where the next word falls in a simple command.
+#[derive(Clone, Copy)]
+enum Position {
+    /// The word names the command.
+    Command,
+    /// The word follows a wrapper and may be one of its options (`sudo -u me ch …`).
+    Wrapped(Wrapper),
+    /// The command is already named; the word is an argument.
+    Argument,
+}
+
+#[derive(Clone, Copy)]
+struct Wrapper {
+    name: &'static str,
+    /// The previous word was an option that takes a separate value.
+    value_next: bool,
+    /// `timeout` takes a duration before the command.
+    duration_seen: bool,
+}
+
+/// Wrapper options whose value is the next word (`nice -n 10`).
+fn wrapper_option_takes_value(wrapper: &str, option: &str) -> bool {
+    match wrapper {
+        "sudo" => matches!(
+            option,
+            "-u" | "-g"
+                | "-p"
+                | "-C"
+                | "-D"
+                | "-r"
+                | "-t"
+                | "-U"
+                | "-T"
+                | "-R"
+                | "--user"
+                | "--group"
+                | "--prompt"
+                | "--close-from"
+                | "--chdir"
+                | "--role"
+                | "--type"
+                | "--other-user"
+                | "--command-timeout"
+                | "--chroot"
+        ),
+        "env" => matches!(option, "-u" | "-C" | "--unset" | "--chdir"),
+        "nice" => matches!(option, "-n" | "--adjustment"),
+        "timeout" => matches!(option, "-s" | "-k" | "--signal" | "--kill-after"),
+        "time" => matches!(option, "-f" | "-o" | "--format" | "--output"),
+        "exec" => option == "-a",
+        _ => false,
+    }
+}
 static EMBEDDED_COMMAND_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"\b(?:cmd|command)["']?\s*:\s*([`"'])"#).unwrap());
 
@@ -141,7 +196,7 @@ fn shell_runs_history(command: &str) -> bool {
     fn first_word_is_history(
         word: &mut String,
         word_quoted: &mut bool,
-        command_position: &mut bool,
+        position: &mut Position,
         shell_launcher: &mut bool,
         script_next: &mut bool,
         redirect_target_next: &mut bool,
@@ -175,7 +230,7 @@ fn shell_runs_history(command: &str) -> bool {
             *shell_launcher = false;
             return false;
         }
-        if !*command_position {
+        if matches!(position, Position::Argument) {
             // A shell given a script path (or -c above) does not execute its
             // standard input as a script.
             if *shell_launcher && !token.starts_with('-') {
@@ -183,13 +238,36 @@ fn shell_runs_history(command: &str) -> bool {
             }
             return false;
         }
-        if token.contains('=')
-            || COMMAND_WRAPPERS.contains(&token.as_str())
-            || SHELL_KEYWORDS.contains(&token.as_str())
-        {
+        if let Position::Wrapped(active) = position {
+            if std::mem::take(&mut active.value_next) {
+                return false;
+            }
+            // `command -v ch` looks the command up without running it.
+            if active.name == "command" && matches!(token.as_str(), "-v" | "-V") {
+                *position = Position::Argument;
+                return false;
+            }
+            if token.len() > 1 && token.starts_with('-') {
+                active.value_next = wrapper_option_takes_value(active.name, &token);
+                return false;
+            }
+            if active.name == "timeout" && !active.duration_seen {
+                active.duration_seen = true;
+                return false;
+            }
+        }
+        if let Some(&name) = COMMAND_WRAPPERS.iter().find(|&&w| w == token) {
+            *position = Position::Wrapped(Wrapper {
+                name,
+                value_next: false,
+                duration_seen: false,
+            });
             return false;
         }
-        *command_position = false;
+        if token.contains('=') || SHELL_KEYWORDS.contains(&token.as_str()) {
+            return false;
+        }
+        *position = Position::Argument;
         let basename = token.rsplit('/').next();
         *shell_launcher = matches!(basename, Some("bash" | "sh" | "zsh"));
         matches!(basename, Some("chat-history" | "ch"))
@@ -197,7 +275,7 @@ fn shell_runs_history(command: &str) -> bool {
 
     let mut word = String::new();
     let mut word_quoted = false;
-    let mut command_position = true;
+    let mut position = Position::Command;
     let mut shell_launcher = false;
     let mut script_next = false;
     let mut quote = None;
@@ -254,7 +332,7 @@ fn shell_runs_history(command: &str) -> bool {
                         if first_word_is_history(
                             &mut word,
                             &mut word_quoted,
-                            &mut command_position,
+                            &mut position,
                             &mut shell_launcher,
                             &mut script_next,
                             &mut redirect_target_next,
@@ -274,7 +352,7 @@ fn shell_runs_history(command: &str) -> bool {
                     if first_word_is_history(
                         &mut word,
                         &mut word_quoted,
-                        &mut command_position,
+                        &mut position,
                         &mut shell_launcher,
                         &mut script_next,
                         &mut redirect_target_next,
@@ -283,7 +361,7 @@ fn shell_runs_history(command: &str) -> bool {
                         return true;
                     }
                     mark_shell_input(&mut heredocs, &mut stdin_heredoc, shell_launcher);
-                    command_position = true;
+                    position = Position::Command;
                     shell_launcher = false;
                     script_next = false;
                     redirect_target_next = false;
@@ -302,7 +380,7 @@ fn shell_runs_history(command: &str) -> bool {
                     if first_word_is_history(
                         &mut word,
                         &mut word_quoted,
-                        &mut command_position,
+                        &mut position,
                         &mut shell_launcher,
                         &mut script_next,
                         &mut redirect_target_next,
@@ -311,7 +389,7 @@ fn shell_runs_history(command: &str) -> bool {
                         return true;
                     }
                     mark_shell_input(&mut heredocs, &mut stdin_heredoc, shell_launcher);
-                    command_position = true;
+                    position = Position::Command;
                     shell_launcher = false;
                     script_next = false;
                     redirect_target_next = false;
@@ -332,7 +410,7 @@ fn shell_runs_history(command: &str) -> bool {
                     if first_word_is_history(
                         &mut word,
                         &mut word_quoted,
-                        &mut command_position,
+                        &mut position,
                         &mut shell_launcher,
                         &mut script_next,
                         &mut redirect_target_next,
@@ -348,7 +426,7 @@ fn shell_runs_history(command: &str) -> bool {
     first_word_is_history(
         &mut word,
         &mut word_quoted,
-        &mut command_position,
+        &mut position,
         &mut shell_launcher,
         &mut script_next,
         &mut redirect_target_next,
@@ -1006,6 +1084,37 @@ mod tests {
             "./target/release/chat-history-bounded search q",
             "python3 compare.py",
             "echo ch",
+        ] {
+            assert!(!is_history_command(cmd), "{cmd}");
+        }
+    }
+
+    #[test]
+    fn wrapper_options_and_operands_precede_the_command() {
+        for cmd in [
+            "sudo -E chat-history search q",
+            "sudo -u me ch view id",
+            "sudo --user=me -- ch view id",
+            "timeout 60 chat-history search q",
+            "timeout -s KILL 5s ch search q",
+            "timeout --kill-after=2 10 ch search q",
+            "nice -n 10 chat-history search q",
+            "nice -5 ch search q",
+            "env -u HOME CHAT_HISTORY_NO_CACHE=1 ch search q",
+            "time -p ch search q",
+            "exec -a name chat-history search q",
+            "nohup nice -n 5 timeout 30 ch search q",
+            "cd /tmp && timeout 60 ch search q",
+        ] {
+            assert!(is_history_command(cmd), "{cmd}");
+        }
+        for cmd in [
+            "command -v chat-history",
+            "command -V ch",
+            "timeout 60 rg chat-history README.md",
+            "nice -n 10 cargo test chat-history",
+            "sudo -u ch ls",
+            "timeout ch",
         ] {
             assert!(!is_history_command(cmd), "{cmd}");
         }
