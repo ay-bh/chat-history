@@ -54,8 +54,9 @@ The code lives in `src/search_index.rs` (index and BM25 retrieval) and
   `SearchMatch` children. Renderers keep a fallback path for results without
   an excerpt, which `--scope similar` produces.
 
-Two operations bypass BM25. Exact session UUID lookup runs before indexing; a UUID absent from the selected sessions falls through
-to a literal token-sequence search. `--scope similar` keeps the old user-message
+Two operations bypass BM25. Exact session UUID lookup runs before indexing; a
+UUID absent from the selected sessions falls through to a literal
+token-sequence search. `--scope similar` keeps the old user-message
 similarity calculation so the meaning of that option does not change.
 
 ## Storage
@@ -176,8 +177,8 @@ multi-chunk queries and come from separate match sets, so partial matches stay
 eligible. These weights are explicit initial policy, not learned or proven
 optimal. Newer timestamps break equal scores, then stable session and ordinal
 order. JSON preserves the score without rounding tiny values to zero. Scores
-are ranking signals, not probabilities, and are not comparable across engines
-or queries.
+are ranking signals, not probabilities, and are not comparable across
+queries.
 
 **Tool-output weight.** Chosen on 185 real agent searches whose relevant
 sessions were the ones the agent opened next. At weight 1 indexing Codex tool
@@ -237,8 +238,9 @@ readable IDE rows, which requires a separate cached Agent membership discovery.
 ## Compatibility
 
 - BM25 is the only engine. `--deep` and `--engine bm25` are still accepted,
-  hidden, and ignored; `--engine legacy` exits with a usage error that says the
-  engine was removed. `CHAT_HISTORY_SEARCH_ENGINE` is ignored.
+  hidden, and ignored; any other `--engine` value exits with a usage error that
+  says the engine was removed. Any other `CHAT_HISTORY_SEARCH_ENGINE` value is
+  ignored with a warning.
 - JSON always includes the former deep-search result fields. Message results
   expose `additional_matches`; ungrouped rows use an empty array.
   `CHAT_HISTORY_SEARCH_GROUP_BY` controls grouping, with an explicit flag taking
@@ -296,7 +298,7 @@ codes, acronyms, Unicode accents, separator normalization, multiple terms and
 prefixes. It asserts intended behavior, not relevance on real histories:
 
 ```sh
-cargo test --test search_bm25 judged_query_fixture -- --nocapture
+cargo test --test search_bm25 judged_query_fixture
 ```
 
 A synthetic benchmark builds 250 sessions and 5,000 messages in a temporary

@@ -158,7 +158,8 @@ pub(crate) fn direct_session_search(
 }
 
 /// `--scope similar`: user messages (and titles) ranked by word overlap with
-/// the query, then boosted and deduplicated.
+/// the query, then boosted and deduplicated. Callers resolve direct session
+/// lookups first.
 pub fn similar_search(
     sessions: &[Session],
     query: &str,
@@ -167,9 +168,6 @@ pub fn similar_search(
 ) -> Vec<SearchResult> {
     if limit == 0 {
         return Vec::new();
-    }
-    if let Some(results) = direct_session_search(sessions, query, timeframe) {
-        return results;
     }
     let tf_cutoff = timeframe.and_then(timeframe_cutoff_fixed);
 
@@ -275,11 +273,6 @@ pub fn similar_search(
                 .filter(|t| cl.contains(t.as_str()))
                 .count();
 
-            if query_terms.len() >= 2 && score == 0.0 && match_count == 0 {
-                msg.final_score = 0.0;
-                return (s, msg, ordinal);
-            }
-
             if match_count == 0 {
                 score *= 0.1;
             }
@@ -339,11 +332,6 @@ pub fn similar_search(
             }
             if !msg.error_patterns.is_empty() {
                 boost *= 1.4;
-            }
-            if msg.role == "assistant"
-                && (cl.contains("solution") || cl.contains("fixed") || cl.contains("resolved"))
-            {
-                boost *= 1.6;
             }
 
             score *= boost.min(MAX_TOTAL_BOOST);
@@ -448,8 +436,7 @@ mod tests {
         boost *= 1.3; // tool_uses
         boost *= 1.2; // files_referenced
         boost *= 1.4; // error_patterns
-        boost *= 1.6; // solution words
-        // Uncapped would be ~118x
+        // Uncapped would be ~74x
         assert!(
             boost > MAX_TOTAL_BOOST,
             "uncapped boost should exceed limit"

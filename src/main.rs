@@ -120,7 +120,7 @@ enum Commands {
         #[arg(long, hide = true)]
         deep: bool,
         /// Removed: BM25 is the only engine. `bm25` is still accepted
-        #[arg(long, hide = true, value_parser = ["bm25", "legacy"])]
+        #[arg(long, hide = true)]
         engine: Option<String>,
         /// Group hits by session or message (defaults to session; similar to message)
         #[arg(long, env = "CHAT_HISTORY_SEARCH_GROUP_BY", value_parser = ["session", "message"])]
@@ -384,16 +384,18 @@ fn main() {
 
     let cli = Cli::parse();
 
-    if let Some(Commands::Search {
-        engine: Some(engine),
-        ..
-    }) = &cli.command
-        && engine == "legacy"
-    {
-        eprintln!(
-            "error: the legacy search engine was removed; BM25 is the only engine. Drop --engine."
-        );
-        std::process::exit(2);
+    if let Some(Commands::Search { engine, .. }) = &cli.command {
+        if engine.as_deref().is_some_and(|e| e != "bm25") {
+            eprintln!(
+                "error: the legacy search engine was removed; BM25 is the only engine. Drop --engine."
+            );
+            std::process::exit(2);
+        }
+        if std::env::var("CHAT_HISTORY_SEARCH_ENGINE").is_ok_and(|e| e != "bm25") {
+            eprintln!(
+                "warning: CHAT_HISTORY_SEARCH_ENGINE is ignored; the legacy search engine was removed."
+            );
+        }
     }
 
     if matches!(&cli.command, Some(Commands::CursorHook)) {

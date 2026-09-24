@@ -1004,12 +1004,16 @@ fn cli_defaults_to_bm25_and_supports_no_cache() {
             .join(INDEX_FILENAME)
             .exists()
     );
-    // Flags and settings from older releases are accepted and ignored.
+    // Flags and settings from older releases are accepted; a legacy engine
+    // setting is ignored with a warning.
     command(&tmp)
         .env("CHAT_HISTORY_SEARCH_ENGINE", "legacy")
         .args(["search", "uniquecli", "--deep", "--json"])
         .assert()
-        .success();
+        .success()
+        .stderr(predicates::str::contains(
+            "CHAT_HISTORY_SEARCH_ENGINE is ignored",
+        ));
     assert!(
         tmp.path()
             .join(".chat-history/cache")
@@ -1020,13 +1024,15 @@ fn cli_defaults_to_bm25_and_supports_no_cache() {
         .args(["search", "uniquecli", "--engine", "bm25", "--json"])
         .assert()
         .success();
-    command(&tmp)
-        .args(["search", "uniquecli", "--engine", "legacy"])
-        .assert()
-        .code(2)
-        .stderr(predicates::str::contains(
-            "legacy search engine was removed",
-        ));
+    for engine in ["legacy", "unknown"] {
+        command(&tmp)
+            .args(["search", "uniquecli", "--engine", engine])
+            .assert()
+            .code(2)
+            .stderr(predicates::str::contains(
+                "legacy search engine was removed",
+            ));
+    }
 }
 
 #[test]
