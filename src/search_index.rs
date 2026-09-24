@@ -4,7 +4,7 @@ use crate::parser::{
     cap_excerpt, clean_first_prompt, is_noise, snippet_around_match, strip_terminal_controls,
 };
 use crate::search::{
-    SearchMatch, SearchResult, direct_session_search, parse_timeframe_duration, scored_search,
+    SearchMatch, SearchResult, direct_session_search, parse_timeframe_duration, similar_search,
 };
 use crate::session::{Message, Session, parse_any_timestamp, parse_session_recovering_timestamps};
 use chrono::{DateTime, Utc};
@@ -74,29 +74,22 @@ pub trait SearchBackend {
     fn search(&mut self, request: &SearchRequest<'_>) -> Result<Vec<SearchResult>>;
 }
 
-pub struct LegacyBackend;
-
-impl SearchBackend for LegacyBackend {
-    fn search(&mut self, request: &SearchRequest<'_>) -> Result<Vec<SearchResult>> {
-        if request.limit == 0 {
-            return Ok(Vec::new());
-        }
-        let results = scored_search(
-            request.sessions,
-            request.query,
-            request.scope,
-            if request.group_by_session {
-                grouped_message_oversample(request.limit)
-            } else {
-                request.limit
-            },
-            request.timeframe,
-        );
-        Ok(if request.group_by_session {
-            crate::search::group_results(results, request.limit)
+/// `--scope similar` keeps its own word-overlap ranking over user messages.
+fn similar(request: &SearchRequest<'_>) -> Vec<SearchResult> {
+    let results = similar_search(
+        request.sessions,
+        request.query,
+        if request.group_by_session {
+            grouped_message_oversample(request.limit)
         } else {
-            results
-        })
+            request.limit
+        },
+        request.timeframe,
+    );
+    if request.group_by_session {
+        crate::search::group_results(results, request.limit)
+    } else {
+        results
     }
 }
 
@@ -343,7 +336,7 @@ pub fn search_corpus(
         return Ok(results);
     }
     if request.scope == "similar" {
-        return LegacyBackend.search(request);
+        return Ok(similar(request));
     }
     if match_query(request.query)?.is_none() {
         return Ok(Vec::new());
@@ -1285,7 +1278,7 @@ impl SearchBackend for Bm25Backend {
         }
         // Similarity remains the existing user-message similarity operation.
         if request.scope == "similar" {
-            return LegacyBackend.search(request);
+            return Ok(similar(request));
         }
         let Some(query) = match_query(request.query)? else {
             return Ok(Vec::new());
@@ -1386,7 +1379,7 @@ impl SearchBackend for Bm25Backend {
             let payload: String = hydrate.query_row([id], |r| r.get(0))?;
             let mut message: Message = serde_json::from_str(&payload)?;
             // Preserve code, digits, quotes, case and the full message. The
-            // legacy fuzzy signature conflates E100/E200 and shared preambles.
+            // similar-search fuzzy signature conflates E100/E200 and shared preambles.
             // Dedup is per conversation so the same error text in another
             // session remains a separate hit.
             let sig = (

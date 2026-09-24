@@ -127,33 +127,21 @@ Date formats: `YYYY-MM-DD`, `today`, `yesterday`, `"3 days ago"`, `"last week"`,
 
 | Flag | Why |
 |---|---|
-| `--engine bm25` | Default: rank metadata and transcript passages together, with an automatically refreshed local index. |
-| `--engine legacy` | Previous metadata-first search; add `--deep` to bypass its metadata shortcut. |
-| `--group-by session\|message` | BM25 defaults to conversations with additional matches; choose message rows explicitly. |
-| `--deep` | Accepted for compatibility; BM25 already searches full transcripts. Snippets are match-centered. |
+| `--group-by session\|message` | Defaults to conversations with additional matches; choose message rows explicitly. |
 | `--json` | Machine-readable output on `search` and `view` (fields below). Not available on `inspect` or the session list. |
 | `--compact` | `search` only: one line per hit with short id, date, source, directory, `#ordinal`, title, excerpt, and `(also #a #b)` for further matches. About a sixth the size of `--json` on real queries. |
 | `--rebuild-index` | Reparse all sessions into the BM25 index. |
 | `--cache-dir PATH` / `--no-cache` | Store the BM25 index elsewhere, or build it in memory for this search. |
 
-`search --json` uses a `{ "query", "count", "results" }` envelope. BM25 and legacy deep-search result items include `session_id`, `source`, `also_ide`, `date`, `summary`, `project`, `score`, `role`, `ordinal`, `timestamp`, `snippet`, `tools`, and `files` (`additional_matches` items carry `ordinal` and `timestamp` too). `role` is `user` (the person), `assistant`, or `tool` (command output, file contents and other tool results, which Claude Code stores as user records). `ordinal` is the message's position in the transcript — pass it to `view <id> --around <ordinal>` — and is `null` for title and first-prompt matches. Legacy metadata-index result items include `matched_field` instead of `role`, `tools`, and `files`, and the envelope includes `"search_type": "index"`. Items also carry `metadata_only`, true for Cursor CLI sessions without a readable transcript.
+`search --json` uses a `{ "query", "count", "results" }` envelope. Result items include `session_id`, `source`, `also_ide`, `date`, `summary`, `project`, `score`, `role`, `ordinal`, `timestamp`, `snippet`, `tools`, and `files` (`additional_matches` items carry `ordinal` and `timestamp` too). `role` is `user` (the person), `assistant`, or `tool` (command output, file contents and other tool results, which Claude Code stores as user records). `ordinal` is the message's position in the transcript — pass it to `view <id> --around <ordinal>` — and is `null` for title and first-prompt matches. Items also carry `metadata_only`, true for Cursor CLI sessions without a readable transcript.
 
 `view --json` returns `{ "session_id", "source", "project", "message_count", "messages" }`. `messages` holds the messages the view options select (`--around`, `--grep`, `--role`, `--head`/`--tail`), each with `ordinal`, `role`, `timestamp`, `content`, `tools`, and `truncated` (true when `--max-chars` cut the content). A gap between ordinals means messages were skipped; a `--grep` with no match gives an empty list.
 
 Scopes: `all` (default), `errors`, `similar`, `tools`, `files`. Use `--timeframe today|week|month|Nd` and `--limit N` (default 15) to constrain results.
 
-`--timeframe` excludes untimestamped messages and first-prompt previews; Cursor recovers missing message times from IDE data when possible. Titles use session activity timestamps. BM25 honors this filter without `--deep`; the legacy metadata shortcut retains its historical behavior.
+`--timeframe` excludes untimestamped messages and first-prompt previews; Cursor recovers missing message times from IDE data when possible. Titles use session activity timestamps.
 
 Human-readable results include an 8-char UUID prefix. Pass it to `find` for any row; `inspect`, `view`, and `export` require a transcript. `resume` works for Claude, Codex, and Cursor chats with a store under `~/.cursor/chats`; other Cursor rows print the chat's **title** and `DIR:` so you can open it in the sidebar.
-
-Example (`--engine legacy` metadata search, not `--json`):
-
-```
-  1.  cursor-ide    2026-07-30 3f9c1a2e ★ 7.5 DIR: ~/proj INDEX_FIELD: summary
-        Restore optimization
-  2.  cursor-agent  2026-08-20 2f5bb25d ★ 4.0 DIR: ~/tmp INDEX_FIELD: first_prompt
-        Please read over the setup guide…
-```
 
 `--json` still includes `session_id`. For IDE Agent chats the JSON `source` is `cursor` (the jsonl store) even though the human tag is `cursor-ide`; those items carry `"also_ide": true`; `resume` launches the Agent CLI when a `~/.cursor/chats` store exists for the id and prints the sidebar hint otherwise.
 
@@ -162,10 +150,9 @@ Example (`--engine legacy` metadata search, not `--json`):
 - Display tags: `claude` = Claude Code, `codex` = Codex, `cursor-agent` = Agent transcripts / CLI chats, `cursor-ide` = Cursor IDE sidebar
 - Cursor IDE **Agent mode** writes SQLite **and** a jsonl with the same composer id. Search lists that pair **once** as `cursor-ide`. `--source cursor` / `cursor-agent` includes transcripts and CLI chat metadata; `--source cursor-ide` is SQLite.
 - Cursor rows marked `[metadata only]` support `find`, `resume`, and title search, but not `inspect`, `view`, `export`, or message search.
-- Header line: source, date, short id, score, `DIR:` spawn directory (`$HOME` shown as `~`), and (index search) `INDEX_FIELD:`
+- Header line: source, date, short id, score, `DIR:` spawn directory (`$HOME` shown as `~`)
 - Title / match text is on the following indented line
 - `★ N.N` = relevance (higher is better)
-- `INDEX_FIELD:` is `summary`, `first_prompt`, or `branch`
 - `inspect` → duration, messages, model, tokens, tools, files, accomplishments (the first informative sentence of the reply that ended each turn), key decisions. It takes several ids; `--brief` prints each as a header, what was asked, its latest substantive result (the last reply with an informative sentence, so a closing "All set" does not hide it), and up to five files it read or edited, the project's first (agent config and scratch files left out). Files come from tool calls, so a listed file was not necessarily changed
 - Claude Code titles come from `ai-title` / `custom-title` JSONL when available
 - Subagent/sidechain sessions are omitted unless `--sidechains`; this includes Cursor transcripts under `agent-transcripts/*/subagents/` (tagged `[subagent]`)
@@ -207,21 +194,17 @@ The hook is opt-in and does not backfill old or cloud history. It records transc
 
 ## Search scoring
 
-**BM25 (default):** Unicode token and prefix matching over overlapping transcript passages, titles, first prompts, project paths, and branches. Rare terms contribute more; repeated mentions saturate, and exact terms receive additional weight over prefix-only matches. Matching all query chunks and matching their ordered phrase add small ranking bonuses while partial matches remain eligible. Recency breaks score ties. JSON retains small positive scores at full precision; scores are not confidence values and cannot be compared across engines or queries.
+**BM25 (default):** Unicode token and prefix matching over overlapping transcript passages, titles, first prompts, project paths, and branches. Rare terms contribute more; repeated mentions saturate, and exact terms receive additional weight over prefix-only matches. Matching all query chunks and matching their ordered phrase add small ranking bonuses while partial matches remain eligible. Recency breaks score ties. JSON retains small positive scores at full precision; scores are not confidence values and cannot be compared across queries.
 
 Tool output is indexed in its own field at 0.3× the weight of conversation text, so a log that repeats a term does not outrank the message where it was discussed; it still matches when nothing else does. Output of chat-history itself (a tool call that ran `chat-history` or `ch`) is shown by `view` but never indexed, since it repeats other sessions. Search leaves out the conversation it runs inside, identified by `CLAUDE_CODE_SESSION_ID` (Claude Code), `CODEX_THREAD_ID` (Codex) or `CURSOR_CONVERSATION_ID` (Cursor's agent); a full-UUID lookup still finds it, and clearing the variable (`CLAUDE_CODE_SESSION_ID= chat-history search …`) includes it.
 
-BM25 returns one row per conversation, with a match-aware excerpt from its strongest passage and up to two additional matching messages. `--limit` counts conversations. JSON preserves the primary result fields and adds `additional_matches` with each extra match's score, role, snippet, tools and files. Use `--group-by message` for individual message rows (at most three per conversation). `CHAT_HISTORY_SEARCH_GROUP_BY=session|message` sets this preference; explicit flags override it. Legacy and `--scope similar` keep their previous message-row default.
+BM25 returns one row per conversation, with a match-aware excerpt from its strongest passage and up to two additional matching messages. `--limit` counts conversations. JSON preserves the primary result fields and adds `additional_matches` with each extra match's score, role, snippet, tools and files. Use `--group-by message` for individual message rows (at most three per conversation). `CHAT_HISTORY_SEARCH_GROUP_BY=session|message` sets this preference; explicit flags override it. `--scope similar` defaults to message rows.
 
-The first search indexes discovered history; later searches validate source fingerprints. When Cursor's shared database changes, search hashes the rows for each conversation and reparses only conversations whose dependencies changed. Reading these rows still has a cost; unchanged database observations reuse their hashes. Filters do not change the indexed collection statistics. `--scope similar` keeps the previous user-message similarity implementation. Queries are plain text; filename and identifier components stay adjacent and share the index’s Unicode analyzer; this is prefix search, not arbitrary infix or typo matching.
+The first search indexes discovered history; later searches validate source fingerprints. When Cursor's shared database changes, search hashes the rows for each conversation and reparses only conversations whose dependencies changed. Reading these rows still has a cost; unchanged database observations reuse their hashes. Filters do not change the indexed collection statistics. `--scope similar` ranks user messages by word overlap with the query instead of BM25. Queries are plain text; filename and identifier components stay adjacent and share the index’s Unicode analyzer; this is prefix search, not arbitrary infix or typo matching.
 
-Select the previous ranking with `--engine legacy` or `CHAT_HISTORY_SEARCH_ENGINE=legacy`. Explicit flags override environment values. `CHAT_HISTORY_CACHE_DIR` selects the cache location, `CHAT_HISTORY_NO_CACHE=1` bypasses both disk caches, and `CHAT_HISTORY_REBUILD_INDEX=true` forces a search-index refresh. A search-local `--cache-dir` overrides the BM25 directory only; `--no-cache` builds BM25 in memory. Unavailable, corrupt, or write-locked search caches fall back to in-memory BM25 with a stderr warning.
+Explicit flags override environment values. `CHAT_HISTORY_CACHE_DIR` selects the cache location, `CHAT_HISTORY_NO_CACHE=1` bypasses both disk caches, and `CHAT_HISTORY_REBUILD_INDEX=true` forces a search-index refresh. A search-local `--cache-dir` overrides the BM25 directory only; `--no-cache` builds BM25 in memory. Unavailable, corrupt, or write-locked search caches fall back to in-memory BM25 with a stderr warning.
 
 See [docs/search-architecture.md](docs/search-architecture.md) for the design, ranking policy, failure handling, and alternatives considered.
-
-**Legacy metadata:** field-weighted — summary 3×, first prompt 2×, branch/project 1× — with recency multipliers (3× today / 2× week / 1.5× month). AND across query words.
-
-**Legacy deep (`--engine legacy --deep`):** parallel transcript parse with tech-term boosts, word/prefix/phrase scoring, separator normalization (`_`/`-`/`/` → spaces), importance/semantic boosts, dedup, and a per-session cap of 3 matches.
 
 ## Credits
 

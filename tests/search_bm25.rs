@@ -1,6 +1,4 @@
-use chat_history::search_index::{
-    Bm25Backend, INDEX_FILENAME, LegacyBackend, SearchBackend, SearchRequest,
-};
+use chat_history::search_index::{Bm25Backend, INDEX_FILENAME, SearchBackend, SearchRequest};
 use chat_history::session::Session;
 use serde_json::json;
 use std::fs;
@@ -264,7 +262,7 @@ fn identical_text_in_two_sessions_stays_two_conversations() {
 }
 
 #[test]
-fn grouped_legacy_search_returns_the_requested_conversations() {
+fn grouped_similar_search_returns_the_requested_conversations() {
     let tmp = TempDir::new().unwrap();
     let names = [
         "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel",
@@ -274,23 +272,27 @@ fn grouped_legacy_search_returns_the_requested_conversations() {
         .map(|name| {
             transcript(
                 &tmp,
-                &format!("legacy-{name}"),
+                &format!("similar-{name}"),
                 &[&format!(
                     "legacydrain unique {name} discussion about authentication flow"
                 )],
             )
         })
         .collect();
-    let hits = LegacyBackend
-        .search(&SearchRequest {
+    let hits = chat_history::search_index::search_corpus(
+        &corpus,
+        &SearchRequest {
             sessions: &corpus,
-            query: "legacydrain",
-            scope: "all",
+            query: "legacydrain discussion about authentication flow",
+            scope: "similar",
             limit: 3,
             timeframe: None,
             group_by_session: true,
-        })
-        .unwrap();
+        },
+        None,
+        false,
+    )
+    .unwrap();
     assert_eq!(hits.len(), 3);
     let ids: std::collections::BTreeSet<_> = hits.iter().map(|h| h.session.id.clone()).collect();
     assert_eq!(ids.len(), 3);
@@ -499,7 +501,7 @@ fn rare_terms_rank_above_generic_technology_mentions() {
 }
 
 #[test]
-fn judged_query_fixture_compares_bm25_and_legacy() {
+fn judged_query_fixture_ranks_the_expected_session_first() {
     let tmp = TempDir::new().unwrap();
     let cases = [
         (
@@ -558,36 +560,14 @@ fn judged_query_fixture_compares_bm25_and_legacy() {
     }
     let mut bm25 = Bm25Backend::open(None).unwrap();
     bm25.sync(&corpus, false).unwrap();
-    let mut legacy = chat_history::search_index::LegacyBackend;
-    let mut measures = Vec::new();
-    for (name, backend) in [
-        ("BM25", &mut bm25 as &mut dyn SearchBackend),
-        ("legacy", &mut legacy),
-    ] {
-        let mut found = 0;
-        let mut reciprocal_rank = 0.0;
-        for (expected, query, _) in cases {
-            let hits = search(backend, &corpus, query, 5);
-            if let Some(rank) = hits.iter().position(|hit| hit.session.id == expected) {
-                found += 1;
-                reciprocal_rank += 1.0 / (rank + 1) as f64;
-            }
-            if name == "BM25" {
-                assert_eq!(
-                    hits.first().map(|hit| hit.session.id.as_str()),
-                    Some(expected),
-                    "{query}"
-                );
-            }
-        }
-        let mrr = reciprocal_rank / cases.len() as f64;
-        eprintln!(
-            "{name}: fixture Recall@5={found}/{}, MRR@5={mrr:.3}",
-            cases.len()
+    for (expected, query, _) in cases {
+        let hits = search(&mut bm25, &corpus, query, 5);
+        assert_eq!(
+            hits.first().map(|hit| hit.session.id.as_str()),
+            Some(expected),
+            "{query}"
         );
-        measures.push(mrr);
     }
-    assert!(measures[0] >= measures[1]);
 }
 
 #[test]
@@ -897,10 +877,7 @@ fn cli_grouping_preserves_json_contract_and_message_opt_out() {
             "uniquecli recovery details",
         ],
     );
-    for args in [
-        vec![],
-        vec!["--engine", "legacy", "--deep", "--group-by", "session"],
-    ] {
+    for args in [vec![], vec!["--group-by", "session"]] {
         let out = command(&tmp)
             .args(["search", "uniquecli", "--json"])
             .args(args)
@@ -1005,7 +982,7 @@ fn human_search_keeps_tools_and_files_beside_additional_matches() {
 }
 
 #[test]
-fn cli_defaults_to_bm25_and_supports_engine_environment_and_no_cache() {
+fn cli_defaults_to_bm25_and_supports_no_cache() {
     let tmp = TempDir::new().unwrap();
     cli_fixture(&tmp);
     let out = command(&tmp)
@@ -1027,9 +1004,10 @@ fn cli_defaults_to_bm25_and_supports_engine_environment_and_no_cache() {
             .join(INDEX_FILENAME)
             .exists()
     );
+    // Flags and settings from older releases are accepted and ignored.
     command(&tmp)
         .env("CHAT_HISTORY_SEARCH_ENGINE", "legacy")
-        .args(["search", "uniquecli", "--engine", "bm25", "--json"])
+        .args(["search", "uniquecli", "--deep", "--json"])
         .assert()
         .success();
     assert!(
@@ -1039,9 +1017,16 @@ fn cli_defaults_to_bm25_and_supports_engine_environment_and_no_cache() {
             .exists()
     );
     command(&tmp)
-        .args(["search", "uniquecli", "--engine", "unknown"])
+        .args(["search", "uniquecli", "--engine", "bm25", "--json"])
         .assert()
-        .code(2);
+        .success();
+    command(&tmp)
+        .args(["search", "uniquecli", "--engine", "legacy"])
+        .assert()
+        .code(2)
+        .stderr(predicates::str::contains(
+            "legacy search engine was removed",
+        ));
 }
 
 #[test]
@@ -1332,7 +1317,7 @@ fn locked_cache_uses_ephemeral_bm25_and_preserves_json() {
 }
 
 #[test]
-fn uuid_lookup_and_quoted_uuid_fallback_work_with_both_engines() {
+fn uuid_lookup_and_quoted_uuid_fallback() {
     let tmp = TempDir::new().unwrap();
     let uuid = "12345678-abcd-4321-8888-123456789abc";
     let corpus = vec![
@@ -1351,20 +1336,17 @@ fn uuid_lookup_and_quoted_uuid_fallback_work_with_both_engines() {
     ];
     let mut index = Bm25Backend::open(None).unwrap();
     index.sync(&corpus, false).unwrap();
-    let mut legacy = chat_history::search_index::LegacyBackend;
-    for backend in [&mut index as &mut dyn SearchBackend, &mut legacy] {
-        assert_eq!(
-            search(backend, &corpus, &uuid.to_uppercase(), 10)[0]
-                .session
-                .id,
-            uuid
-        );
-        assert_eq!(
-            search(backend, &corpus[1..], uuid, 10)[0].session.id,
-            "mention"
-        );
-        assert!(search(backend, &corpus, uuid, 0).is_empty());
-    }
+    assert_eq!(
+        search(&mut index, &corpus, &uuid.to_uppercase(), 10)[0]
+            .session
+            .id,
+        uuid
+    );
+    assert_eq!(
+        search(&mut index, &corpus[1..], uuid, 10)[0].session.id,
+        "mention"
+    );
+    assert!(search(&mut index, &corpus, uuid, 0).is_empty());
 }
 
 #[test]
@@ -1602,7 +1584,7 @@ fn missing_fts_asset_is_rebuilt_from_existing_message_rows() {
 
 #[test]
 #[ignore = "Synthetic release-mode performance comparison; run with --ignored --nocapture"]
-fn benchmark_cold_warm_and_legacy() {
+fn benchmark_cold_and_warm() {
     use std::time::Instant;
     let tmp = TempDir::new().unwrap();
     let mut corpus = Vec::new();
@@ -1636,19 +1618,8 @@ fn benchmark_cold_warm_and_legacy() {
     let start = Instant::now();
     assert!(!search(&mut index, &corpus, "marker137", 15).is_empty());
     let query = start.elapsed();
-    let start = Instant::now();
-    assert!(
-        !search(
-            &mut chat_history::search_index::LegacyBackend,
-            &corpus,
-            "marker137",
-            15
-        )
-        .is_empty()
-    );
-    let legacy = start.elapsed();
     eprintln!(
-        "250 sessions / 5000 messages: cold={cold:?}; warm open+sync={warm:?}; BM25 query={query:?}; legacy deep query={legacy:?}"
+        "250 sessions / 5000 messages: cold={cold:?}; warm open+sync={warm:?}; BM25 query={query:?}"
     );
 }
 

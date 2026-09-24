@@ -406,7 +406,9 @@ fn help_shows_examples_and_subcommand_about() {
         .args(["search", "--help"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("full transcript content"));
+        .stdout(predicate::str::contains(
+            "BM25 searches transcripts by default",
+        ));
 }
 
 #[test]
@@ -627,19 +629,18 @@ fn list_summarize_groups_by_day() {
 }
 
 #[test]
-fn search_index_finds_session() {
+fn search_finds_session_by_title() {
     let tmp = TempDir::new().unwrap();
     setup_fixture(&tmp);
     Command::cargo_bin("chat-history")
         .unwrap()
-        .args(["search", "docker", "--engine", "legacy"])
+        .args(["search", "docker"])
         .env("CLAUDE_CONFIG_DIR", tmp.path())
         .env("HOME", tmp.path())
         .assert()
         .success()
         .stdout(predicate::str::contains("docker deployment pipeline"))
-        .stdout(predicate::str::contains("DIR:"))
-        .stdout(predicate::str::contains("INDEX_FIELD:"));
+        .stdout(predicate::str::contains("DIR:"));
 }
 
 #[test]
@@ -648,7 +649,7 @@ fn search_json_format() {
     setup_fixture(&tmp);
     let output = Command::cargo_bin("chat-history")
         .unwrap()
-        .args(["search", "docker", "--json", "--engine", "legacy"])
+        .args(["search", "docker", "--json"])
         .env("CLAUDE_CONFIG_DIR", tmp.path())
         .env("HOME", tmp.path())
         .output()
@@ -933,7 +934,7 @@ fn search_uuid_mentioned_in_content_falls_back_to_content_search() {
 
     Command::cargo_bin("chat-history")
         .unwrap()
-        .args(["search", "550e8400-e29b-41d4-a716-446655440000", "--deep"])
+        .args(["search", "550e8400-e29b-41d4-a716-446655440000"])
         .env("CLAUDE_CONFIG_DIR", tmp.path())
         .env("HOME", tmp.path())
         .env_remove("CODEX_HOME")
@@ -1213,7 +1214,7 @@ fn deep_search_with_transcript() {
     setup_transcript_fixture(&tmp);
     Command::cargo_bin("chat-history")
         .unwrap()
-        .args(["search", "webpack production", "--deep"])
+        .args(["search", "webpack production"])
         .env("CLAUDE_CONFIG_DIR", tmp.path())
         .env("HOME", tmp.path())
         .assert()
@@ -1483,7 +1484,7 @@ fn deep_search_json_combined() {
     setup_rich_transcript_fixture(&tmp);
     let output = Command::cargo_bin("chat-history")
         .unwrap()
-        .args(["search", "authentication error", "--deep", "--json"])
+        .args(["search", "authentication error", "--json"])
         .env("CLAUDE_CONFIG_DIR", tmp.path())
         .env("HOME", tmp.path())
         .output()
@@ -1518,7 +1519,7 @@ fn deep_search_finds_tool_output_content() {
     setup_rich_transcript_fixture(&tmp);
     Command::cargo_bin("chat-history")
         .unwrap()
-        .args(["search", "rate limiting brute force", "--deep"])
+        .args(["search", "rate limiting brute force"])
         .env("CLAUDE_CONFIG_DIR", tmp.path())
         .env("HOME", tmp.path())
         .assert()
@@ -1781,7 +1782,7 @@ fn codex_session_deep_search() {
     setup_codex_fixture(&tmp);
     Command::cargo_bin("chat-history")
         .unwrap()
-        .args(["search", "async handlers", "--deep"])
+        .args(["search", "async handlers"])
         .env("HOME", tmp.path())
         .env("CLAUDE_CONFIG_DIR", tmp.path())
         .env_remove("CODEX_HOME")
@@ -1933,7 +1934,7 @@ fn cursor_session_deep_search() {
     setup_cursor_fixture(&tmp);
     Command::cargo_bin("chat-history")
         .unwrap()
-        .args(["search", "connection pooling", "--deep"])
+        .args(["search", "connection pooling"])
         .env("HOME", tmp.path())
         .env("CLAUDE_CONFIG_DIR", tmp.path())
         .assert()
@@ -1959,13 +1960,7 @@ fn cursor_subagent_sessions_hidden_by_default() {
 
     Command::cargo_bin("chat-history")
         .unwrap()
-        .args([
-            "search",
-            "subagent analysis",
-            "--source",
-            "cursor-agent",
-            "--deep",
-        ])
+        .args(["search", "subagent analysis", "--source", "cursor-agent"])
         .env("HOME", tmp.path())
         .env("CLAUDE_CONFIG_DIR", tmp.path())
         .env("NO_COLOR", "1")
@@ -1998,7 +1993,6 @@ fn cursor_subagent_sessions_listed_and_searchable_with_flag() {
             "subagent analysis",
             "--source",
             "cursor-agent",
-            "--deep",
             "--sidechains",
         ])
         .env("HOME", tmp.path())
@@ -2019,7 +2013,7 @@ fn timeframe_excludes_empty_timestamp_messages() {
     // Without timeframe: deep search should find Cursor results
     let output = Command::cargo_bin("chat-history")
         .unwrap()
-        .args(["search", "database", "--deep"])
+        .args(["search", "database"])
         .env("CLAUDE_CONFIG_DIR", tmp.path())
         .env("HOME", tmp.path())
         .env("NO_COLOR", "1")
@@ -2034,7 +2028,7 @@ fn timeframe_excludes_empty_timestamp_messages() {
     // With timeframe: empty-timestamp Cursor messages should be excluded
     let output = Command::cargo_bin("chat-history")
         .unwrap()
-        .args(["search", "database", "--deep", "--timeframe", "today"])
+        .args(["search", "database", "--timeframe", "today"])
         .env("CLAUDE_CONFIG_DIR", tmp.path())
         .env("HOME", tmp.path())
         .env("NO_COLOR", "1")
@@ -2125,7 +2119,7 @@ fn local_flag_works_with_search() {
     fs::create_dir_all(&alpha_dir).unwrap();
     let output = Command::cargo_bin("chat-history")
         .unwrap()
-        .args(["-L", "search", "deploy", "--deep"])
+        .args(["-L", "search", "deploy"])
         .current_dir(&alpha_dir)
         .env("CLAUDE_CONFIG_DIR", tmp.path())
         .env("HOME", tmp.path())
@@ -2211,7 +2205,7 @@ fn short_message_fix_ci_is_searchable() {
     setup_short_message_fixture(&tmp);
     let output = Command::cargo_bin("chat-history")
         .unwrap()
-        .args(["search", "fix ci", "--deep"])
+        .args(["search", "fix ci"])
         .env("CLAUDE_CONFIG_DIR", tmp.path())
         .env("HOME", tmp.path())
         .env("NO_COLOR", "1")
@@ -2234,7 +2228,7 @@ fn short_message_git_rebase_is_searchable() {
     setup_short_message_fixture(&tmp);
     let output = Command::cargo_bin("chat-history")
         .unwrap()
-        .args(["search", "git rebase", "--deep"])
+        .args(["search", "git rebase"])
         .env("CLAUDE_CONFIG_DIR", tmp.path())
         .env("HOME", tmp.path())
         .env("NO_COLOR", "1")
@@ -2257,7 +2251,7 @@ fn short_message_run_tests_is_searchable() {
     setup_short_message_fixture(&tmp);
     let output = Command::cargo_bin("chat-history")
         .unwrap()
-        .args(["search", "run tests", "--deep"])
+        .args(["search", "run tests"])
         .env("CLAUDE_CONFIG_DIR", tmp.path())
         .env("HOME", tmp.path())
         .env("NO_COLOR", "1")
@@ -2277,7 +2271,7 @@ fn short_noise_ok_does_not_pollute_unrelated_search() {
     setup_short_message_fixture(&tmp);
     let output = Command::cargo_bin("chat-history")
         .unwrap()
-        .args(["search", "webpack kubernetes", "--deep", "--json"])
+        .args(["search", "webpack kubernetes", "--json"])
         .env("CLAUDE_CONFIG_DIR", tmp.path())
         .env("HOME", tmp.path())
         .output()
@@ -2315,7 +2309,7 @@ fn empty_and_whitespace_messages_still_filtered() {
 
     let output = Command::cargo_bin("chat-history")
         .unwrap()
-        .args(["search", "hello claude help", "--deep", "--json"])
+        .args(["search", "hello claude help", "--json"])
         .env("CLAUDE_CONFIG_DIR", tmp.path())
         .env("HOME", tmp.path())
         .output()

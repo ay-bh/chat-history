@@ -111,16 +111,23 @@ fn search_hits_carry_the_message_ordinal_and_timestamp() {
 }
 
 #[test]
-fn legacy_engine_hits_carry_the_same_ordinal() {
+fn similar_scope_hits_carry_the_same_ordinal() {
     let tmp = fixture();
-    let out = search(&tmp, &["quokkafield", "--engine", "legacy", "--deep"]);
+    let out = search(
+        &tmp,
+        &[
+            "what about the quokkafield timeouts in production",
+            "--scope",
+            "similar",
+        ],
+    );
     let ordinals: Vec<u64> = out["results"]
         .as_array()
         .unwrap()
         .iter()
         .filter_map(|r| r["ordinal"].as_u64())
         .collect();
-    assert!(ordinals.contains(&4) || ordinals.contains(&5), "{out}");
+    assert!(ordinals.contains(&4), "{out}");
 }
 
 #[test]

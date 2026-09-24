@@ -279,7 +279,6 @@ fn metadata_only_rows_match_a_timeframe_search_by_activity_time() {
         .args([
             "search",
             "discovery probe",
-            "--deep",
             "--json",
             "--timeframe",
             "today",
@@ -417,8 +416,8 @@ fn uuid_lookup_respects_timeframe() {
     let tmp = TempDir::new().unwrap();
     transcript(&tmp, true);
     for args in [
-        vec!["search", ID, "--deep", "--json"],
-        vec!["search", ID, "--deep", "--json", "--timeframe", "today"],
+        vec!["search", ID, "--json"],
+        vec!["search", ID, "--json", "--timeframe", "today"],
     ] {
         command(&tmp)
             .args(args)
@@ -431,7 +430,7 @@ fn uuid_lookup_respects_timeframe() {
     let tmp = TempDir::new().unwrap();
     let path = transcript(&tmp, false);
     command(&tmp)
-        .args(["search", ID, "--deep", "--json", "--timeframe", "today"])
+        .args(["search", ID, "--json", "--timeframe", "today"])
         .assert()
         .success()
         .stdout(predicate::str::contains(hit.as_str()));
@@ -443,7 +442,7 @@ fn uuid_lookup_respects_timeframe() {
         .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_577_836_800))
         .unwrap();
     command(&tmp)
-        .args(["search", ID, "--deep", "--json", "--timeframe", "today"])
+        .args(["search", ID, "--json", "--timeframe", "today"])
         .assert()
         .success()
         .stdout(predicate::str::contains(hit.as_str()).not());
@@ -462,7 +461,7 @@ fn uuid_lookup_respects_timeframe() {
     )
     .unwrap();
     command(&tmp)
-        .args(["search", ID, "--deep", "--json", "--timeframe", "today"])
+        .args(["search", ID, "--json", "--timeframe", "today"])
         .assert()
         .success()
         .stdout(predicate::str::contains(
@@ -507,13 +506,13 @@ fn uuid_outside_the_timeframe_says_so() {
         .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_577_836_800))
         .unwrap();
     command(&tmp)
-        .args(["search", ID, "--deep", "--timeframe", "today"])
+        .args(["search", ID, "--timeframe", "today"])
         .assert()
         .success()
         .stderr(predicate::str::contains("no activity in the --timeframe"));
     // The note is stderr, so JSON consumers get it too without corrupting stdout.
     command(&tmp)
-        .args(["search", ID, "--deep", "--json", "--timeframe", "today"])
+        .args(["search", ID, "--json", "--timeframe", "today"])
         .assert()
         .success()
         .stderr(predicate::str::contains("no activity in the --timeframe"));
@@ -600,14 +599,7 @@ fn native_cursor_timestamps_enable_timeframe_search() {
     let tmp = TempDir::new().unwrap();
     transcript(&tmp, true);
     command(&tmp)
-        .args([
-            "search",
-            "uniquecache",
-            "--deep",
-            "--json",
-            "--timeframe",
-            "today",
-        ])
+        .args(["search", "uniquecache", "--json", "--timeframe", "today"])
         .assert()
         .success()
         .stdout(predicate::str::contains("investigate uniquecache failure"));
@@ -697,7 +689,6 @@ fn paired_ide_timestamps_enable_search_without_losing_transcript_content() {
             "cursor",
             "search",
             "uniquecache",
-            "--deep",
             "--json",
             "--timeframe",
             "today",
@@ -714,20 +705,12 @@ fn paired_ide_timestamps_enable_search_without_losing_transcript_content() {
             .unwrap()
     };
     assert_eq!(
+        score(&["--source", "cursor", "search", "uniquecache", "--json"]),
         score(&[
             "--source",
             "cursor",
             "search",
             "uniquecache",
-            "--deep",
-            "--json"
-        ]),
-        score(&[
-            "--source",
-            "cursor",
-            "search",
-            "uniquecache",
-            "--deep",
             "--json",
             "--timeframe",
             "today"
@@ -752,7 +735,7 @@ fn unsupported_cursor_schema_warns_without_corrupting_json() {
     drop(conn);
     transcript(&tmp, true);
     let output = command(&tmp)
-        .args(["search", "uniquecache", "--deep", "--json"])
+        .args(["search", "uniquecache", "--json"])
         .output()
         .unwrap();
     assert!(output.status.success());
