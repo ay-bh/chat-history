@@ -36,16 +36,21 @@ macro_rules! c {
     };
 }
 
-fn src_tag(source: &str, also_ide: bool) -> String {
-    // IDE Agent chats write SQLite *and* an agent-transcripts jsonl with the
-    // same composer id. Prefer the IDE label — that's the UI the user used.
-    let label = match source {
+/// The source name rows show. IDE Agent chats write SQLite *and* an
+/// agent-transcripts jsonl with the same composer id; prefer the IDE label,
+/// since that's the UI the user used.
+fn src_label(source: &str, also_ide: bool) -> &'static str {
+    match source {
         "claude" => "claude",
         "codex" => "codex",
         "cursor-ide" => "cursor-ide",
         "cursor" if also_ide => "cursor-ide",
         _ => "cursor-agent",
-    };
+    }
+}
+
+fn src_tag(source: &str, also_ide: bool) -> String {
+    let label = src_label(source, also_ide);
     let color = match source {
         "claude" => "bg_cyan",
         "codex" => "bg_magenta",
@@ -359,6 +364,105 @@ pub fn print_search_results(results: &[SearchResult], query: &str) {
     }
 }
 
+/// One line per hit, for agents shortlisting sessions: short id, date,
+/// source, directory, the hit's #ordinal (for `view --around`), title, the
+/// excerpt, and the ordinals of the conversation's further matches.
+pub fn print_search_results_compact(results: &[SearchResult], query: &str) {
+    if results.is_empty() {
+        eprintln!("No results for \"{query}\".");
+    }
+    for r in results {
+        let snippet = usable_search_snippet(r.snippet.as_deref(), &r.message.content, query, 200);
+        let also: Vec<String> = r
+            .additional_matches
+            .iter()
+            .filter_map(|m| m.ordinal.map(|o| format!("#{o}")))
+            .collect();
+        let also = if also.is_empty() {
+            String::new()
+        } else {
+            format!("  (also {})", also.join(" "))
+        };
+        let title = title_of(&r.session.summary, &r.session.first_prompt, 80);
+        let excerpt = tty(&clip_chars(&compact_search_preview(&snippet), 160));
+        // A title or first-prompt hit has no ordinal; its excerpt is often
+        // the title again, and is dropped unless it shows more than the title.
+        let excerpt = if r.ordinal.is_none()
+            && excerpt.starts_with(title.trim_end_matches('…'))
+            && excerpt.chars().count() <= title.chars().count()
+        {
+            String::new()
+        } else {
+            let (_, role) = role_style(&r.message.role);
+            format!("  —  {role}: {excerpt}")
+        };
+        println!(
+            "{}{excerpt}{also}",
+            compact_row(&r.session, r.ordinal, &title)
+        );
+    }
+}
+
+/// `print_search_results_compact` for legacy metadata matches, which have
+/// no message: the matched field stands in for the role.
+pub fn print_index_results_compact(results: &[IndexResult], query: &str) {
+    if results.is_empty() {
+        eprintln!("No results for \"{query}\".");
+    }
+    for r in results {
+        println!(
+            "{}  —  {}: {}",
+            compact_row(
+                &r.session,
+                None,
+                &title_of(&r.session.summary, &r.display, 80)
+            ),
+            tty(&r.matched_field),
+            tty(&clip_chars(
+                &compact_search_preview(&clean_prompt(&r.display)),
+                160
+            ))
+        );
+    }
+}
+
+fn compact_row(session: &Session, ordinal: Option<usize>, title: &str) -> String {
+    let short: String = session.id.chars().take(8).collect();
+    let dir = if session.project.is_empty() {
+        "-".to_string()
+    } else {
+        tty(&abbreviate_home(&session.project))
+    };
+    let ordinal = ordinal.map_or_else(|| "-".to_string(), |o| format!("#{o}"));
+    // Only find and resume work on these; inspect, view and export refuse.
+    let availability = if session.is_cursor_store_only() {
+        "  [metadata only]"
+    } else {
+        ""
+    };
+    format!(
+        "{}  {}  {}  {dir}  {ordinal}  {title}{availability}",
+        tty(&short),
+        tty(&session.date),
+        src_label(&session.source, session.also_ide)
+    )
+}
+
+fn clip_chars(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let cut: String = text.chars().take(max - 1).collect();
+    format!("{}…", cut.trim_end())
+}
+
+/// Tool names in first-use order, each once: a message that ran Bash five
+/// times lists Bash once.
+fn unique_tools(tools: &[String]) -> Vec<&String> {
+    let mut seen = std::collections::HashSet::new();
+    tools.iter().filter(|t| seen.insert(t.as_str())).collect()
+}
+
 /// Colour and display name of a message role.
 fn role_style(role: &str) -> (&'static str, &'static str) {
     match role {
@@ -447,9 +551,8 @@ fn format_search_preview(snippet: &str, query: &str) -> String {
 
 fn print_hit_details(message: &Message, indent: &str) {
     if !message.tool_uses.is_empty() {
-        let tools: String = message
-            .tool_uses
-            .iter()
+        let tools: String = unique_tools(&message.tool_uses)
+            .into_iter()
             .take(5)
             .cloned()
             .collect::<Vec<_>>()
@@ -485,7 +588,7 @@ pub fn print_search_results_json(results: &[SearchResult], query: &str) {
                 "ordinal": r.ordinal,
                 "timestamp": r.message.timestamp,
                 "snippet": usable_search_snippet(r.snippet.as_deref(), &r.message.content, query, 300),
-                "tools": r.message.tool_uses,
+                "tools": unique_tools(&r.message.tool_uses),
                 "files": r.message.files_referenced,
                 "additional_matches": r.additional_matches.iter().map(|hit| serde_json::json!({
                     "score": hit.message.final_score,
@@ -493,7 +596,7 @@ pub fn print_search_results_json(results: &[SearchResult], query: &str) {
                     "ordinal": hit.ordinal,
                     "timestamp": hit.message.timestamp,
                     "snippet": usable_search_snippet(hit.snippet.as_deref(), &hit.message.content, query, 300),
-                    "tools": hit.message.tool_uses,
+                    "tools": unique_tools(&hit.message.tool_uses),
                     "files": hit.message.files_referenced,
                 })).collect::<Vec<_>>(),
             })
@@ -790,6 +893,41 @@ pub fn print_transcript(
         }
         println!();
     }
+}
+
+/// `view --json`: the messages the options select, as data. Ordinals are
+/// the transcript positions search hits report; a gap between two ordinals
+/// means messages were skipped. `truncated` marks content cut by --max-chars.
+pub fn print_view_json(messages: &[Message], session: &Session, opts: &ViewOptions) {
+    let selected: Vec<serde_json::Value> = opts
+        .slots(messages)
+        .into_iter()
+        .filter_map(|slot| match slot {
+            Slot::Message(ordinal) => Some(ordinal),
+            Slot::Gap => None,
+        })
+        .map(|ordinal| {
+            let msg = &messages[ordinal];
+            let text = view_text(msg);
+            let content = opts.clip(&text);
+            serde_json::json!({
+                "ordinal": ordinal,
+                "role": msg.role,
+                "timestamp": msg.timestamp,
+                "truncated": content != text,
+                "content": content,
+                "tools": msg.tool_uses,
+            })
+        })
+        .collect();
+    let out = serde_json::json!({
+        "session_id": session.id,
+        "source": session.source,
+        "project": session.project,
+        "message_count": messages.len(),
+        "messages": selected,
+    });
+    println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
 }
 
 pub fn print_plain(messages: &[Message], opts: &ViewOptions) {

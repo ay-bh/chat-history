@@ -42,12 +42,12 @@ fn cli_timeframe(value: &str) -> Result<String, String> {
         the Cursor sidebar instead.",
     version,
     after_help = "EXAMPLES:\n  \
-        chat-history                                  list sessions, newest first\n  \
-        chat-history --from yesterday --to yesterday  sessions from a specific day\n  \
-        chat-history search \"auth error\" --deep --json\n  \
-        chat-history --source cursor-ide              IDE sidebar chats only\n  \
-        chat-history inspect 6b1094cd                 summarize by short ID\n  \
-        chat-history view 6b1094cd --plain | less\n\n\
+        chat-history                                    list sessions, newest first\n  \
+        chat-history --from yesterday --to yesterday    sessions from a specific day\n  \
+        chat-history search \"auth error\" --compact      one line per hit (--json for scripts)\n  \
+        chat-history --source cursor-ide                IDE sidebar chats only\n  \
+        chat-history inspect 6b1094cd 0f9b82b1 --brief  compare sessions, a few lines each\n  \
+        chat-history view 6b1094cd --plain --around 42  message #42 (a hit's ordinal) and neighbours\n\n\
         EXIT CODES:\n  \
         0 success, 1 not found / IO error, 2 usage error or ambiguous session ID"
 )]
@@ -108,7 +108,7 @@ struct Cli {
 enum Commands {
     /// Search session content and metadata with BM25 relevance ranking
     #[command(
-        after_help = "EXAMPLES:\n  chat-history search 'auth error' --json\n  chat-history search 'src/parser.rs' --scope files\n  chat-history search 'auth error' --engine legacy --deep\n\nExplicit flags override environment variables. BM25 searches transcripts by default."
+        after_help = "EXAMPLES:\n  chat-history search 'auth error' --compact\n  chat-history search 'auth error' --json\n  chat-history search 'src/parser.rs' --scope files\n  chat-history search 'auth error' --engine legacy --deep\n\nExplicit flags override environment variables. BM25 searches transcripts by default."
     )]
     Search {
         /// Search query, or a full session UUID for direct lookup
@@ -143,6 +143,10 @@ enum Commands {
         /// Structured JSON output (session_id, score, snippet, tools, files)
         #[arg(long = "json")]
         json_output: bool,
+        /// One line per hit: short id, date, source, directory, #ordinal,
+        /// title, excerpt, and the ordinals of further matches
+        #[arg(long, conflicts_with = "json_output")]
+        compact: bool,
     },
     /// Summarize sessions: accomplishments, tools, files, model, tokens
     Inspect {
@@ -168,6 +172,10 @@ enum Commands {
         /// Plain text without formatting, pipe-friendly
         #[arg(long)]
         plain: bool,
+        /// JSON for scripts: the selected messages with ordinal, role,
+        /// timestamp, content and tools
+        #[arg(long = "json", conflicts_with_all = ["plain", "tools"])]
+        json_output: bool,
         /// Show message N (a search hit's `ordinal`) and --context messages around it
         #[arg(long, value_name = "N", conflicts_with = "grep")]
         around: Option<usize>,
@@ -494,6 +502,7 @@ fn main() {
             limit,
             timeframe,
             json_output,
+            compact,
         }) => {
             let mut pre = filtered;
             // The calling conversation contains the question being searched
@@ -512,6 +521,8 @@ fn main() {
                 if search::index_quality_ok(&idx_results) {
                     if json_output {
                         display::print_index_results_json(&idx_results, &query);
+                    } else if compact {
+                        display::print_index_results_compact(&idx_results, &query);
                     } else {
                         display::print_index_results(&idx_results, &query);
                     }
@@ -579,6 +590,8 @@ fn main() {
             }
             if json_output {
                 display::print_search_results_json(&results, &query);
+            } else if compact {
+                display::print_search_results_compact(&results, &query);
             } else {
                 display::print_search_results(&results, &query);
             }
@@ -627,6 +640,7 @@ fn main() {
             last,
             tools,
             plain,
+            json_output,
             around,
             grep,
             context,
@@ -660,9 +674,15 @@ fn main() {
                     pattern.as_str(),
                     messages.len()
                 );
+                // Scripts still get a document to parse, with no messages.
+                if json_output {
+                    display::print_view_json(&messages, session, &opts);
+                }
                 return;
             }
-            if plain {
+            if json_output {
+                display::print_view_json(&messages, session, &opts);
+            } else if plain {
                 display::print_plain(&messages, &opts);
             } else {
                 display::print_transcript(&messages, session, tools, &opts);
