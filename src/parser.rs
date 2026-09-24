@@ -127,6 +127,17 @@ pub fn is_history_command(command: &str) -> bool {
 }
 
 fn shell_runs_history(command: &str) -> bool {
+    fn mark_shell_input(
+        heredocs: &mut [Heredoc],
+        stdin_heredoc: &mut Option<usize>,
+        shell_launcher: bool,
+    ) {
+        let candidate = stdin_heredoc.take();
+        if shell_launcher && let Some(index) = candidate {
+            heredocs[index].shell_input = true;
+        }
+    }
+
     fn first_word_is_history(
         word: &mut String,
         command_position: &mut bool,
@@ -173,6 +184,7 @@ fn shell_runs_history(command: &str) -> bool {
     let mut quote = None;
     let mut escaped = false;
     let mut heredocs = Vec::new();
+    let mut stdin_heredoc = None;
     let mut chars = command.chars();
     while let Some(ch) = chars.next() {
         if escaped {
@@ -195,7 +207,7 @@ fn shell_runs_history(command: &str) -> bool {
                 '\\' => escaped = true,
                 '\'' | '"' => quote = Some(ch),
                 '<' if chars.clone().next() == Some('<') => {
-                    if let Some(mut heredoc) = read_heredoc(&mut chars) {
+                    if let Some(heredoc) = read_heredoc(&mut chars) {
                         if first_word_is_history(
                             &mut word,
                             &mut command_position,
@@ -204,7 +216,7 @@ fn shell_runs_history(command: &str) -> bool {
                         ) {
                             return true;
                         }
-                        heredoc.shell_input = shell_launcher;
+                        stdin_heredoc = Some(heredocs.len());
                         heredocs.push(heredoc);
                     } else {
                         word.push(ch);
@@ -219,6 +231,7 @@ fn shell_runs_history(command: &str) -> bool {
                     ) {
                         return true;
                     }
+                    mark_shell_input(&mut heredocs, &mut stdin_heredoc, shell_launcher);
                     command_position = true;
                     shell_launcher = false;
                     script_next = false;
@@ -242,6 +255,7 @@ fn shell_runs_history(command: &str) -> bool {
                     ) {
                         return true;
                     }
+                    mark_shell_input(&mut heredocs, &mut stdin_heredoc, shell_launcher);
                     command_position = true;
                     shell_launcher = false;
                     script_next = false;
@@ -917,6 +931,10 @@ mod tests {
             "cat <<'FIRST' <<'SECOND'\nch search q\nFIRST\nchat-history view id\nSECOND",
             "bash script.sh <<'EOF'\nch search q\nEOF",
             "bash -lc 'echo ready' <<'EOF'\nch search q\nEOF",
+            "bash <<'EOF' -c 'echo ready'\nch search q\nEOF",
+            "bash <<'EOF' script.sh\nch search q\nEOF",
+            "bash <<'FIRST' <<'SECOND'\nch search q\nFIRST\necho ready\nSECOND",
+            "bash <<'FIRST'; cat <<'SECOND'\necho ready\nFIRST\nch search q\nSECOND",
         ] {
             assert!(!is_history_command(cmd), "{cmd}");
         }
@@ -930,6 +948,9 @@ mod tests {
             "bash <<'EOF'\nch search q\nEOF",
             "sh <<EOF\nchat-history search q\nEOF",
             "cat <<'EOF'\nch search q\nEOF\nchat-history view id",
+            "bash <<'FIRST' <<'SECOND'\necho ignored\nFIRST\nch search q\nSECOND",
+            "bash <<'EOF'; echo ready\nch search q\nEOF",
+            "cat <<'FIRST'; bash <<'SECOND'\nch search q\nFIRST\nch view id\nSECOND",
         ] {
             assert!(is_history_command(cmd), "{cmd}");
         }
