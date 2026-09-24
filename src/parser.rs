@@ -127,25 +127,60 @@ pub fn is_history_command(command: &str) -> bool {
 }
 
 fn shell_runs_history(command: &str) -> bool {
+    fn mark_shell_input(
+        heredocs: &mut [Heredoc],
+        stdin_heredoc: &mut Option<usize>,
+        shell_launcher: bool,
+    ) {
+        let candidate = stdin_heredoc.take();
+        if shell_launcher && let Some(index) = candidate {
+            heredocs[index].shell_input = true;
+        }
+    }
+
     fn first_word_is_history(
         word: &mut String,
+        word_quoted: &mut bool,
         command_position: &mut bool,
         shell_launcher: &mut bool,
         script_next: &mut bool,
+        redirect_target_next: &mut bool,
+        stdin_heredoc: &mut Option<usize>,
     ) -> bool {
+        let quoted = std::mem::take(word_quoted);
         if word.is_empty() {
             return false;
         }
         let token = std::mem::take(word);
+        // A redirection (`>out`, `> out`, `2>&1`, `&>log`) and its target are
+        // not arguments: they neither name a command nor a script path. A
+        // quoted word (`bash -c '>log ch …'`) is never a redirection.
+        if std::mem::take(redirect_target_next) {
+            return false;
+        }
+        if !quoted && let Some((needs_target, stdin)) = redirection(&token) {
+            // A later `</dev/null` or `<<<word` replaces a heredoc as stdin.
+            if stdin {
+                *stdin_heredoc = None;
+            }
+            *redirect_target_next = needs_target;
+            return false;
+        }
         if *script_next {
             *script_next = false;
             return shell_runs_history(&token);
         }
         if *shell_launcher && token.starts_with('-') && token.contains('c') {
             *script_next = true;
+            *shell_launcher = false;
             return false;
         }
         if !*command_position {
+            // A shell given a script path (or -c above) does not execute its
+            // standard input as a script.
+            if *shell_launcher && !token.starts_with('-') {
+                *shell_launcher = false;
+            }
             return false;
         }
         if token.contains('=')
@@ -161,11 +196,18 @@ fn shell_runs_history(command: &str) -> bool {
     }
 
     let mut word = String::new();
+    let mut word_quoted = false;
     let mut command_position = true;
     let mut shell_launcher = false;
     let mut script_next = false;
     let mut quote = None;
     let mut escaped = false;
+    let mut redirect_target_next = false;
+    let mut heredocs = Vec::new();
+    let mut stdin_heredoc = None;
+    // One entry per open `(`: whether it opened `((`/`$((` arithmetic, where
+    // `<<` is a shift rather than a heredoc.
+    let mut parens = Vec::new();
     let mut chars = command.chars();
     while let Some(ch) = chars.next() {
         if escaped {
@@ -186,26 +228,115 @@ fn shell_runs_history(command: &str) -> bool {
             Some(_) => word.push(ch),
             None => match ch {
                 '\\' => escaped = true,
-                '\'' | '"' => quote = Some(ch),
-                '\n' | ';' | '&' | '|' | '(' | ')' | '{' | '}' | '`' => {
+                '\'' | '"' => {
+                    word_quoted |= word.is_empty();
+                    quote = Some(ch);
+                }
+                // `<<<` is a here-string: its word is data, not a heredoc.
+                '<' if chars.as_str().starts_with("<<") => {
+                    chars.next();
+                    chars.next();
+                    word.push_str("<<<");
+                }
+                // `2>&1`, `>&2` and `&>log` are redirections, not `&` separators.
+                '&' if word.ends_with(['>', '<']) || chars.as_str().starts_with('>') => {
+                    word.push(ch);
+                }
+                '<' if chars.clone().next() == Some('<') && !parens.contains(&true) => {
+                    if let Some(heredoc) = read_heredoc(&mut chars) {
+                        // `2<<ERR` feeds descriptor 2; only descriptor 0 is stdin.
+                        let descriptor = if !word_quoted && word.bytes().all(|b| b.is_ascii_digit())
+                        {
+                            std::mem::take(&mut word)
+                        } else {
+                            String::new()
+                        };
+                        if first_word_is_history(
+                            &mut word,
+                            &mut word_quoted,
+                            &mut command_position,
+                            &mut shell_launcher,
+                            &mut script_next,
+                            &mut redirect_target_next,
+                            &mut stdin_heredoc,
+                        ) {
+                            return true;
+                        }
+                        if matches!(descriptor.as_str(), "" | "0") {
+                            stdin_heredoc = Some(heredocs.len());
+                        }
+                        heredocs.push(heredoc);
+                    } else {
+                        word.push(ch);
+                    }
+                }
+                '\n' => {
                     if first_word_is_history(
                         &mut word,
+                        &mut word_quoted,
                         &mut command_position,
                         &mut shell_launcher,
                         &mut script_next,
+                        &mut redirect_target_next,
+                        &mut stdin_heredoc,
                     ) {
                         return true;
                     }
+                    mark_shell_input(&mut heredocs, &mut stdin_heredoc, shell_launcher);
                     command_position = true;
                     shell_launcher = false;
                     script_next = false;
+                    redirect_target_next = false;
+                    for heredoc in std::mem::take(&mut heredocs) {
+                        let body = heredoc_body(&mut chars, &heredoc);
+                        if (heredoc.shell_input && shell_runs_history(&body))
+                            || (!heredoc.shell_input
+                                && !heredoc.quoted
+                                && expanded_heredoc_runs_history(&body))
+                        {
+                            return true;
+                        }
+                    }
+                }
+                ';' | '&' | '|' | '(' | ')' | '{' | '}' | '`' => {
+                    if first_word_is_history(
+                        &mut word,
+                        &mut word_quoted,
+                        &mut command_position,
+                        &mut shell_launcher,
+                        &mut script_next,
+                        &mut redirect_target_next,
+                        &mut stdin_heredoc,
+                    ) {
+                        return true;
+                    }
+                    mark_shell_input(&mut heredocs, &mut stdin_heredoc, shell_launcher);
+                    command_position = true;
+                    shell_launcher = false;
+                    script_next = false;
+                    redirect_target_next = false;
+                    if ch == '(' {
+                        let arithmetic = chars.clone().next() == Some('(');
+                        if arithmetic {
+                            chars.next();
+                        }
+                        parens.push(arithmetic);
+                    } else if ch == ')'
+                        && parens.pop() == Some(true)
+                        && chars.clone().next() == Some(')')
+                    {
+                        chars.next();
+                    }
                 }
                 ch if ch.is_whitespace() => {
                     if first_word_is_history(
                         &mut word,
+                        &mut word_quoted,
                         &mut command_position,
                         &mut shell_launcher,
                         &mut script_next,
+                        &mut redirect_target_next,
+                        &mut stdin_heredoc,
                     ) {
                         return true;
                     }
@@ -216,10 +347,135 @@ fn shell_runs_history(command: &str) -> bool {
     }
     first_word_is_history(
         &mut word,
+        &mut word_quoted,
         &mut command_position,
         &mut shell_launcher,
         &mut script_next,
+        &mut redirect_target_next,
+        &mut stdin_heredoc,
     )
+}
+
+/// Whether a word is a redirection, and if so whether its target is the
+/// next word (`>` alone) rather than attached (`>out`, `2>&1`), and whether
+/// it replaces standard input (`<file`, `0<file`, `<<<word`, `<&3`).
+fn redirection(token: &str) -> Option<(bool, bool)> {
+    let op = token.trim_start_matches(|c: char| c.is_ascii_digit());
+    if !(op.starts_with(['>', '<']) || op.starts_with("&>")) {
+        return None;
+    }
+    let descriptor = &token[..token.len() - op.len()];
+    let stdin = match descriptor {
+        "" => op.starts_with('<'),
+        _ => descriptor == "0",
+    };
+    Some((op.trim_start_matches(['>', '<', '&']).is_empty(), stdin))
+}
+
+struct Heredoc {
+    delimiter: String,
+    quoted: bool,
+    strip_tabs: bool,
+    shell_input: bool,
+}
+
+/// Read the delimiter after `<<`, leaving the original iterator alone for
+/// `<<<` or an unsupported/malformed delimiter.
+fn read_heredoc(chars: &mut std::str::Chars<'_>) -> Option<Heredoc> {
+    let mut rest = chars.clone();
+    rest.next()?; // second '<'
+    if rest.clone().next() == Some('<') {
+        return None;
+    }
+    let strip_tabs = if rest.clone().next() == Some('-') {
+        rest.next();
+        true
+    } else {
+        false
+    };
+    while matches!(rest.clone().next(), Some(' ' | '\t')) {
+        rest.next();
+    }
+    let mut delimiter = String::new();
+    let mut quote = None;
+    let mut quoted = false;
+    while let Some(ch) = rest.clone().next() {
+        if quote.is_none() && (ch.is_whitespace() || ";&|()<>{}".contains(ch)) {
+            break;
+        }
+        rest.next();
+        match (quote, ch) {
+            (None, '\'' | '"') => {
+                quote = Some(ch);
+                quoted = true;
+            }
+            (Some(q), c) if q == c => quote = None,
+            (None, '\\') => {
+                delimiter.push(rest.next()?);
+                quoted = true;
+            }
+            _ => delimiter.push(ch),
+        }
+    }
+    if delimiter.is_empty() || quote.is_some() {
+        return None;
+    }
+    *chars = rest;
+    Some(Heredoc {
+        delimiter,
+        quoted,
+        strip_tabs,
+        shell_input: false,
+    })
+}
+
+/// Consume one heredoc through its exact delimiter line, in redirection order.
+fn heredoc_body(chars: &mut std::str::Chars<'_>, heredoc: &Heredoc) -> String {
+    let mut body = String::new();
+    loop {
+        let mut line = String::new();
+        let mut newline = false;
+        for ch in chars.by_ref() {
+            if ch == '\n' {
+                newline = true;
+                break;
+            }
+            line.push(ch);
+        }
+        let comparison = line.strip_suffix('\r').unwrap_or(&line);
+        let comparison = if heredoc.strip_tabs {
+            comparison.trim_start_matches('\t')
+        } else {
+            comparison
+        };
+        if comparison == heredoc.delimiter {
+            break;
+        }
+        body.push_str(&line);
+        if !newline {
+            break;
+        }
+        body.push('\n');
+    }
+    body
+}
+
+/// An unquoted heredoc expands substitutions even when its lines are data.
+fn expanded_heredoc_runs_history(body: &str) -> bool {
+    let mut chars = body.chars();
+    let mut escaped = false;
+    while let Some(ch) = chars.next() {
+        if escaped {
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else if (ch == '`' || (ch == '$' && chars.clone().next() == Some('(')))
+            && shell_runs_history(&substitution(&mut chars, ch))
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// The body of a command substitution whose opener (`` ` `` or `$`) was just
@@ -753,6 +1009,66 @@ mod tests {
         ] {
             assert!(!is_history_command(cmd), "{cmd}");
         }
+    }
+
+    #[test]
+    fn heredoc_data_is_not_a_shell_command() {
+        for cmd in [
+            "cat > guide.md <<'EOF'\nchat-history search q\nEOF",
+            "python3 - <<'PY'\nch search q\nPY",
+            "cat <<EOF\nchat-history search q\nEOF",
+            "cat <<-'EOF'\n\tch search q\n\tEOF",
+            "cat <<'FIRST' <<'SECOND'\nch search q\nFIRST\nchat-history view id\nSECOND",
+            "bash script.sh <<'EOF'\nch search q\nEOF",
+            "bash -lc 'echo ready' <<'EOF'\nch search q\nEOF",
+            "bash <<'EOF' -c 'echo ready'\nch search q\nEOF",
+            "bash <<'EOF' script.sh\nch search q\nEOF",
+            "bash <<'FIRST' <<'SECOND'\nch search q\nFIRST\necho ready\nSECOND",
+            "bash <<'FIRST'; cat <<'SECOND'\necho ready\nFIRST\nch search q\nSECOND",
+            "cat <<< 'ch search q'",
+            "bash script.sh >out <<'EOF'\nch search q\nEOF",
+            "bash <<'EOF' < /dev/null\nch search q\nEOF",
+            "bash <<'EOF' </dev/null\nch search q\nEOF",
+            "bash <<'EOF' 0</dev/null\nch search q\nEOF",
+            "bash <<'EOF' <<< 'echo ready'\nch search q\nEOF",
+        ] {
+            assert!(!is_history_command(cmd), "{cmd}");
+        }
+    }
+
+    #[test]
+    fn executable_commands_in_and_after_heredocs_are_recognised() {
+        for cmd in [
+            "cat <<EOF\n$(chat-history search q)\nEOF",
+            "cat <<EOF\n`ch search q`\nEOF",
+            "bash <<'EOF'\nch search q\nEOF",
+            "sh <<EOF\nchat-history search q\nEOF",
+            "cat <<'EOF'\nch search q\nEOF\nchat-history view id",
+            "bash <<'FIRST' <<'SECOND'\necho ignored\nFIRST\nch search q\nSECOND",
+            "bash <<'EOF'; echo ready\nch search q\nEOF",
+            "cat <<'FIRST'; bash <<'SECOND'\nch search q\nFIRST\nch view id\nSECOND",
+            "cat <<< \"x\"\nchat-history search q",
+            "grep -c a <<< \"$x\"; ch view id",
+            "bash <<'EOF' >out\nch search q\nEOF",
+            "bash >out <<'EOF'\nch search q\nEOF",
+            "bash <<'EOF' 2>&1 >>log\nch search q\nEOF",
+            "diff <(chat-history search a 2>/dev/null) <(ch search b)",
+            "echo $((1<<4))\nch search q",
+            "(( x << 2 )) && ch search q",
+            "(( x << 2 ))\nch search q\n2",
+            "echo $(( (1 << 2) + 1 ))\nch search q",
+            "((cd /tmp; ch search q))",
+            "bash -c '>log chat-history search q'",
+            "sh -c \"2>/dev/null ch search q\"",
+            "bash -c 'echo ok' 2>/dev/null <<'EOF'; ch view id\nx\nEOF",
+            "bash 2<<'ERR' <<'SCRIPT'\nignored\nERR\nch search q\nSCRIPT",
+            "bash 3<<'X' 0<<'SCRIPT'\nignored\nX\nch search q\nSCRIPT",
+            "bash < /dev/null <<'EOF'\nch search q\nEOF",
+            "bash <<'SCRIPT' 2<<'ERR'\nch search q\nSCRIPT\nignored\nERR",
+        ] {
+            assert!(is_history_command(cmd), "{cmd}");
+        }
+        assert!(!is_history_command("cat <<EOF\n\\$(ch search q)\nEOF"));
     }
 
     #[test]

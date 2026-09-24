@@ -239,6 +239,28 @@ fn quoted_history_name_in_another_command_does_not_hide_its_output() {
 }
 
 #[test]
+fn heredoc_documentation_does_not_hide_tool_output() {
+    let tmp = TempDir::new().unwrap();
+    write_claude(
+        tmp.path(),
+        ID_A,
+        vec![
+            ("user", json!("write a command example")),
+            (
+                "assistant",
+                tool_use("tu1", "cat > guide.md <<'EOF'\nch search examples\nEOF"),
+            ),
+            (
+                "user",
+                tool_result("tu1", "heredoc_fixture_token = written"),
+            ),
+        ],
+    );
+    let found = hits(&search(&tmp, "heredoc_fixture_token"));
+    assert_eq!(found, vec![(ID_A.to_owned(), "tool".to_owned(), Some(2))]);
+}
+
+#[test]
 fn tool_output_ranks_below_conversation_text() {
     let tmp = fixture();
     let out = search(&tmp, "heronbeak");
