@@ -545,7 +545,12 @@ fn main() {
                     .as_deref()
                     .map_or(scope != "similar", |value| value == "session"),
             };
-            let directory = if no_cache || std::env::var_os("CHAT_HISTORY_NO_CACHE").is_some() {
+            // `similar` ranks user messages directly and never opens the index,
+            // so it skips preparing (and possibly seeding) the cache directory.
+            let directory = if no_cache
+                || scope == "similar"
+                || std::env::var_os("CHAT_HISTORY_NO_CACHE").is_some()
+            {
                 None
             } else {
                 cache_dir

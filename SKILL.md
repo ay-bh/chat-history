@@ -85,7 +85,7 @@ chat-history find <id>                     # print transcript file path for scri
 chat-history completions zsh               # shell completions (bash/zsh/fish/elvish/powershell)
 ```
 
-- `--scope` values: `all` (default), `errors` (messages with error patterns or the word "error"), `similar` (user messages only — similar past queries), `tools` (messages with tool calls), `files` (messages referencing files). Any scope other than `all` always searches full transcripts.
+- `--scope` values: `all` (default), `errors` (messages with error patterns or the word "error"), `similar` (user messages only — similar past queries), `tools` (messages with tool calls), `files` (messages referencing files). Every scope, including `all`, searches full transcripts.
 - Shared filters on every subcommand: `--from`/`--to`, `--source`, `--project`, `--branch`, `-k`, `--sidechains` (include hidden subagent sessions).
 
 ## Interpreting output
