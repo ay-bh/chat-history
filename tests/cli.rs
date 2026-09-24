@@ -806,6 +806,27 @@ fn setup_transcript_fixture(tmp: &TempDir) {
 }
 
 #[test]
+fn export_without_output_prints_markdown_and_writes_no_file() {
+    let tmp = TempDir::new().unwrap();
+    setup_transcript_fixture(&tmp);
+    let cwd = tmp.path().join("cwd");
+    fs::create_dir(&cwd).unwrap();
+    Command::cargo_bin("chat-history")
+        .unwrap()
+        .args(["export", "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"])
+        .current_dir(&cwd)
+        .env("CLAUDE_CONFIG_DIR", tmp.path())
+        .env("HOME", tmp.path())
+        .env_remove("CODEX_HOME")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("## You"))
+        .stdout(predicate::str::contains("webpack"))
+        .stdout(predicate::str::contains("Exported to").not());
+    assert_eq!(fs::read_dir(&cwd).unwrap().count(), 0);
+}
+
+#[test]
 fn export_write_failure_exits_nonzero() {
     let tmp = TempDir::new().unwrap();
     setup_transcript_fixture(&tmp);
