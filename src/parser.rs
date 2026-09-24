@@ -140,21 +140,24 @@ fn shell_runs_history(command: &str) -> bool {
 
     fn first_word_is_history(
         word: &mut String,
+        word_quoted: &mut bool,
         command_position: &mut bool,
         shell_launcher: &mut bool,
         script_next: &mut bool,
         redirect_target_next: &mut bool,
     ) -> bool {
+        let quoted = std::mem::take(word_quoted);
         if word.is_empty() {
             return false;
         }
         let token = std::mem::take(word);
         // A redirection (`>out`, `> out`, `2>&1`, `&>log`) and its target are
-        // not arguments: they neither name a command nor a script path.
+        // not arguments: they neither name a command nor a script path. A
+        // quoted word (`bash -c '>log ch …'`) is never a redirection.
         if std::mem::take(redirect_target_next) {
             return false;
         }
-        if let Some(needs_target) = redirection(&token) {
+        if !quoted && let Some(needs_target) = redirection(&token) {
             *redirect_target_next = needs_target;
             return false;
         }
@@ -188,6 +191,7 @@ fn shell_runs_history(command: &str) -> bool {
     }
 
     let mut word = String::new();
+    let mut word_quoted = false;
     let mut command_position = true;
     let mut shell_launcher = false;
     let mut script_next = false;
@@ -196,6 +200,9 @@ fn shell_runs_history(command: &str) -> bool {
     let mut redirect_target_next = false;
     let mut heredocs = Vec::new();
     let mut stdin_heredoc = None;
+    // One entry per open `(`: whether it opened `((`/`$((` arithmetic, where
+    // `<<` is a shift rather than a heredoc.
+    let mut parens = Vec::new();
     let mut chars = command.chars();
     while let Some(ch) = chars.next() {
         if escaped {
@@ -216,7 +223,10 @@ fn shell_runs_history(command: &str) -> bool {
             Some(_) => word.push(ch),
             None => match ch {
                 '\\' => escaped = true,
-                '\'' | '"' => quote = Some(ch),
+                '\'' | '"' => {
+                    word_quoted |= word.is_empty();
+                    quote = Some(ch);
+                }
                 // `<<<` is a here-string: its word is data, not a heredoc.
                 '<' if chars.as_str().starts_with("<<") => {
                     chars.next();
@@ -227,10 +237,11 @@ fn shell_runs_history(command: &str) -> bool {
                 '&' if word.ends_with(['>', '<']) || chars.as_str().starts_with('>') => {
                     word.push(ch);
                 }
-                '<' if chars.clone().next() == Some('<') => {
+                '<' if chars.clone().next() == Some('<') && !parens.contains(&true) => {
                     if let Some(heredoc) = read_heredoc(&mut chars) {
                         if first_word_is_history(
                             &mut word,
+                            &mut word_quoted,
                             &mut command_position,
                             &mut shell_launcher,
                             &mut script_next,
@@ -247,6 +258,7 @@ fn shell_runs_history(command: &str) -> bool {
                 '\n' => {
                     if first_word_is_history(
                         &mut word,
+                        &mut word_quoted,
                         &mut command_position,
                         &mut shell_launcher,
                         &mut script_next,
@@ -273,6 +285,7 @@ fn shell_runs_history(command: &str) -> bool {
                 ';' | '&' | '|' | '(' | ')' | '{' | '}' | '`' => {
                     if first_word_is_history(
                         &mut word,
+                        &mut word_quoted,
                         &mut command_position,
                         &mut shell_launcher,
                         &mut script_next,
@@ -285,10 +298,23 @@ fn shell_runs_history(command: &str) -> bool {
                     shell_launcher = false;
                     script_next = false;
                     redirect_target_next = false;
+                    if ch == '(' {
+                        let arithmetic = chars.clone().next() == Some('(');
+                        if arithmetic {
+                            chars.next();
+                        }
+                        parens.push(arithmetic);
+                    } else if ch == ')'
+                        && parens.pop() == Some(true)
+                        && chars.clone().next() == Some(')')
+                    {
+                        chars.next();
+                    }
                 }
                 ch if ch.is_whitespace() => {
                     if first_word_is_history(
                         &mut word,
+                        &mut word_quoted,
                         &mut command_position,
                         &mut shell_launcher,
                         &mut script_next,
@@ -303,6 +329,7 @@ fn shell_runs_history(command: &str) -> bool {
     }
     first_word_is_history(
         &mut word,
+        &mut word_quoted,
         &mut command_position,
         &mut shell_launcher,
         &mut script_next,
@@ -997,6 +1024,14 @@ mod tests {
             "bash >out <<'EOF'\nch search q\nEOF",
             "bash <<'EOF' 2>&1 >>log\nch search q\nEOF",
             "diff <(chat-history search a 2>/dev/null) <(ch search b)",
+            "echo $((1<<4))\nch search q",
+            "(( x << 2 )) && ch search q",
+            "(( x << 2 ))\nch search q\n2",
+            "echo $(( (1 << 2) + 1 ))\nch search q",
+            "((cd /tmp; ch search q))",
+            "bash -c '>log chat-history search q'",
+            "sh -c \"2>/dev/null ch search q\"",
+            "bash -c 'echo ok' 2>/dev/null <<'EOF'; ch view id\nx\nEOF",
         ] {
             assert!(is_history_command(cmd), "{cmd}");
         }
