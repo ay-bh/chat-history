@@ -234,7 +234,10 @@ fn reclaim_previous_generations(dir: &Path) {
 struct Progress {
     terminal: bool,
     last: Instant,
+    /// A line has been printed (off a terminal, the only one).
     shown: bool,
+    /// A terminal line is on screen and not yet cleared.
+    active: bool,
 }
 
 impl Progress {
@@ -250,6 +253,7 @@ impl Progress {
             terminal,
             last: start,
             shown: false,
+            active: false,
         }
     }
 
@@ -260,22 +264,40 @@ impl Progress {
         }
         self.last = now;
         self.shown = true;
+        self.active = self.terminal;
+        // The same index may be in memory and rebuilt next time, so this
+        // makes no promise about later searches.
         Some(if self.terminal {
             format!("\rUpdating search index: {done}/{total} sessions")
         } else {
-            format!("Updating search index ({total} sessions); later searches reuse it.\n")
+            format!("Updating search index ({total} sessions)…\n")
         })
     }
 
     /// What clears the terminal line once the search is done.
     fn finish(&self) -> Option<String> {
-        (self.terminal && self.shown).then(|| "\r\x1b[2K".to_string())
+        self.active.then(|| "\r\x1b[2K".to_string())
+    }
+
+    /// Clears the terminal line now, so other output starts on a clean line.
+    fn clear(&mut self) -> Option<String> {
+        let clear = self.finish();
+        self.active = false;
+        clear
+    }
+
+    /// Prints a warning on its own line, clearing any progress first.
+    fn warn(&mut self, message: &str) {
+        if let Some(clear) = self.clear() {
+            eprint!("{clear}");
+        }
+        eprintln!("{message}");
     }
 }
 
 impl Drop for Progress {
     fn drop(&mut self) {
-        if let Some(clear) = self.finish() {
+        if let Some(clear) = self.clear() {
             eprint!("{clear}");
         }
     }
@@ -336,16 +358,16 @@ pub fn search_corpus(
             Ok(backend) => backend,
             Err(error) if is_corrupt(&error) && !reset_done => {
                 reset_done = true;
-                eprintln!("Warning: search cache is corrupt ({error}); resetting it in place.");
+                progress.warn(&format!(
+                    "Warning: search cache is corrupt ({error}); resetting it in place."
+                ));
                 if let Err(e) = reset_in_place(dir) {
-                    eprintln!("Warning: search cache reset failed ({e}).");
+                    progress.warn(&format!("Warning: search cache reset failed ({e})."));
                 }
                 continue;
             }
             Err(error) => {
-                eprintln!(
-                    "Warning: search cache unavailable ({error}); searching with an in-memory BM25 index."
-                );
+                progress.warn(&format!("Warning: search cache unavailable ({error}); searching with an in-memory BM25 index."));
                 return memory_search(corpus, request, rebuild, &mut progress);
             }
         };
@@ -359,15 +381,15 @@ pub fn search_corpus(
             if is_corrupt(&error) && !reset_done {
                 reset_done = true;
                 drop(backend);
-                eprintln!("Warning: search cache is corrupt ({error}); resetting it in place.");
+                progress.warn(&format!(
+                    "Warning: search cache is corrupt ({error}); resetting it in place."
+                ));
                 if let Err(e) = reset_in_place(dir) {
-                    eprintln!("Warning: search cache reset failed ({e}).");
+                    progress.warn(&format!("Warning: search cache reset failed ({e})."));
                 }
                 continue;
             }
-            eprintln!(
-                "Warning: could not save search cache ({error}); searching with an in-memory BM25 index."
-            );
+            progress.warn(&format!("Warning: could not save search cache ({error}); searching with an in-memory BM25 index."));
             return memory_search(corpus, request, rebuild, &mut progress);
         }
         match backend.search(request) {
@@ -375,15 +397,11 @@ pub fn search_corpus(
                 Ok(true) => return Ok(results),
                 Ok(false) if attempt + 1 < CACHE_MISMATCH_ATTEMPTS => {}
                 Ok(false) => {
-                    eprintln!(
-                        "Warning: search cache replaced during retrieval; searching with an in-memory BM25 index."
-                    );
+                    progress.warn("Warning: search cache replaced during retrieval; searching with an in-memory BM25 index.");
                     break;
                 }
                 Err(error) => {
-                    eprintln!(
-                        "Warning: search cache query failed ({error}); searching with an in-memory BM25 index."
-                    );
+                    progress.warn(&format!("Warning: search cache query failed ({error}); searching with an in-memory BM25 index."));
                     return memory_search(corpus, request, rebuild, &mut progress);
                 }
             },
@@ -391,15 +409,15 @@ pub fn search_corpus(
                 // Damaged postings surface at MATCH time, after a clean sync.
                 reset_done = true;
                 drop(backend);
-                eprintln!("Warning: search cache is corrupt ({error}); resetting it in place.");
+                progress.warn(&format!(
+                    "Warning: search cache is corrupt ({error}); resetting it in place."
+                ));
                 if let Err(e) = reset_in_place(dir) {
-                    eprintln!("Warning: search cache reset failed ({e}).");
+                    progress.warn(&format!("Warning: search cache reset failed ({e})."));
                 }
             }
             Err(error) => {
-                eprintln!(
-                    "Warning: search cache query failed ({error}); searching with an in-memory BM25 index."
-                );
+                progress.warn(&format!("Warning: search cache query failed ({error}); searching with an in-memory BM25 index."));
                 return memory_search(corpus, request, rebuild, &mut progress);
             }
         }
@@ -1516,7 +1534,7 @@ mod tests {
         let first = p.tick(40, 100, start + Duration::from_millis(800));
         assert_eq!(
             first.as_deref(),
-            Some("Updating search index (100 sessions); later searches reuse it.\n")
+            Some("Updating search index (100 sessions)…\n")
         );
         assert_eq!(p.tick(70, 100, start + Duration::from_secs(3)), None);
         assert_eq!(p.tick(99, 100, start + Duration::from_secs(9)), None);
@@ -1541,6 +1559,34 @@ mod tests {
             Some("\rUpdating search index: 90/100 sessions")
         );
         assert_eq!(p.finish().as_deref(), Some("\r\x1b[2K"));
+    }
+
+    #[test]
+    fn progress_is_cleared_before_a_warning_on_a_terminal() {
+        let start = Instant::now();
+        let mut p = Progress::starting_at(true, start);
+        assert_eq!(p.clear(), None, "nothing shown yet");
+        p.tick(40, 100, start + Duration::from_millis(800));
+        assert_eq!(
+            p.clear().as_deref(),
+            Some("\r\x1b[2K"),
+            "clear the line first"
+        );
+        assert_eq!(p.finish(), None, "already cleared; nothing left to clear");
+        // Progress resumes on a fresh line after the warning.
+        assert!(
+            p.tick(60, 100, start + Duration::from_millis(1600))
+                .is_some()
+        );
+        assert_eq!(p.finish().as_deref(), Some("\r\x1b[2K"));
+
+        let mut captured = Progress::starting_at(false, start);
+        captured.tick(40, 100, start + Duration::from_millis(800));
+        assert_eq!(
+            captured.clear(),
+            None,
+            "a captured line ends in a newline already"
+        );
     }
 
     #[test]
