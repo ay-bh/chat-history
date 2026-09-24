@@ -143,11 +143,21 @@ fn shell_runs_history(command: &str) -> bool {
         command_position: &mut bool,
         shell_launcher: &mut bool,
         script_next: &mut bool,
+        redirect_target_next: &mut bool,
     ) -> bool {
         if word.is_empty() {
             return false;
         }
         let token = std::mem::take(word);
+        // A redirection (`>out`, `> out`, `2>&1`, `&>log`) and its target are
+        // not arguments: they neither name a command nor a script path.
+        if std::mem::take(redirect_target_next) {
+            return false;
+        }
+        if let Some(needs_target) = redirection(&token) {
+            *redirect_target_next = needs_target;
+            return false;
+        }
         if *script_next {
             *script_next = false;
             return shell_runs_history(&token);
@@ -183,6 +193,7 @@ fn shell_runs_history(command: &str) -> bool {
     let mut script_next = false;
     let mut quote = None;
     let mut escaped = false;
+    let mut redirect_target_next = false;
     let mut heredocs = Vec::new();
     let mut stdin_heredoc = None;
     let mut chars = command.chars();
@@ -206,6 +217,16 @@ fn shell_runs_history(command: &str) -> bool {
             None => match ch {
                 '\\' => escaped = true,
                 '\'' | '"' => quote = Some(ch),
+                // `<<<` is a here-string: its word is data, not a heredoc.
+                '<' if chars.as_str().starts_with("<<") => {
+                    chars.next();
+                    chars.next();
+                    word.push_str("<<<");
+                }
+                // `2>&1`, `>&2` and `&>log` are redirections, not `&` separators.
+                '&' if word.ends_with(['>', '<']) || chars.as_str().starts_with('>') => {
+                    word.push(ch);
+                }
                 '<' if chars.clone().next() == Some('<') => {
                     if let Some(heredoc) = read_heredoc(&mut chars) {
                         if first_word_is_history(
@@ -213,6 +234,7 @@ fn shell_runs_history(command: &str) -> bool {
                             &mut command_position,
                             &mut shell_launcher,
                             &mut script_next,
+                            &mut redirect_target_next,
                         ) {
                             return true;
                         }
@@ -228,6 +250,7 @@ fn shell_runs_history(command: &str) -> bool {
                         &mut command_position,
                         &mut shell_launcher,
                         &mut script_next,
+                        &mut redirect_target_next,
                     ) {
                         return true;
                     }
@@ -235,6 +258,7 @@ fn shell_runs_history(command: &str) -> bool {
                     command_position = true;
                     shell_launcher = false;
                     script_next = false;
+                    redirect_target_next = false;
                     for heredoc in std::mem::take(&mut heredocs) {
                         let body = heredoc_body(&mut chars, &heredoc);
                         if (heredoc.shell_input && shell_runs_history(&body))
@@ -252,6 +276,7 @@ fn shell_runs_history(command: &str) -> bool {
                         &mut command_position,
                         &mut shell_launcher,
                         &mut script_next,
+                        &mut redirect_target_next,
                     ) {
                         return true;
                     }
@@ -259,6 +284,7 @@ fn shell_runs_history(command: &str) -> bool {
                     command_position = true;
                     shell_launcher = false;
                     script_next = false;
+                    redirect_target_next = false;
                 }
                 ch if ch.is_whitespace() => {
                     if first_word_is_history(
@@ -266,6 +292,7 @@ fn shell_runs_history(command: &str) -> bool {
                         &mut command_position,
                         &mut shell_launcher,
                         &mut script_next,
+                        &mut redirect_target_next,
                     ) {
                         return true;
                     }
@@ -279,7 +306,18 @@ fn shell_runs_history(command: &str) -> bool {
         &mut command_position,
         &mut shell_launcher,
         &mut script_next,
+        &mut redirect_target_next,
     )
+}
+
+/// Whether a word is a redirection, and if so whether its target is the
+/// next word (`>` alone) rather than attached (`>out`, `2>&1`).
+fn redirection(token: &str) -> Option<bool> {
+    let op = token.trim_start_matches(|c: char| c.is_ascii_digit());
+    if !(op.starts_with(['>', '<']) || op.starts_with("&>")) {
+        return None;
+    }
+    Some(op.trim_start_matches(['>', '<', '&']).is_empty())
 }
 
 struct Heredoc {
@@ -935,6 +973,8 @@ mod tests {
             "bash <<'EOF' script.sh\nch search q\nEOF",
             "bash <<'FIRST' <<'SECOND'\nch search q\nFIRST\necho ready\nSECOND",
             "bash <<'FIRST'; cat <<'SECOND'\necho ready\nFIRST\nch search q\nSECOND",
+            "cat <<< 'ch search q'",
+            "bash script.sh >out <<'EOF'\nch search q\nEOF",
         ] {
             assert!(!is_history_command(cmd), "{cmd}");
         }
@@ -951,6 +991,12 @@ mod tests {
             "bash <<'FIRST' <<'SECOND'\necho ignored\nFIRST\nch search q\nSECOND",
             "bash <<'EOF'; echo ready\nch search q\nEOF",
             "cat <<'FIRST'; bash <<'SECOND'\nch search q\nFIRST\nch view id\nSECOND",
+            "cat <<< \"x\"\nchat-history search q",
+            "grep -c a <<< \"$x\"; ch view id",
+            "bash <<'EOF' >out\nch search q\nEOF",
+            "bash >out <<'EOF'\nch search q\nEOF",
+            "bash <<'EOF' 2>&1 >>log\nch search q\nEOF",
+            "diff <(chat-history search a 2>/dev/null) <(ch search b)",
         ] {
             assert!(is_history_command(cmd), "{cmd}");
         }
