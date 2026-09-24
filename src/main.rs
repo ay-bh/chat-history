@@ -385,13 +385,15 @@ fn main() {
     let cli = Cli::parse();
 
     if let Some(Commands::Search { engine, .. }) = &cli.command {
-        if engine.as_deref().is_some_and(|e| e != "bm25") {
+        let removed_engine =
+            |e: &str| !e.trim().is_empty() && !e.trim().eq_ignore_ascii_case("bm25");
+        if engine.as_deref().is_some_and(removed_engine) {
             eprintln!(
                 "error: the legacy search engine was removed; BM25 is the only engine. Drop --engine."
             );
             std::process::exit(2);
         }
-        if std::env::var("CHAT_HISTORY_SEARCH_ENGINE").is_ok_and(|e| e != "bm25") {
+        if std::env::var("CHAT_HISTORY_SEARCH_ENGINE").is_ok_and(|e| removed_engine(&e)) {
             eprintln!(
                 "warning: CHAT_HISTORY_SEARCH_ENGINE is ignored; the legacy search engine was removed."
             );

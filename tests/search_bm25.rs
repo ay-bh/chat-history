@@ -1020,10 +1020,22 @@ fn cli_defaults_to_bm25_and_supports_no_cache() {
             .join(INDEX_FILENAME)
             .exists()
     );
-    command(&tmp)
-        .args(["search", "uniquecli", "--engine", "bm25", "--json"])
-        .assert()
-        .success();
+    for engine in ["bm25", "BM25"] {
+        command(&tmp)
+            .args(["search", "uniquecli", "--engine", engine, "--json"])
+            .assert()
+            .success();
+    }
+    for value in ["", "BM25"] {
+        command(&tmp)
+            .env("CHAT_HISTORY_SEARCH_ENGINE", value)
+            .args(["search", "uniquecli", "--json"])
+            .assert()
+            .success()
+            .stderr(predicates::prelude::PredicateBooleanExt::not(
+                predicates::str::contains("CHAT_HISTORY_SEARCH_ENGINE"),
+            ));
+    }
     for engine in ["legacy", "unknown"] {
         command(&tmp)
             .args(["search", "uniquecli", "--engine", engine])
