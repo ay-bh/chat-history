@@ -1128,7 +1128,13 @@ pub fn export_transcript(messages: &[Message], session: &Session, out_path: Opti
     }
     let content = lines.join("\n");
     let Some(path) = out_path else {
-        print!("{content}");
+        // A terminal must not run escape sequences from transcript text; a
+        // pipe or redirect gets the same bytes `-o` would write.
+        if std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+            print!("{}", tty(&content));
+        } else {
+            print!("{content}");
+        }
         return true;
     };
     match std::fs::write(path, &content) {
