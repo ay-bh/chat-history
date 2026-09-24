@@ -227,16 +227,69 @@ fn reclaim_previous_generations(dir: &Path) {
     }
 }
 
+/// Index-sync progress on stderr. A terminal gets one line rewritten in
+/// place and cleared when the search ends. Anything else, such as an agent
+/// capturing output, gets at most one line, and only when the sync is slow
+/// enough to notice.
+struct Progress {
+    terminal: bool,
+    last: Instant,
+    shown: bool,
+}
+
+impl Progress {
+    const INTERVAL: Duration = Duration::from_millis(750);
+
+    fn new() -> Self {
+        use std::io::IsTerminal;
+        Self::starting_at(std::io::stderr().is_terminal(), Instant::now())
+    }
+
+    fn starting_at(terminal: bool, start: Instant) -> Self {
+        Self {
+            terminal,
+            last: start,
+            shown: false,
+        }
+    }
+
+    /// What to print now, if anything.
+    fn tick(&mut self, done: usize, total: usize, now: Instant) -> Option<String> {
+        if now.duration_since(self.last) < Self::INTERVAL || (self.shown && !self.terminal) {
+            return None;
+        }
+        self.last = now;
+        self.shown = true;
+        Some(if self.terminal {
+            format!("\rUpdating search index: {done}/{total} sessions")
+        } else {
+            format!("Updating search index ({total} sessions); later searches reuse it.\n")
+        })
+    }
+
+    /// What clears the terminal line once the search is done.
+    fn finish(&self) -> Option<String> {
+        (self.terminal && self.shown).then(|| "\r\x1b[2K".to_string())
+    }
+}
+
+impl Drop for Progress {
+    fn drop(&mut self) {
+        if let Some(clear) = self.finish() {
+            eprint!("{clear}");
+        }
+    }
+}
+
 fn sync_corpus(
     backend: &mut Bm25Backend,
     corpus: &[Session],
     rebuild: bool,
-    last_progress: &mut std::time::Instant,
+    progress: &mut Progress,
 ) -> Result<SyncStats> {
     backend.sync_with_progress(corpus, rebuild, |done, total| {
-        if last_progress.elapsed() >= Duration::from_millis(750) {
-            eprintln!("Updating search index: {done}/{total} sessions");
-            *last_progress = std::time::Instant::now();
+        if let Some(line) = progress.tick(done, total, Instant::now()) {
+            eprint!("{line}");
         }
     })
 }
@@ -245,10 +298,10 @@ fn memory_search(
     corpus: &[Session],
     request: &SearchRequest<'_>,
     rebuild: bool,
-    last_progress: &mut std::time::Instant,
+    progress: &mut Progress,
 ) -> Result<Vec<SearchResult>> {
     let mut backend = Bm25Backend::open(None)?;
-    sync_corpus(&mut backend, corpus, rebuild, last_progress)?;
+    sync_corpus(&mut backend, corpus, rebuild, progress)?;
     backend.search(request)
 }
 
@@ -273,9 +326,9 @@ pub fn search_corpus(
     if match_query(request.query)?.is_none() {
         return Ok(Vec::new());
     }
-    let mut last_progress = Instant::now();
+    let mut progress = Progress::new();
     let Some(dir) = directory else {
-        return memory_search(corpus, request, rebuild, &mut last_progress);
+        return memory_search(corpus, request, rebuild, &mut progress);
     };
     let mut reset_done = false;
     for attempt in 0..CACHE_MISMATCH_ATTEMPTS {
@@ -293,10 +346,10 @@ pub fn search_corpus(
                 eprintln!(
                     "Warning: search cache unavailable ({error}); searching with an in-memory BM25 index."
                 );
-                return memory_search(corpus, request, rebuild, &mut last_progress);
+                return memory_search(corpus, request, rebuild, &mut progress);
             }
         };
-        if let Err(error) = sync_corpus(&mut backend, corpus, rebuild, &mut last_progress) {
+        if let Err(error) = sync_corpus(&mut backend, corpus, rebuild, &mut progress) {
             if error.to_string().starts_with("no such table")
                 && attempt + 1 < CACHE_MISMATCH_ATTEMPTS
             {
@@ -315,7 +368,7 @@ pub fn search_corpus(
             eprintln!(
                 "Warning: could not save search cache ({error}); searching with an in-memory BM25 index."
             );
-            return memory_search(corpus, request, rebuild, &mut last_progress);
+            return memory_search(corpus, request, rebuild, &mut progress);
         }
         match backend.search(request) {
             Ok(results) => match indexed_session_keys_match(&backend.conn, corpus) {
@@ -331,7 +384,7 @@ pub fn search_corpus(
                     eprintln!(
                         "Warning: search cache query failed ({error}); searching with an in-memory BM25 index."
                     );
-                    return memory_search(corpus, request, rebuild, &mut last_progress);
+                    return memory_search(corpus, request, rebuild, &mut progress);
                 }
             },
             Err(error) if is_corrupt(&error) && !reset_done => {
@@ -347,11 +400,11 @@ pub fn search_corpus(
                 eprintln!(
                     "Warning: search cache query failed ({error}); searching with an in-memory BM25 index."
                 );
-                return memory_search(corpus, request, rebuild, &mut last_progress);
+                return memory_search(corpus, request, rebuild, &mut progress);
             }
         }
     }
-    memory_search(corpus, request, rebuild, &mut last_progress)
+    memory_search(corpus, request, rebuild, &mut progress)
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -1433,6 +1486,9 @@ impl SearchBackend for Bm25Backend {
 
 #[cfg(test)]
 mod tests {
+    use super::Progress;
+    use std::time::{Duration, Instant};
+
     #[test]
     fn sync_batches_are_bounded_by_session_count_and_source_bytes() {
         let sizes = [10u64, 30, 5, 1, 1, 1, 50];
@@ -1447,6 +1503,45 @@ mod tests {
     }
 
     use super::{grouped_message_oversample, match_query};
+
+    #[test]
+    fn progress_off_a_terminal_is_one_line_and_only_when_slow() {
+        let start = Instant::now();
+        let mut p = Progress::starting_at(false, start);
+        assert_eq!(
+            p.tick(10, 100, start + Duration::from_millis(200)),
+            None,
+            "fast syncs say nothing"
+        );
+        let first = p.tick(40, 100, start + Duration::from_millis(800));
+        assert_eq!(
+            first.as_deref(),
+            Some("Updating search index (100 sessions); later searches reuse it.\n")
+        );
+        assert_eq!(p.tick(70, 100, start + Duration::from_secs(3)), None);
+        assert_eq!(p.tick(99, 100, start + Duration::from_secs(9)), None);
+        assert_eq!(p.finish(), None);
+    }
+
+    #[test]
+    fn progress_on_a_terminal_rewrites_one_line_and_clears_it() {
+        let start = Instant::now();
+        let mut p = Progress::starting_at(true, start);
+        assert_eq!(p.finish(), None, "nothing shown, nothing to clear");
+        assert_eq!(p.tick(1, 100, start + Duration::from_millis(100)), None);
+        assert_eq!(
+            p.tick(40, 100, start + Duration::from_millis(800))
+                .as_deref(),
+            Some("\rUpdating search index: 40/100 sessions")
+        );
+        assert_eq!(p.tick(41, 100, start + Duration::from_millis(900)), None);
+        assert_eq!(
+            p.tick(90, 100, start + Duration::from_millis(1600))
+                .as_deref(),
+            Some("\rUpdating search index: 90/100 sessions")
+        );
+        assert_eq!(p.finish().as_deref(), Some("\r\x1b[2K"));
+    }
 
     #[test]
     fn grouped_oversample_stays_bounded() {
