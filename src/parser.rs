@@ -145,6 +145,7 @@ fn shell_runs_history(command: &str) -> bool {
         shell_launcher: &mut bool,
         script_next: &mut bool,
         redirect_target_next: &mut bool,
+        stdin_heredoc: &mut Option<usize>,
     ) -> bool {
         let quoted = std::mem::take(word_quoted);
         if word.is_empty() {
@@ -157,7 +158,11 @@ fn shell_runs_history(command: &str) -> bool {
         if std::mem::take(redirect_target_next) {
             return false;
         }
-        if !quoted && let Some(needs_target) = redirection(&token) {
+        if !quoted && let Some((needs_target, stdin)) = redirection(&token) {
+            // A later `</dev/null` or `<<<word` replaces a heredoc as stdin.
+            if stdin {
+                *stdin_heredoc = None;
+            }
             *redirect_target_next = needs_target;
             return false;
         }
@@ -239,6 +244,13 @@ fn shell_runs_history(command: &str) -> bool {
                 }
                 '<' if chars.clone().next() == Some('<') && !parens.contains(&true) => {
                     if let Some(heredoc) = read_heredoc(&mut chars) {
+                        // `2<<ERR` feeds descriptor 2; only descriptor 0 is stdin.
+                        let descriptor = if !word_quoted && word.bytes().all(|b| b.is_ascii_digit())
+                        {
+                            std::mem::take(&mut word)
+                        } else {
+                            String::new()
+                        };
                         if first_word_is_history(
                             &mut word,
                             &mut word_quoted,
@@ -246,10 +258,13 @@ fn shell_runs_history(command: &str) -> bool {
                             &mut shell_launcher,
                             &mut script_next,
                             &mut redirect_target_next,
+                            &mut stdin_heredoc,
                         ) {
                             return true;
                         }
-                        stdin_heredoc = Some(heredocs.len());
+                        if matches!(descriptor.as_str(), "" | "0") {
+                            stdin_heredoc = Some(heredocs.len());
+                        }
                         heredocs.push(heredoc);
                     } else {
                         word.push(ch);
@@ -263,6 +278,7 @@ fn shell_runs_history(command: &str) -> bool {
                         &mut shell_launcher,
                         &mut script_next,
                         &mut redirect_target_next,
+                        &mut stdin_heredoc,
                     ) {
                         return true;
                     }
@@ -290,6 +306,7 @@ fn shell_runs_history(command: &str) -> bool {
                         &mut shell_launcher,
                         &mut script_next,
                         &mut redirect_target_next,
+                        &mut stdin_heredoc,
                     ) {
                         return true;
                     }
@@ -319,6 +336,7 @@ fn shell_runs_history(command: &str) -> bool {
                         &mut shell_launcher,
                         &mut script_next,
                         &mut redirect_target_next,
+                        &mut stdin_heredoc,
                     ) {
                         return true;
                     }
@@ -334,17 +352,24 @@ fn shell_runs_history(command: &str) -> bool {
         &mut shell_launcher,
         &mut script_next,
         &mut redirect_target_next,
+        &mut stdin_heredoc,
     )
 }
 
 /// Whether a word is a redirection, and if so whether its target is the
-/// next word (`>` alone) rather than attached (`>out`, `2>&1`).
-fn redirection(token: &str) -> Option<bool> {
+/// next word (`>` alone) rather than attached (`>out`, `2>&1`), and whether
+/// it replaces standard input (`<file`, `0<file`, `<<<word`, `<&3`).
+fn redirection(token: &str) -> Option<(bool, bool)> {
     let op = token.trim_start_matches(|c: char| c.is_ascii_digit());
     if !(op.starts_with(['>', '<']) || op.starts_with("&>")) {
         return None;
     }
-    Some(op.trim_start_matches(['>', '<', '&']).is_empty())
+    let descriptor = &token[..token.len() - op.len()];
+    let stdin = match descriptor {
+        "" => op.starts_with('<'),
+        _ => descriptor == "0",
+    };
+    Some((op.trim_start_matches(['>', '<', '&']).is_empty(), stdin))
 }
 
 struct Heredoc {
@@ -1002,6 +1027,10 @@ mod tests {
             "bash <<'FIRST'; cat <<'SECOND'\necho ready\nFIRST\nch search q\nSECOND",
             "cat <<< 'ch search q'",
             "bash script.sh >out <<'EOF'\nch search q\nEOF",
+            "bash <<'EOF' < /dev/null\nch search q\nEOF",
+            "bash <<'EOF' </dev/null\nch search q\nEOF",
+            "bash <<'EOF' 0</dev/null\nch search q\nEOF",
+            "bash <<'EOF' <<< 'echo ready'\nch search q\nEOF",
         ] {
             assert!(!is_history_command(cmd), "{cmd}");
         }
@@ -1032,6 +1061,10 @@ mod tests {
             "bash -c '>log chat-history search q'",
             "sh -c \"2>/dev/null ch search q\"",
             "bash -c 'echo ok' 2>/dev/null <<'EOF'; ch view id\nx\nEOF",
+            "bash 2<<'ERR' <<'SCRIPT'\nignored\nERR\nch search q\nSCRIPT",
+            "bash 3<<'X' 0<<'SCRIPT'\nignored\nX\nch search q\nSCRIPT",
+            "bash < /dev/null <<'EOF'\nch search q\nEOF",
+            "bash <<'SCRIPT' 2<<'ERR'\nch search q\nSCRIPT\nignored\nERR",
         ] {
             assert!(is_history_command(cmd), "{cmd}");
         }
