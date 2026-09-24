@@ -126,7 +126,10 @@ fn wrapper_option_takes_value(wrapper: &str, option: &str) -> bool {
                 | "--command-timeout"
                 | "--chroot"
         ),
-        "env" => matches!(option, "-u" | "-C" | "--unset" | "--chdir"),
+        "env" => matches!(
+            option,
+            "-u" | "-C" | "-a" | "--unset" | "--chdir" | "--argv0"
+        ),
         "nice" => matches!(option, "-n" | "--adjustment"),
         "timeout" => matches!(option, "-s" | "-k" | "--signal" | "--kill-after"),
         "time" => matches!(option, "-f" | "-o" | "--format" | "--output"),
@@ -242,8 +245,13 @@ fn shell_runs_history(command: &str) -> bool {
             if std::mem::take(&mut active.value_next) {
                 return false;
             }
-            // `command -v ch` looks the command up without running it.
-            if active.name == "command" && matches!(token.as_str(), "-v" | "-V") {
+            // `command -v ch` (or `-pv`) looks the command up without running it.
+            if active.name == "command"
+                && token.len() > 1
+                && token.starts_with('-')
+                && token[1..].chars().all(|c| matches!(c, 'p' | 'v' | 'V'))
+                && token.contains(['v', 'V'])
+            {
                 *position = Position::Argument;
                 return false;
             }
@@ -1103,6 +1111,8 @@ mod tests {
             "env -u HOME CHAT_HISTORY_NO_CACHE=1 ch search q",
             "time -p ch search q",
             "exec -a name chat-history search q",
+            "command -p ch search q",
+            "env -a name ch search q",
             "nohup nice -n 5 timeout 30 ch search q",
             "cd /tmp && timeout 60 ch search q",
         ] {
@@ -1111,6 +1121,10 @@ mod tests {
         for cmd in [
             "command -v chat-history",
             "command -V ch",
+            "command -pv ch",
+            "command -Vp chat-history",
+            "env -a ch ls",
+            "env --argv0 chat-history ls",
             "timeout 60 rg chat-history README.md",
             "nice -n 10 cargo test chat-history",
             "sudo -u ch ls",
