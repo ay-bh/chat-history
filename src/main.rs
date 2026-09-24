@@ -42,12 +42,12 @@ fn cli_timeframe(value: &str) -> Result<String, String> {
         the Cursor sidebar instead.",
     version,
     after_help = "EXAMPLES:\n  \
-        chat-history                                  list sessions, newest first\n  \
-        chat-history --from yesterday --to yesterday  sessions from a specific day\n  \
-        chat-history search \"auth error\" --deep --json\n  \
-        chat-history --source cursor-ide              IDE sidebar chats only\n  \
-        chat-history inspect 6b1094cd                 summarize by short ID\n  \
-        chat-history view 6b1094cd --plain | less\n\n\
+        chat-history                                    list sessions, newest first\n  \
+        chat-history --from yesterday --to yesterday    sessions from a specific day\n  \
+        chat-history search \"auth error\" --compact      one line per hit (--json for scripts)\n  \
+        chat-history --source cursor-ide                IDE sidebar chats only\n  \
+        chat-history inspect 6b1094cd 0f9b82b1 --brief  compare sessions, a few lines each\n  \
+        chat-history view 6b1094cd --plain --around 42  message #42 (a hit's ordinal) and neighbours\n\n\
         EXIT CODES:\n  \
         0 success, 1 not found / IO error, 2 usage error or ambiguous session ID"
 )]
@@ -108,7 +108,7 @@ struct Cli {
 enum Commands {
     /// Search session content and metadata with BM25 relevance ranking
     #[command(
-        after_help = "EXAMPLES:\n  chat-history search 'auth error' --json\n  chat-history search 'src/parser.rs' --scope files\n  chat-history search 'auth error' --engine legacy --deep\n\nExplicit flags override environment variables. BM25 searches transcripts by default."
+        after_help = "EXAMPLES:\n  chat-history search 'auth error' --compact\n  chat-history search 'auth error' --json\n  chat-history search 'src/parser.rs' --scope files\n  chat-history search 'auth error' --engine legacy --deep\n\nExplicit flags override environment variables. BM25 searches transcripts by default."
     )]
     Search {
         /// Search query, or a full session UUID for direct lookup
