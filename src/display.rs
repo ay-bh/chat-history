@@ -1,6 +1,6 @@
 use crate::inspect::InspectInfo;
 use crate::parser::{clean_prompt, display_title, snippet_around_match, strip_terminal_controls};
-use crate::search::{IndexResult, SearchResult};
+use crate::search::SearchResult;
 use crate::session::{self, Message, Session};
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
@@ -264,43 +264,6 @@ pub fn print_summarized(sessions: &[Session]) {
     }
 }
 
-pub fn print_index_results(results: &[IndexResult], query: &str) {
-    if results.is_empty() {
-        println!("{}No results for \"{}\".{}", c!("dim"), query, c!("reset"));
-        return;
-    }
-    println!(
-        "\n{}{} results for \"{}\"{}  {}(index search — use --deep for full transcript search){}\n",
-        c!("bold"),
-        results.len(),
-        query,
-        c!("reset"),
-        c!("dim"),
-        c!("reset")
-    );
-    for (i, r) in results.iter().enumerate() {
-        let tag = src_tag(&r.session.source, r.session.also_ide);
-        let score = format!("{}★ {:.1}{}", c!("yellow"), r.score, c!("reset"));
-        let title = title_of(&r.session.summary, &r.display, 100);
-        println!(
-            "  {}{:3}.{} {} {}{}{} {} {}{}{}",
-            c!("dim"),
-            i + 1,
-            c!("reset"),
-            tag,
-            c!("cyan"),
-            r.session.date,
-            c!("reset"),
-            id_chip(&r.session),
-            score,
-            dir_label(&r.session.project),
-            labeled("INDEX_FIELD", &r.matched_field)
-        );
-        print_title_line(&title, &r.session);
-    }
-    println!();
-}
-
 pub fn print_search_results(results: &[SearchResult], query: &str) {
     if results.is_empty() {
         println!("{}No results for \"{}\".{}", c!("dim"), query, c!("reset"));
@@ -399,29 +362,6 @@ pub fn print_search_results_compact(results: &[SearchResult], query: &str) {
         println!(
             "{}{excerpt}{also}",
             compact_row(&r.session, r.ordinal, &title)
-        );
-    }
-}
-
-/// `print_search_results_compact` for legacy metadata matches, which have
-/// no message: the matched field stands in for the role.
-pub fn print_index_results_compact(results: &[IndexResult], query: &str) {
-    if results.is_empty() {
-        eprintln!("No results for \"{query}\".");
-    }
-    for r in results {
-        println!(
-            "{}  —  {}: {}",
-            compact_row(
-                &r.session,
-                None,
-                &title_of(&r.session.summary, &r.display, 80)
-            ),
-            tty(&r.matched_field),
-            tty(&clip_chars(
-                &compact_search_preview(&clean_prompt(&r.display)),
-                160
-            ))
         );
     }
 }
@@ -603,28 +543,6 @@ pub fn print_search_results_json(results: &[SearchResult], query: &str) {
         })
         .collect();
     let out = serde_json::json!({ "query": query, "count": items.len(), "results": items });
-    println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
-}
-
-pub fn print_index_results_json(results: &[IndexResult], query: &str) {
-    let items: Vec<serde_json::Value> = results
-        .iter()
-        .map(|r| {
-            serde_json::json!({
-                "session_id": r.session.id,
-                "source": r.session.source,
-                "also_ide": r.session.also_ide,
-                "metadata_only": r.session.is_cursor_store_only(),
-                "date": r.session.date,
-                "summary": r.session.summary,
-                "project": r.session.project,
-                "score": (r.score * 10.0).round() / 10.0,
-                "matched_field": r.matched_field,
-                "snippet": clean_prompt(&r.display).chars().take(200).collect::<String>(),
-            })
-        })
-        .collect();
-    let out = serde_json::json!({ "query": query, "count": items.len(), "results": items, "search_type": "index" });
     println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
 }
 

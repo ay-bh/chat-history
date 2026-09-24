@@ -22,7 +22,8 @@ The replacement has four goals:
   any time.
 - Require no background service, model download or network access.
 
-The legacy engine is retained behind `--engine legacy` for comparison.
+The previous engine has since been removed; only `--scope similar` keeps its
+word-overlap scorer.
 
 ## Components
 
@@ -37,28 +38,25 @@ flowchart TD
     F --> G
     E --> H[BM25 backend]
     G --> H
-    G --> L[Legacy backend]
+    G --> L[Similar-scope scorer]
     H --> I[Deduplicate and group ranked messages]
     I --> J[Match-aware excerpts and shared renderers]
     L --> J
 ```
 
 The code lives in `src/search_index.rs` (index and BM25 retrieval) and
-`src/search.rs` (result types, grouping and the legacy scorer).
+`src/search.rs` (result types, grouping and the `--scope similar` scorer).
 
 - `SearchBackend::search(&SearchRequest)` is the boundary between the CLI and
-  an engine. Either backend can be replaced without touching the renderers.
+  an engine. The backend can be replaced without touching the renderers.
 - `Bm25Backend` owns index synchronization and lexical retrieval.
-- `LegacyBackend` adapts the existing deep scorer. The CLI keeps the legacy
-  metadata shortcut only when `--engine legacy` is selected. Existing callers of
-  `scored_search` keep their old behavior.
 - `SearchResult` carries one message, an optional excerpt and up to two
-  `SearchMatch` children. Renderers keep a fallback path for legacy results,
-  which have no excerpt.
+  `SearchMatch` children. Renderers keep a fallback path for results without
+  an excerpt, which `--scope similar` produces.
 
-Two operations bypass BM25. Exact session UUID lookup is shared by both engines
-and runs before indexing; a UUID absent from the selected sessions falls through
-to a literal token-sequence search. `--scope similar` keeps the old user-message
+Two operations bypass BM25. Exact session UUID lookup runs before indexing; a
+UUID absent from the selected sessions falls through to a literal
+token-sequence search. `--scope similar` keeps the old user-message
 similarity calculation so the meaning of that option does not change.
 
 ## Storage
@@ -179,8 +177,8 @@ multi-chunk queries and come from separate match sets, so partial matches stay
 eligible. These weights are explicit initial policy, not learned or proven
 optimal. Newer timestamps break equal scores, then stable session and ordinal
 order. JSON preserves the score without rounding tiny values to zero. Scores
-are ranking signals, not probabilities, and are not comparable across engines
-or queries.
+are ranking signals, not probabilities, and are not comparable across
+queries.
 
 **Tool-output weight.** Chosen on 185 real agent searches whose relevant
 sessions were the ones the agent opened next. At weight 1 indexing Codex tool
@@ -239,18 +237,17 @@ readable IDE rows, which requires a separate cached Agent membership discovery.
 
 ## Compatibility
 
-- BM25 is the default engine. `--deep` is still accepted and only affects the
-  legacy metadata shortcut. `CHAT_HISTORY_SEARCH_ENGINE=legacy` restores the
-  old engine, and an explicit `--engine` takes precedence.
-- Default JSON always includes the former deep-search result fields. Legacy
-  metadata results keep `matched_field` and `search_type: index`. Message
-  results expose `additional_matches`; ungrouped rows use an empty array.
+- BM25 is the only engine. `--deep` and `--engine bm25` are still accepted,
+  hidden, and ignored; any other `--engine` value exits with a usage error that
+  says the engine was removed. Any other `CHAT_HISTORY_SEARCH_ENGINE` value is
+  ignored with a warning.
+- JSON always includes the former deep-search result fields. Message results
+  expose `additional_matches`; ungrouped rows use an empty array.
   `CHAT_HISTORY_SEARCH_GROUP_BY` controls grouping, with an explicit flag taking
-  precedence. Legacy and similarity searches keep their previous defaults.
-- Relevance ordering and result counts intentionally change. Short messages
-  remain eligible, multiple terms need not all match, and a metadata match
-  cannot suppress transcript retrieval. Legacy substring and importance
-  heuristics live only in the legacy engine.
+  precedence. Similarity searches default to message rows.
+- Relevance ordering and result counts changed from the previous engine. Short
+  messages remain eligible, multiple terms need not all match, and a metadata
+  match cannot suppress transcript retrieval.
 
 ## Alternatives considered
 
@@ -294,27 +291,25 @@ provenance, scopes, persistent refresh, rebuild and deletion, WAL-only edits,
 cache failures, UUID lookup, CLI selection, winning-passage excerpts, coverage
 and phrase bonuses, group filling and JSON children, unrelated Cursor writes,
 same-size WAL changes, and atomic database replacement. The CLI and Cursor
-reliability suites exercise the new default; the two metadata-output contract
-tests select the legacy engine explicitly.
+reliability suites exercise the same path.
 
 An eight-query synthetic fixture spans rare identifiers, filenames, error
 codes, acronyms, Unicode accents, separator normalization, multiple terms and
 prefixes. It asserts intended behavior, not relevance on real histories:
 
 ```sh
-cargo test --test search_bm25 judged_query_fixture -- --nocapture
+cargo test --test search_bm25 judged_query_fixture
 ```
 
 A synthetic benchmark builds 250 sessions and 5,000 messages in a temporary
-directory, then measures cold synchronization, a reopened warm index, one BM25
-query and the legacy deep query, and verifies that warm synchronization
-reparses zero sessions:
+directory, then measures cold synchronization, a reopened warm index and one
+BM25 query, and verifies that warm synchronization reparses zero sessions:
 
 ```sh
-cargo test --release --test search_bm25 benchmark_cold_warm_and_legacy -- --ignored --nocapture
+cargo test --release --test search_bm25 benchmark_cold_and_warm -- --ignored --nocapture
 ```
 
 Before tuning ranking weights, collect representative queries with expected
-sessions and compare Recall@5 and MRR across both engines, especially for exact
+sessions and compare Recall@5 and MRR before and after, especially for exact
 errors, filenames, short acronyms, verbose queries and old but relevant
 conversations.

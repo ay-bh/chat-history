@@ -1,5 +1,5 @@
 use chat_history::dates::parse_human_date;
-use chat_history::search_index::{self, LegacyBackend, SearchBackend, SearchRequest};
+use chat_history::search_index::{self, SearchRequest};
 use chat_history::session::{
     self, ResumeAction, SessionLookup, filter_sessions, load_sessions, lookup_session,
     parse_session, session_copies,
@@ -108,7 +108,7 @@ struct Cli {
 enum Commands {
     /// Search session content and metadata with BM25 relevance ranking
     #[command(
-        after_help = "EXAMPLES:\n  chat-history search 'auth error' --compact\n  chat-history search 'auth error' --json\n  chat-history search 'src/parser.rs' --scope files\n  chat-history search 'auth error' --engine legacy --deep\n\nExplicit flags override environment variables. BM25 searches transcripts by default."
+        after_help = "EXAMPLES:\n  chat-history search 'auth error' --compact\n  chat-history search 'auth error' --json\n  chat-history search 'src/parser.rs' --scope files\n\nExplicit flags override environment variables. BM25 searches transcripts by default."
     )]
     Search {
         /// Search query, or a full session UUID for direct lookup
@@ -116,13 +116,13 @@ enum Commands {
         /// What to search within transcripts
         #[arg(long, default_value = "all", value_parser = ["all", "errors", "similar", "tools", "files"])]
         scope: String,
-        /// Search full transcript content with legacy (already enabled with BM25)
-        #[arg(long)]
+        /// Accepted and ignored; older releases needed it to search transcripts
+        #[arg(long, hide = true)]
         deep: bool,
-        /// Ranking engine; legacy retains the previous metadata/deep search behavior
-        #[arg(long, env = "CHAT_HISTORY_SEARCH_ENGINE", default_value = "bm25", value_parser = ["bm25", "legacy"])]
-        engine: String,
-        /// Group hits by session or message (BM25 defaults to session; legacy/similar to message)
+        /// Removed: BM25 is the only engine. `bm25` is still accepted
+        #[arg(long, hide = true)]
+        engine: Option<String>,
+        /// Group hits by session or message (defaults to session; similar to message)
         #[arg(long, env = "CHAT_HISTORY_SEARCH_GROUP_BY", value_parser = ["session", "message"])]
         group_by: Option<String>,
         /// Reparse all sessions and replace the BM25 index contents
@@ -384,6 +384,22 @@ fn main() {
 
     let cli = Cli::parse();
 
+    if let Some(Commands::Search { engine, .. }) = &cli.command {
+        let removed_engine =
+            |e: &str| !e.trim().is_empty() && !e.trim().eq_ignore_ascii_case("bm25");
+        if engine.as_deref().is_some_and(removed_engine) {
+            eprintln!(
+                "error: the legacy search engine was removed; BM25 is the only engine. Drop --engine."
+            );
+            std::process::exit(2);
+        }
+        if std::env::var("CHAT_HISTORY_SEARCH_ENGINE").is_ok_and(|e| removed_engine(&e)) {
+            eprintln!(
+                "warning: CHAT_HISTORY_SEARCH_ENGINE is ignored; the legacy search engine was removed."
+            );
+        }
+    }
+
     if matches!(&cli.command, Some(Commands::CursorHook)) {
         use std::io::IsTerminal;
         let result = if std::io::stdin().is_terminal() {
@@ -437,8 +453,7 @@ fn main() {
             | Some(Commands::Resume { .. })
             | Some(Commands::Find { .. })
     );
-    let bm25_search =
-        matches!(&cli.command, Some(Commands::Search { engine, .. }) if engine == "bm25");
+    let bm25_search = matches!(&cli.command, Some(Commands::Search { .. }));
     let mut sessions = if id_lookup || bm25_search {
         load_sessions(None)
     } else {
@@ -493,8 +508,8 @@ fn main() {
         Some(Commands::Search {
             query,
             scope,
-            deep,
-            engine,
+            deep: _,
+            engine: _,
             group_by,
             rebuild_index,
             cache_dir,
@@ -516,30 +531,6 @@ fn main() {
                 });
             }
 
-            if engine == "legacy" && !deep && scope == "all" && !scoring::is_uuid(&query) {
-                let idx_results = search::index_search(&pre, &query, limit);
-                if search::index_quality_ok(&idx_results) {
-                    if json_output {
-                        display::print_index_results_json(&idx_results, &query);
-                    } else if compact {
-                        display::print_index_results_compact(&idx_results, &query);
-                    } else {
-                        display::print_index_results(&idx_results, &query);
-                    }
-                    return;
-                }
-                if !json_output {
-                    if !idx_results.is_empty() {
-                        eprintln!(
-                            "Index matches too weak (best: ★ {:.1}) — searching transcripts...",
-                            idx_results[0].score
-                        );
-                    } else {
-                        eprintln!("No index matches — searching transcripts...");
-                    }
-                }
-            }
-
             if scoring::is_uuid(&query)
                 && !json_output
                 && !pre.iter().any(|s| s.id.eq_ignore_ascii_case(query.trim()))
@@ -554,27 +545,26 @@ fn main() {
                 timeframe: timeframe.as_deref(),
                 group_by_session: group_by
                     .as_deref()
-                    .map_or(engine == "bm25" && scope != "similar", |value| {
-                        value == "session"
-                    }),
+                    .map_or(scope != "similar", |value| value == "session"),
             };
-            let result = if engine == "legacy" || scope == "similar" {
-                LegacyBackend.search(&request)
+            // `similar` ranks user messages directly and never opens the index,
+            // so it skips preparing (and possibly seeding) the cache directory.
+            let directory = if no_cache
+                || scope == "similar"
+                || std::env::var_os("CHAT_HISTORY_NO_CACHE").is_some()
+            {
+                None
             } else {
-                let directory = if no_cache || std::env::var_os("CHAT_HISTORY_NO_CACHE").is_some() {
-                    None
-                } else {
-                    cache_dir
-                        .filter(|p| !p.as_os_str().is_empty())
-                        .or_else(|| chat_history::cache_dir::prepare(search_index::INDEX_FILENAME))
-                };
-                search_index::search_corpus(
-                    search_corpus.as_deref().unwrap_or(&sessions),
-                    &request,
-                    directory.as_deref(),
-                    rebuild_index,
-                )
+                cache_dir
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .or_else(|| chat_history::cache_dir::prepare(search_index::INDEX_FILENAME))
             };
+            let result = search_index::search_corpus(
+                search_corpus.as_deref().unwrap_or(&sessions),
+                &request,
+                directory.as_deref(),
+                rebuild_index,
+            );
             let results = result.unwrap_or_else(|error| {
                 eprintln!("Search failed: {error}");
                 std::process::exit(1);

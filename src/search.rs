@@ -6,15 +6,7 @@ use rayon::prelude::*;
 use std::collections::{BTreeSet, HashMap};
 
 const MAX_MATCHES_PER_SESSION: usize = 3;
-const INDEX_QUALITY_THRESHOLD: f64 = 5.0;
 const MAX_TOTAL_BOOST: f64 = 10.0;
-
-pub struct IndexResult {
-    pub session: Session,
-    pub score: f64,
-    pub matched_field: String,
-    pub display: String,
-}
 
 pub struct SearchResult {
     pub session: Session,
@@ -56,115 +48,6 @@ pub fn group_results(results: Vec<SearchResult>, limit: usize) -> Vec<SearchResu
     grouped
 }
 
-pub fn index_search(sessions: &[Session], query: &str, limit: usize) -> Vec<IndexResult> {
-    let query_terms: Vec<String> = query
-        .to_lowercase()
-        .split_whitespace()
-        .map(String::from)
-        .collect();
-    if query_terms.is_empty() {
-        return Vec::new();
-    }
-
-    let field_weights: &[(&str, f64)] = &[
-        ("summary", 3.0),
-        ("first_prompt", 2.0),
-        ("branch", 1.0),
-        ("project", 1.0),
-    ];
-
-    let mut scored: Vec<IndexResult> = Vec::new();
-
-    for s in sessions {
-        let mut total_score = 0.0;
-        let mut best_field = "";
-        let mut best_weight = 0.0;
-
-        let field_values: [(&str, &str); 4] = [
-            ("summary", &s.summary),
-            ("first_prompt", &s.first_prompt),
-            ("branch", &s.branch),
-            ("project", &s.project),
-        ];
-
-        let mut all_found = true;
-        for term in &query_terms {
-            let mut term_found = false;
-            for (fname, fval, weight) in field_values
-                .iter()
-                .zip(field_weights.iter())
-                .map(|((n, v), (_, w))| (n, v, w))
-            {
-                if fval.to_lowercase().contains(term.as_str()) {
-                    term_found = true;
-                    total_score += weight;
-                    if *weight > best_weight {
-                        best_weight = *weight;
-                        best_field = fname;
-                    }
-                }
-            }
-            if !term_found {
-                all_found = false;
-                break;
-            }
-        }
-
-        if !all_found || total_score <= 0.0 {
-            continue;
-        }
-
-        let ts = if s.modified.is_empty() {
-            &s.created
-        } else {
-            &s.modified
-        };
-        total_score *= recency_multiplier(ts);
-
-        let display = match best_field {
-            "summary" => &s.summary,
-            "first_prompt" => &s.first_prompt,
-            "branch" => &s.branch,
-            "project" => &s.project,
-            _ => &s.summary,
-        };
-        let display = if display.is_empty() {
-            if !s.summary.is_empty() {
-                &s.summary
-            } else {
-                &s.first_prompt
-            }
-        } else {
-            display
-        };
-
-        scored.push(IndexResult {
-            session: s.clone(),
-            score: total_score,
-            matched_field: best_field.to_string(),
-            display: display.chars().take(200).collect(),
-        });
-    }
-
-    scored.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    scored.truncate(limit);
-    scored
-}
-
-pub fn index_quality_ok(results: &[IndexResult]) -> bool {
-    let Some(best) = results.first() else {
-        return false;
-    };
-    match best.matched_field.as_str() {
-        "summary" => best.score >= 4.5,
-        _ => best.score >= INDEX_QUALITY_THRESHOLD,
-    }
-}
-
 pub fn parse_timeframe_duration(tf: &str) -> Result<chrono::Duration, String> {
     let lower = tf.to_lowercase();
     let days = match lower.as_str() {
@@ -202,7 +85,7 @@ fn parse_timestamp(ts: &str) -> Option<DateTime<FixedOffset>> {
     crate::session::parse_any_timestamp(ts)
 }
 
-/// Resolve exact session identities before either lexical engine runs.
+/// Resolve exact session identities before any lexical search runs.
 pub(crate) fn direct_session_search(
     sessions: &[Session],
     query: &str,
@@ -274,18 +157,17 @@ pub(crate) fn direct_session_search(
     None
 }
 
-pub fn scored_search(
+/// `--scope similar`: user messages (and titles) ranked by word overlap with
+/// the query, then boosted and deduplicated. Callers resolve direct session
+/// lookups first.
+pub fn similar_search(
     sessions: &[Session],
     query: &str,
-    scope: &str,
     limit: usize,
     timeframe: Option<&str>,
 ) -> Vec<SearchResult> {
     if limit == 0 {
         return Vec::new();
-    }
-    if let Some(results) = direct_session_search(sessions, query, timeframe) {
-        return results;
     }
     let tf_cutoff = timeframe.and_then(timeframe_cutoff_fixed);
 
@@ -306,35 +188,12 @@ pub fn scored_search(
             long
         }
     };
-    let query_normalized = normalize_for_search(query);
-    let query_words_norm: Vec<String> = {
-        let deduped: BTreeSet<String> = query_normalized
-            .split_whitespace()
-            .filter(|w| w.len() > 2)
-            .map(String::from)
-            .collect();
-        if deduped.is_empty() {
-            query_normalized
-                .split_whitespace()
-                .filter(|w| w.len() >= 2)
-                .map(String::from)
-                .collect::<BTreeSet<String>>()
-                .into_iter()
-                .collect()
-        } else {
-            deduped.into_iter().collect()
-        }
-    };
-    let query_words_norm_refs: Vec<&str> = query_words_norm.iter().map(|s| s.as_str()).collect();
-
-    let use_similar = scope == "similar";
-
     let candidates: Vec<(Session, Message, String, Option<usize>)> = sessions
         .par_iter()
         .filter(|s| !s.file.is_empty() && std::path::Path::new(&s.file).exists())
         .flat_map(|s| {
             // Recovered times feed recency scoring, so recover them for every
-            // deep search: the same hit must score the same with and without
+            // search: the same hit must score the same with and without
             // --timeframe.
             let (messages, _) = parse_session_recovering_timestamps(s, false);
             let title = s.summary.clone();
@@ -378,16 +237,7 @@ pub fn scored_search(
                 if msg.history_output || is_noise(&cl) {
                     continue;
                 }
-                if scope == "errors" && msg.error_patterns.is_empty() && !cl.contains("error") {
-                    continue;
-                }
-                if use_similar && msg.role != "user" {
-                    continue;
-                }
-                if scope == "tools" && msg.tool_uses.is_empty() {
-                    continue;
-                }
-                if scope == "files" && msg.files_referenced.is_empty() {
+                if msg.role != "user" {
                     continue;
                 }
 
@@ -401,19 +251,11 @@ pub fn scored_search(
                     continue;
                 }
 
-                if use_similar {
-                    let sim = query_similarity(query, &msg.content);
-                    if sim < 0.25 {
-                        continue;
-                    }
-                    msg.relevance_score = sim * 10.0;
-                } else {
-                    let hist_score = score_relevance(&msg.content, query);
-                    let normalized = normalize_for_search(&msg.content);
-                    let prefix_score =
-                        prefix_match_score(&normalized, &query_words_norm_refs, &msg.timestamp);
-                    msg.relevance_score = hist_score + prefix_score * 2.0;
+                let sim = query_similarity(query, &msg.content);
+                if sim < 0.25 {
+                    continue;
                 }
+                msg.relevance_score = sim * 10.0;
                 msg.session_id = s.id.clone();
                 msg.project_path = s.project.clone();
                 hits.push((s.clone(), msg, cl, ordinal));
@@ -430,11 +272,6 @@ pub fn scored_search(
                 .iter()
                 .filter(|t| cl.contains(t.as_str()))
                 .count();
-
-            if query_terms.len() >= 2 && score == 0.0 && match_count == 0 {
-                msg.final_score = 0.0;
-                return (s, msg, ordinal);
-            }
 
             if match_count == 0 {
                 score *= 0.1;
@@ -495,11 +332,6 @@ pub fn scored_search(
             }
             if !msg.error_patterns.is_empty() {
                 boost *= 1.4;
-            }
-            if msg.role == "assistant"
-                && (cl.contains("solution") || cl.contains("fixed") || cl.contains("resolved"))
-            {
-                boost *= 1.6;
             }
 
             score *= boost.min(MAX_TOTAL_BOOST);
@@ -594,203 +426,6 @@ mod tests {
     }
 
     #[test]
-    fn index_search_matches_summary() {
-        let sessions = vec![
-            make_session(
-                "1",
-                "implement authentication system",
-                "",
-                "myproject",
-                "main",
-            ),
-            make_session("2", "fix docker build", "", "myproject", "main"),
-        ];
-        let results = index_search(&sessions, "authentication", 10);
-        assert!(!results.is_empty());
-        assert_eq!(results[0].session.id, "1");
-        assert_eq!(results[0].matched_field, "summary");
-    }
-
-    #[test]
-    fn index_search_no_match() {
-        let sessions = vec![make_session("1", "implement auth", "", "myproject", "main")];
-        let results = index_search(&sessions, "kubernetes deploy", 10);
-        assert!(results.is_empty());
-    }
-
-    #[test]
-    fn index_search_matches_project() {
-        let sessions = vec![make_session("1", "some work", "", "chat-history", "main")];
-        let results = index_search(&sessions, "chat-history", 10);
-        assert!(!results.is_empty());
-        assert_eq!(results[0].matched_field, "project");
-    }
-
-    #[test]
-    fn index_search_matches_branch() {
-        let sessions = vec![make_session("1", "some work", "", "proj", "feature-auth")];
-        let results = index_search(&sessions, "feature-auth", 10);
-        assert!(!results.is_empty());
-    }
-
-    #[test]
-    fn index_search_matches_first_prompt() {
-        let sessions = vec![make_session(
-            "1",
-            "",
-            "help me debug the webpack config",
-            "proj",
-            "main",
-        )];
-        let results = index_search(&sessions, "webpack", 10);
-        assert!(!results.is_empty());
-        assert_eq!(results[0].matched_field, "first_prompt");
-    }
-
-    #[test]
-    fn index_search_empty_query() {
-        let sessions = vec![make_session("1", "test", "", "proj", "main")];
-        let results = index_search(&sessions, "", 10);
-        assert!(results.is_empty());
-    }
-
-    #[test]
-    fn index_search_whitespace_query() {
-        let sessions = vec![make_session("1", "test", "", "proj", "main")];
-        let results = index_search(&sessions, "   ", 10);
-        assert!(results.is_empty());
-    }
-
-    #[test]
-    fn index_search_respects_limit() {
-        let sessions: Vec<Session> = (0..20)
-            .map(|i| {
-                make_session(
-                    &format!("{i}"),
-                    &format!("auth session {i}"),
-                    "",
-                    "proj",
-                    "main",
-                )
-            })
-            .collect();
-        let results = index_search(&sessions, "auth", 5);
-        assert!(results.len() <= 5);
-    }
-
-    #[test]
-    fn index_search_multi_term() {
-        let sessions = vec![
-            make_session("1", "implement authentication", "", "proj", "main"),
-            make_session("2", "implement docker build", "", "proj", "main"),
-            make_session("3", "fix authentication", "", "proj", "main"),
-        ];
-        let results = index_search(&sessions, "implement authentication", 10);
-        assert!(!results.is_empty());
-        // Session 1 matches both terms, should score highest
-        assert_eq!(results[0].session.id, "1");
-    }
-
-    #[test]
-    fn index_search_summary_weighted_higher() {
-        let sessions = vec![
-            make_session("1", "webpack configuration", "", "other", "other"),
-            make_session("2", "", "", "webpack", "main"),
-        ];
-        let results = index_search(&sessions, "webpack", 10);
-        assert!(results.len() >= 2);
-        // Summary match (weight 3.0) should score higher than project match (weight 1.0)
-        assert_eq!(results[0].session.id, "1");
-    }
-
-    #[test]
-    fn index_search_display_fallback() {
-        let sessions = vec![make_session("1", "", "first prompt text", "proj", "main")];
-        let results = index_search(&sessions, "prompt", 10);
-        assert!(!results.is_empty());
-        assert!(results[0].display.contains("first prompt text"));
-    }
-
-    #[test]
-    fn index_quality_ok_high_score() {
-        let results = vec![IndexResult {
-            session: make_session("1", "test", "", "proj", "main"),
-            score: 10.0,
-            matched_field: "summary".into(),
-            display: "test".into(),
-        }];
-        assert!(index_quality_ok(&results));
-    }
-
-    #[test]
-    fn index_quality_ok_low_score() {
-        let results = vec![IndexResult {
-            session: make_session("1", "test", "", "proj", "main"),
-            score: 2.0,
-            matched_field: "project".into(),
-            display: "proj".into(),
-        }];
-        assert!(!index_quality_ok(&results));
-    }
-
-    #[test]
-    fn index_quality_ok_title_match_when_recency_damps_score() {
-        let results = vec![IndexResult {
-            session: make_session("1", "review mergeability checks", "", "proj", "main"),
-            score: 4.5,
-            matched_field: "summary".into(),
-            display: "review mergeability checks".into(),
-        }];
-        assert!(index_quality_ok(&results));
-    }
-
-    #[test]
-    fn index_quality_old_summary_falls_through() {
-        let results = vec![IndexResult {
-            session: make_session("1", "stale title", "", "proj", "main"),
-            score: 3.0,
-            matched_field: "summary".into(),
-            display: "stale title".into(),
-        }];
-        assert!(!index_quality_ok(&results));
-    }
-
-    #[test]
-    fn index_quality_first_prompt_keeps_five_floor() {
-        let results = vec![IndexResult {
-            session: make_session("1", "", "first prompt text", "proj", "main"),
-            score: 4.5,
-            matched_field: "first_prompt".into(),
-            display: "first prompt text".into(),
-        }];
-        assert!(!index_quality_ok(&results));
-    }
-
-    #[test]
-    fn index_quality_ok_empty() {
-        assert!(!index_quality_ok(&[]));
-    }
-
-    #[test]
-    fn index_quality_threshold_boundary() {
-        let at_threshold = vec![IndexResult {
-            session: make_session("1", "test", "", "proj", "main"),
-            score: INDEX_QUALITY_THRESHOLD,
-            matched_field: "summary".into(),
-            display: "test".into(),
-        }];
-        assert!(index_quality_ok(&at_threshold));
-
-        let below = vec![IndexResult {
-            session: make_session("1", "test", "", "proj", "main"),
-            score: INDEX_QUALITY_THRESHOLD - 0.1,
-            matched_field: "project".into(),
-            display: "proj".into(),
-        }];
-        assert!(!index_quality_ok(&below));
-    }
-
-    #[test]
     fn max_total_boost_caps_combined_multiplier() {
         // Simulate worst case: all boosts active
         let mut boost = 1.0_f64;
@@ -801,8 +436,7 @@ mod tests {
         boost *= 1.3; // tool_uses
         boost *= 1.2; // files_referenced
         boost *= 1.4; // error_patterns
-        boost *= 1.6; // solution words
-        // Uncapped would be ~118x
+        // Uncapped would be ~74x
         assert!(
             boost > MAX_TOTAL_BOOST,
             "uncapped boost should exceed limit"
@@ -812,7 +446,7 @@ mod tests {
     }
 
     #[test]
-    fn scored_search_includes_session_title_when_absent_from_transcript() {
+    fn similar_search_includes_session_title_when_absent_from_transcript() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let data = concat!(
             r#"{"type":"user","message":{"role":"user","content":"please look at the checkout workflow"},"timestamp":"2026-08-14T00:00:00Z","uuid":"u1"}"#,
@@ -833,7 +467,7 @@ mod tests {
         s.created = (chrono::Utc::now() - chrono::Duration::days(3))
             .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         s.modified = s.created.clone();
-        let results = scored_search(&[s.clone()], "mergeability", "all", 10, None);
+        let results = similar_search(&[s.clone()], "review mergeability checks", 10, None);
         assert!(
             results
                 .iter()
@@ -844,7 +478,7 @@ mod tests {
                 .map(|r| r.message.content.clone())
                 .collect::<Vec<_>>()
         );
-        let recent = scored_search(&[s.clone()], "mergeability", "all", 10, Some("30d"));
+        let recent = similar_search(&[s.clone()], "review mergeability checks", 10, Some("30d"));
         assert!(
             recent
                 .iter()

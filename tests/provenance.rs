@@ -293,11 +293,14 @@ fn the_calling_claude_session_is_left_out_of_search() {
 }
 
 #[test]
-fn the_calling_session_is_left_out_of_legacy_search_too() {
+fn the_calling_session_is_left_out_of_similar_search_too() {
     let tmp = fixture();
+    let query = "find the pelican deploy notes";
+    let all = search_with(cmd(&tmp), query, &["--scope", "similar"]);
+    assert!(session_ids(&all).contains(&ID_A.to_owned()), "{all}");
     let mut inside = cmd(&tmp);
     inside.env("CLAUDE_CODE_SESSION_ID", ID_A);
-    let out = search_with(inside, "pelican", &["--engine", "legacy", "--deep"]);
+    let out = search_with(inside, query, &["--scope", "similar"]);
     assert!(!session_ids(&out).contains(&ID_A.to_owned()), "{out}");
 }
 

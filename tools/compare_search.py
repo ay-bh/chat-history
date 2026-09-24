@@ -34,7 +34,7 @@ def main():
     engines = {
         "old-default": (args.baseline.resolve(), []),
         "old-deep": (args.baseline.resolve(), ["--deep"]),
-        "bm25": (args.candidate.resolve(), ["--engine", "bm25", "--deep"]),
+        "bm25": (args.candidate.resolve(), []),
     }
     if args.candidate_only:
         engines = {"bm25": engines["bm25"]}
