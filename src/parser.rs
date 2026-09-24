@@ -143,9 +143,15 @@ fn shell_runs_history(command: &str) -> bool {
         }
         if *shell_launcher && token.starts_with('-') && token.contains('c') {
             *script_next = true;
+            *shell_launcher = false;
             return false;
         }
         if !*command_position {
+            // A shell given a script path (or -c above) does not execute its
+            // standard input as a script.
+            if *shell_launcher && !token.starts_with('-') {
+                *shell_launcher = false;
+            }
             return false;
         }
         if token.contains('=')
@@ -166,6 +172,7 @@ fn shell_runs_history(command: &str) -> bool {
     let mut script_next = false;
     let mut quote = None;
     let mut escaped = false;
+    let mut heredocs = Vec::new();
     let mut chars = command.chars();
     while let Some(ch) = chars.next() {
         if escaped {
@@ -187,7 +194,46 @@ fn shell_runs_history(command: &str) -> bool {
             None => match ch {
                 '\\' => escaped = true,
                 '\'' | '"' => quote = Some(ch),
-                '\n' | ';' | '&' | '|' | '(' | ')' | '{' | '}' | '`' => {
+                '<' if chars.clone().next() == Some('<') => {
+                    if let Some(mut heredoc) = read_heredoc(&mut chars) {
+                        if first_word_is_history(
+                            &mut word,
+                            &mut command_position,
+                            &mut shell_launcher,
+                            &mut script_next,
+                        ) {
+                            return true;
+                        }
+                        heredoc.shell_input = shell_launcher;
+                        heredocs.push(heredoc);
+                    } else {
+                        word.push(ch);
+                    }
+                }
+                '\n' => {
+                    if first_word_is_history(
+                        &mut word,
+                        &mut command_position,
+                        &mut shell_launcher,
+                        &mut script_next,
+                    ) {
+                        return true;
+                    }
+                    command_position = true;
+                    shell_launcher = false;
+                    script_next = false;
+                    for heredoc in std::mem::take(&mut heredocs) {
+                        let body = heredoc_body(&mut chars, &heredoc);
+                        if (heredoc.shell_input && shell_runs_history(&body))
+                            || (!heredoc.shell_input
+                                && !heredoc.quoted
+                                && expanded_heredoc_runs_history(&body))
+                        {
+                            return true;
+                        }
+                    }
+                }
+                ';' | '&' | '|' | '(' | ')' | '{' | '}' | '`' => {
                     if first_word_is_history(
                         &mut word,
                         &mut command_position,
@@ -220,6 +266,112 @@ fn shell_runs_history(command: &str) -> bool {
         &mut shell_launcher,
         &mut script_next,
     )
+}
+
+struct Heredoc {
+    delimiter: String,
+    quoted: bool,
+    strip_tabs: bool,
+    shell_input: bool,
+}
+
+/// Read the delimiter after `<<`, leaving the original iterator alone for
+/// `<<<` or an unsupported/malformed delimiter.
+fn read_heredoc(chars: &mut std::str::Chars<'_>) -> Option<Heredoc> {
+    let mut rest = chars.clone();
+    rest.next()?; // second '<'
+    if rest.clone().next() == Some('<') {
+        return None;
+    }
+    let strip_tabs = if rest.clone().next() == Some('-') {
+        rest.next();
+        true
+    } else {
+        false
+    };
+    while matches!(rest.clone().next(), Some(' ' | '\t')) {
+        rest.next();
+    }
+    let mut delimiter = String::new();
+    let mut quote = None;
+    let mut quoted = false;
+    while let Some(ch) = rest.clone().next() {
+        if quote.is_none() && (ch.is_whitespace() || ";&|()<>{}".contains(ch)) {
+            break;
+        }
+        rest.next();
+        match (quote, ch) {
+            (None, '\'' | '"') => {
+                quote = Some(ch);
+                quoted = true;
+            }
+            (Some(q), c) if q == c => quote = None,
+            (None, '\\') => {
+                delimiter.push(rest.next()?);
+                quoted = true;
+            }
+            _ => delimiter.push(ch),
+        }
+    }
+    if delimiter.is_empty() || quote.is_some() {
+        return None;
+    }
+    *chars = rest;
+    Some(Heredoc {
+        delimiter,
+        quoted,
+        strip_tabs,
+        shell_input: false,
+    })
+}
+
+/// Consume one heredoc through its exact delimiter line, in redirection order.
+fn heredoc_body(chars: &mut std::str::Chars<'_>, heredoc: &Heredoc) -> String {
+    let mut body = String::new();
+    loop {
+        let mut line = String::new();
+        let mut newline = false;
+        for ch in chars.by_ref() {
+            if ch == '\n' {
+                newline = true;
+                break;
+            }
+            line.push(ch);
+        }
+        let comparison = line.strip_suffix('\r').unwrap_or(&line);
+        let comparison = if heredoc.strip_tabs {
+            comparison.trim_start_matches('\t')
+        } else {
+            comparison
+        };
+        if comparison == heredoc.delimiter {
+            break;
+        }
+        body.push_str(&line);
+        if !newline {
+            break;
+        }
+        body.push('\n');
+    }
+    body
+}
+
+/// An unquoted heredoc expands substitutions even when its lines are data.
+fn expanded_heredoc_runs_history(body: &str) -> bool {
+    let mut chars = body.chars();
+    let mut escaped = false;
+    while let Some(ch) = chars.next() {
+        if escaped {
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else if (ch == '`' || (ch == '$' && chars.clone().next() == Some('(')))
+            && shell_runs_history(&substitution(&mut chars, ch))
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// The body of a command substitution whose opener (`` ` `` or `$`) was just
@@ -753,6 +905,35 @@ mod tests {
         ] {
             assert!(!is_history_command(cmd), "{cmd}");
         }
+    }
+
+    #[test]
+    fn heredoc_data_is_not_a_shell_command() {
+        for cmd in [
+            "cat > guide.md <<'EOF'\nchat-history search q\nEOF",
+            "python3 - <<'PY'\nch search q\nPY",
+            "cat <<EOF\nchat-history search q\nEOF",
+            "cat <<-'EOF'\n\tch search q\n\tEOF",
+            "cat <<'FIRST' <<'SECOND'\nch search q\nFIRST\nchat-history view id\nSECOND",
+            "bash script.sh <<'EOF'\nch search q\nEOF",
+            "bash -lc 'echo ready' <<'EOF'\nch search q\nEOF",
+        ] {
+            assert!(!is_history_command(cmd), "{cmd}");
+        }
+    }
+
+    #[test]
+    fn executable_commands_in_and_after_heredocs_are_recognised() {
+        for cmd in [
+            "cat <<EOF\n$(chat-history search q)\nEOF",
+            "cat <<EOF\n`ch search q`\nEOF",
+            "bash <<'EOF'\nch search q\nEOF",
+            "sh <<EOF\nchat-history search q\nEOF",
+            "cat <<'EOF'\nch search q\nEOF\nchat-history view id",
+        ] {
+            assert!(is_history_command(cmd), "{cmd}");
+        }
+        assert!(!is_history_command("cat <<EOF\n\\$(ch search q)\nEOF"));
     }
 
     #[test]
