@@ -1127,15 +1127,17 @@ pub fn export_transcript(messages: &[Message], session: &Session, out_path: Opti
         lines.push(format!("## {role}\n\n{text}\n"));
     }
     let content = lines.join("\n");
-    let path = out_path.map(String::from).unwrap_or_else(|| {
-        let safe: String = summary
-            .chars()
-            .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
-            .take(50)
-            .collect();
-        format!("{}_{safe}.md", session.date)
-    });
-    match std::fs::write(&path, &content) {
+    let Some(path) = out_path else {
+        // A terminal must not run escape sequences from transcript text; a
+        // pipe or redirect gets the same bytes `-o` would write.
+        if std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+            print!("{}", tty(&content));
+        } else {
+            print!("{content}");
+        }
+        return true;
+    };
+    match std::fs::write(path, &content) {
         Ok(_) => {
             println!("Exported to {path}");
             true
