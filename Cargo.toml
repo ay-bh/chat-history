@@ -10,6 +10,8 @@ repository = "https://github.com/ay-bh/chat-history"
 readme = "README.md"
 keywords = ["claude-code", "cursor-ide", "codex", "conversation", "transcript"]
 categories = ["command-line-utilities", "development-tools"]
+# Search evaluation scripts for development; not part of the crate.
+exclude = ["tools/"]
 
 
 [[bin]]
