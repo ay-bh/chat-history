@@ -749,7 +749,7 @@ impl Bm25Backend {
                 let current = current_fingerprint(&self.conn, key)?;
                 if !rebuild
                     && current.as_deref() == Some(stamp.as_str())
-                    && same_messages(&self.conn, key, &extracted)?
+                    && matches!(stored_rows(&self.conn, key, &extracted)?, Stored::Identical)
                 {
                     stats.unchanged += 1;
                     done += 1;
@@ -963,22 +963,54 @@ fn extract_session(
     (stamp, extracted)
 }
 
-fn same_messages(conn: &Connection, key: &str, extracted: &Extracted) -> Result<bool> {
+/// How the rows a session has in the index relate to a fresh extraction.
+enum Stored {
+    /// Every stored row matches and the transcript gained nothing.
+    Identical,
+    /// The stored conversation is a prefix of the extraction. `replace` names
+    /// title or prompt rows whose payload changed (their timestamp follows the
+    /// transcript's modification time), as (stored id, extracted index);
+    /// `extracted[append..]` are the messages the transcript gained.
+    Prefix {
+        replace: Vec<(i64, usize)>,
+        append: usize,
+    },
+    /// Anything else: a rewritten or shortened transcript, or a parser change.
+    Different,
+}
+
+fn stored_rows(conn: &Connection, key: &str, extracted: &Extracted) -> Result<Stored> {
     let mut stmt = conn.prepare_cached(
-        "SELECT ordinal, payload FROM messages WHERE session_key = ?1 ORDER BY ordinal",
+        "SELECT id, ordinal, payload FROM messages WHERE session_key = ?1 ORDER BY ordinal",
     )?;
     let mut rows = stmt.query([key])?;
-    for (ordinal, message, _) in extracted {
+    let mut replace = Vec::new();
+    let mut matched = 0;
+    for (n, (ordinal, message, metadata)) in extracted.iter().enumerate() {
         let Some(row) = rows.next()? else {
-            return Ok(false);
+            break;
         };
-        if row.get::<_, usize>(0)? != *ordinal
-            || row.get::<_, String>(1)? != serde_json::to_string(message)?
-        {
-            return Ok(false);
+        if row.get::<_, usize>(1)? != *ordinal {
+            return Ok(Stored::Different);
         }
+        if row.get::<_, String>(2)? != serde_json::to_string(message)? {
+            if !*metadata {
+                return Ok(Stored::Different);
+            }
+            replace.push((row.get::<_, i64>(0)?, n));
+        }
+        matched = n + 1;
     }
-    Ok(rows.next()?.is_none())
+    if rows.next()?.is_some() {
+        return Ok(Stored::Different);
+    }
+    if matched == extracted.len() && replace.is_empty() {
+        return Ok(Stored::Identical);
+    }
+    Ok(Stored::Prefix {
+        replace,
+        append: matched,
+    })
 }
 
 fn publish_session(
@@ -993,14 +1025,38 @@ fn publish_session(
     let same_version = current
         .and_then(|value| serde_json::from_str::<Fingerprint>(value).ok())
         .is_some_and(|value| value.version == EXTRACTION_VERSION);
-    if !rebuild && same_version && same_messages(tx, key, &extracted)? {
-        if current != Some(stamp) {
-            tx.execute(
-                "UPDATE sessions SET fingerprint = ?2 WHERE key = ?1",
-                params![key, stamp],
-            )?;
+    // `same_version` implies the session row exists, so the fast paths below
+    // only ever add to or restamp an indexed session.
+    if !rebuild && same_version {
+        match stored_rows(tx, key, &extracted)? {
+            Stored::Identical => {
+                if current != Some(stamp) {
+                    tx.execute(
+                        "UPDATE sessions SET fingerprint = ?2 WHERE key = ?1",
+                        params![key, stamp],
+                    )?;
+                }
+                return Ok(());
+            }
+            // Active transcripts only grow. Appending the new messages keeps
+            // the stored rows (and their ids) and costs a few passage
+            // inserts instead of re-tokenizing every message twice.
+            Stored::Prefix { replace, append } => {
+                tx.execute(
+                    "UPDATE sessions SET fingerprint = ?2 WHERE key = ?1",
+                    params![key, stamp],
+                )?;
+                for (id, n) in replace {
+                    let (_, message, metadata) = &extracted[n];
+                    replace_message(tx, id, session, message, *metadata)?;
+                }
+                for (ordinal, message, metadata) in &extracted[append..] {
+                    insert_message(tx, key, session, message, *ordinal, *metadata)?;
+                }
+                return Ok(());
+            }
+            Stored::Different => {}
         }
-        return Ok(());
     }
     // The cascading delete is a multi-write statement and takes a savepoint,
     // which makes FTS5 flush; a session absent from the index has nothing to
@@ -1106,7 +1162,44 @@ fn insert_message(
             !message.files_referenced.is_empty()
         ],
     )?;
-    let id = conn.last_insert_rowid();
+    write_passages(conn, conn.last_insert_rowid(), session, message, metadata)
+}
+
+/// Rewrites an indexed message in place, keeping its id: the row itself and
+/// its passages. Used for the title and prompt rows, whose payload follows
+/// the transcript's modification time.
+fn replace_message(
+    conn: &Connection,
+    id: i64,
+    session: &Session,
+    message: &Message,
+    metadata: bool,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE messages SET payload = ?2, timestamp = ?3, errors = ?4, tools = ?5, files = ?6
+         WHERE id = ?1",
+        params![
+            id,
+            serde_json::to_string(message)?,
+            parse_any_timestamp(&message.timestamp).map(|t| t.timestamp_millis()),
+            !metadata
+                && (!message.error_patterns.is_empty()
+                    || message.content_lower().contains("error")),
+            !message.tool_uses.is_empty(),
+            !message.files_referenced.is_empty()
+        ],
+    )?;
+    conn.execute("DELETE FROM passages WHERE message_id = ?1", [id])?;
+    write_passages(conn, id, session, message, metadata)
+}
+
+fn write_passages(
+    conn: &Connection,
+    id: i64,
+    session: &Session,
+    message: &Message,
+    metadata: bool,
+) -> Result<()> {
     // Written directly rather than through an AFTER INSERT trigger: a trigger
     // makes each passage insert a multi-write statement with its own savepoint,
     // and FTS5 flushes its pending index to disk on every savepoint.

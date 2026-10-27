@@ -143,8 +143,12 @@ in memory at once. Index writes stay serial and transactional.
 **Retention.** After a source changes, identical extracted message payloads keep
 their postings. This avoids rewriting every Cursor transcript when unrelated
 data changes in the shared database. Complete payloads and ordinals are
-compared; rebuild requests and extraction-version changes always regenerate
-passages. Sessions absent from the discovery snapshot are removed from the
+compared. When the stored conversation is a prefix of the new extraction, which
+is what an active transcript looks like after it was appended to, only the new
+messages are inserted and the title and prompt rows are refreshed in place;
+the stored rows keep their ids. Any other difference (a rewritten or shortened
+transcript) replaces the session's rows, and rebuild requests and
+extraction-version changes always regenerate passages. Sessions absent from the discovery snapshot are removed from the
 index. An unavailable source is therefore indexed again when it returns. Source
 files are never modified.
 
