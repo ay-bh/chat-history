@@ -854,3 +854,42 @@ fn cursor_hook_is_opt_in_fail_open_and_discovers_nonstandard_paths() {
         .stdout(predicate::str::contains("hook-model"));
     assert!(!Path::new(&tmp.path().join(".cursor/hooks.json")).exists());
 }
+
+#[test]
+fn an_unreadable_cursor_database_does_not_freeze_an_agent_transcript() {
+    // Sync leaves an indexed transcript alone only while it is being written.
+    // When a Cursor transcript's shared database cannot be fingerprinted (a
+    // directory stands in for it here) the transcript is still re-parsed once
+    // it has been quiet, so the messages it gained reach the index.
+    let tmp = TempDir::new().unwrap();
+    let path = transcript(&tmp, true);
+    fs::create_dir_all(tmp.path().join("cursor-user/globalStorage/state.vscdb")).unwrap();
+    let search = |query: &str| -> String {
+        let out = command(&tmp)
+            .env("CHAT_HISTORY_CACHE_DIR", tmp.path().join("cache"))
+            .args(["search", query, "--json"])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap()
+    };
+    std::thread::sleep(std::time::Duration::from_millis(2100));
+    assert!(search("uniquecache").contains(ID), "first index");
+    let mut content = fs::read_to_string(&path).unwrap();
+    content.push_str(
+        &json!({"role":"user", "message":{"content":"later uniqueappended question"},
+            "timestamp": chrono::Utc::now().to_rfc3339()})
+        .to_string(),
+    );
+    content.push('\n');
+    fs::write(&path, content).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(2100));
+    assert!(
+        search("uniqueappended").contains(ID),
+        "quiet transcript re-parsed"
+    );
+}

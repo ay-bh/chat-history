@@ -102,6 +102,23 @@ pub(crate) fn fingerprint(path: &Path, sqlite: bool) -> Option<String> {
     fingerprint_at(path, sqlite, SystemTime::now())
 }
 
+/// Whether the file, or for SQLite its WAL or journal, was modified inside
+/// the racy window: it is still being written. A missing file is not.
+pub(crate) fn recently_written(path: &Path, sqlite: bool) -> bool {
+    let now = SystemTime::now();
+    let mut names = vec![path.as_os_str().to_os_string()];
+    if sqlite {
+        for suffix in ["-wal", "-journal"] {
+            let mut name = path.as_os_str().to_os_string();
+            name.push(suffix);
+            names.push(name);
+        }
+    }
+    names
+        .iter()
+        .any(|name| stamp(Path::new(name)).is_ok_and(|s| !s.stable_at(now)))
+}
+
 /// Listing dates reuse the metadata already read for cache validation.
 pub(crate) fn metadata(path: &Path) -> std::io::Result<fs::Metadata> {
     if let Some(meta) = ACTIVE.with(|slot| slot.borrow().as_ref()?.metadata.get(path).cloned()) {
