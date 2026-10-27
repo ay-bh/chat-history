@@ -291,6 +291,7 @@ fn grouped_similar_search_returns_the_requested_conversations() {
         },
         None,
         false,
+        &|_| false,
     )
     .unwrap();
     assert_eq!(hits.len(), 3);
@@ -1399,6 +1400,7 @@ fn concurrent_profiles_search_their_own_consistent_snapshot() {
                         },
                         Some(directory),
                         false,
+                        &|_| false,
                     )
                     .unwrap();
                     assert_eq!(hits.len(), 1);

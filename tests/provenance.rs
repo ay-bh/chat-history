@@ -552,28 +552,87 @@ fn indexed_session_keys(tmp: &TempDir) -> Vec<String> {
         .unwrap()
 }
 
-#[test]
-fn the_calling_session_is_not_synced_into_the_index_by_its_own_search() {
-    // The calling transcript is being appended to while the search runs and
-    // can never be a hit, so indexing it is pure cost: it was re-parsed and
-    // rewritten on every search an agent made.
-    let tmp = fixture();
-    let mut inside = cmd(&tmp);
-    inside.env("CLAUDE_CODE_SESSION_ID", ID_A);
-    let without = session_ids(&search_with(inside, "pelican", &[]));
-    assert_eq!(without, vec![ID_B.to_owned()]);
-    let keys = indexed_session_keys(&tmp);
-    assert!(
-        keys.iter().any(|k| k.contains(ID_B)),
-        "other sessions are indexed: {keys:?}"
-    );
-    assert!(
-        !keys.iter().any(|k| k.contains(ID_A)),
-        "the calling session was synced into the index: {keys:?}"
-    );
+/// The stored messages of session A, as (rowid, payload) pairs.
+fn stored_messages_of_a(tmp: &TempDir) -> Vec<(i64, String)> {
+    let conn = rusqlite::Connection::open(tmp.path().join("cache/search-v3.db")).unwrap();
+    let mut stmt = conn
+        .prepare("SELECT id, payload FROM messages WHERE session_key LIKE ?1 ORDER BY id")
+        .unwrap();
+    stmt.query_map([format!("%{ID_A}%")], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+}
 
-    // A search from anywhere else indexes it as usual.
-    let all = session_ids(&search(&tmp, "pelican"));
-    assert!(all.contains(&ID_A.to_owned()), "{all:?}");
-    assert!(indexed_session_keys(&tmp).iter().any(|k| k.contains(ID_A)));
+#[test]
+fn the_calling_session_is_indexed_when_absent_so_ranking_does_not_depend_on_cache_history() {
+    // BM25 weights come from the whole index. The caller's rows take part
+    // whether the index is fresh, warm or in memory; otherwise the same
+    // query from the same session ranks differently depending on whether
+    // some earlier search from elsewhere happened to index the caller.
+    let tmp = TempDir::new().unwrap();
+    write_claude(
+        tmp.path(),
+        ID_A,
+        (0..40)
+            .map(|i| ("user", json!(format!("albatross discussion number {i}"))))
+            .collect(),
+    );
+    write_claude(
+        tmp.path(),
+        ID_B,
+        vec![("user", json!("albatross reference notes"))],
+    );
+    write_claude(
+        tmp.path(),
+        ID_C,
+        vec![("user", json!("pelican reference notes"))],
+    );
+    let from_a = |extra: &[&str]| {
+        let mut inside = cmd(&tmp);
+        inside.env("CLAUDE_CODE_SESSION_ID", ID_A);
+        session_ids(&search_with(inside, "albatross pelican", extra))
+    };
+    let cold = from_a(&["--limit", "1"]);
+    assert!(
+        indexed_session_keys(&tmp).iter().any(|k| k.contains(ID_A)),
+        "a fresh index holds the caller too"
+    );
+    // A search from another session, with no source change in between.
+    search(&tmp, "albatross pelican");
+    let warm = from_a(&["--limit", "1"]);
+    let in_memory = from_a(&["--limit", "1", "--no-cache"]);
+    assert_eq!(cold, warm, "cold vs warm cache");
+    assert_eq!(warm, in_memory, "warm cache vs in-memory index");
+}
+
+#[test]
+fn the_calling_session_is_not_refreshed_by_its_own_searches_but_by_any_other() {
+    // The caller is being appended to while it searches and can never be a
+    // hit, so re-parsing and rewriting it on every search is pure cost.
+    let tmp = fixture();
+    search(&tmp, "pelican");
+    let before = stored_messages_of_a(&tmp);
+    assert!(!before.is_empty());
+    write_claude(
+        tmp.path(),
+        ID_A,
+        vec![(
+            "user",
+            json!("pelican freshcalleruniquetoken updated discussion"),
+        )],
+    );
+    for _ in 0..3 {
+        let mut inside = cmd(&tmp);
+        inside.env("CLAUDE_CODE_SESSION_ID", ID_A.to_uppercase());
+        let result = search_with(inside, "pelican", &[]);
+        assert_eq!(session_ids(&result), vec![ID_B.to_owned()]);
+        assert_eq!(stored_messages_of_a(&tmp), before, "caller left as indexed");
+    }
+    assert_eq!(
+        session_ids(&search(&tmp, "freshcalleruniquetoken")),
+        vec![ID_A.to_owned()],
+        "a search from elsewhere refreshes it"
+    );
+    assert_ne!(stored_messages_of_a(&tmp), before);
 }

@@ -461,9 +461,10 @@ fn main() {
     };
     // The calling conversation contains the question being searched for and
     // would rank first, so it is left out of search results; asking for it
-    // by id still finds it. It is left out of the index sync as well: it is
-    // being appended to while the search runs (so it would be re-parsed and
-    // rewritten on every search) and no hit can come from it.
+    // by id still finds it. The index sync leaves it as it is (indexing it
+    // only when the index lacks it): it is being appended to while the
+    // search runs, so refreshing it would re-parse and rewrite it on every
+    // search, and no hit can come from it.
     let calling = match &cli.command {
         Some(Commands::Search { query, .. }) if !scoring::is_uuid(query) => {
             session::calling_sessions()
@@ -476,13 +477,7 @@ fn main() {
             .any(|(source, id)| s.source.starts_with(source) && s.id.eq_ignore_ascii_case(id))
     };
     // Stable collection statistics and freshness across project/source filters.
-    let search_corpus: Option<Vec<session::Session>> = bm25_search.then(|| {
-        sessions
-            .iter()
-            .filter(|s| !is_calling(s))
-            .cloned()
-            .collect()
-    });
+    let search_corpus = bm25_search.then(|| sessions.clone());
     if !cli.sidechains {
         sessions.retain(|s| !s.is_sidechain);
     }
@@ -577,6 +572,7 @@ fn main() {
                 &request,
                 directory.as_deref(),
                 rebuild_index,
+                &is_calling,
             );
             let results = result.unwrap_or_else(|error| {
                 eprintln!("Search failed: {error}");

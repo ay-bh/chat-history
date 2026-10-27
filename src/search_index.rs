@@ -296,13 +296,22 @@ impl Drop for Progress {
     }
 }
 
+/// Sessions the sync leaves as the index holds them: indexed when the index
+/// lacks them, so they take part in the collection statistics on every path
+/// (persistent, fresh or in-memory), but never refreshed. Used for the
+/// conversation a search runs inside: it is appended to while the search
+/// runs and no hit can come from it, so re-parsing and rewriting it on every
+/// search would be pure cost.
+pub type Frozen<'a> = &'a (dyn Fn(&Session) -> bool + Sync);
+
 fn sync_corpus(
     backend: &mut Bm25Backend,
     corpus: &[Session],
     rebuild: bool,
+    frozen: Frozen<'_>,
     progress: &mut Progress,
 ) -> Result<SyncStats> {
-    backend.sync_with_progress(corpus, rebuild, |done, total| {
+    backend.sync_frozen(corpus, rebuild, frozen, |done, total| {
         if let Some(line) = progress.tick(done, total, Instant::now()) {
             eprint!("{line}");
         }
@@ -313,20 +322,23 @@ fn memory_search(
     corpus: &[Session],
     request: &SearchRequest<'_>,
     rebuild: bool,
+    frozen: Frozen<'_>,
     progress: &mut Progress,
 ) -> Result<Vec<SearchResult>> {
     let mut backend = Bm25Backend::open(None)?;
-    sync_corpus(&mut backend, corpus, rebuild, progress)?;
+    sync_corpus(&mut backend, corpus, rebuild, frozen, progress)?;
     backend.search(request)
 }
 
 /// CLI orchestration. Cache failures preserve BM25 semantics using an ephemeral
 /// index; malformed user queries remain errors rather than triggering a rebuild.
+/// `frozen` sessions are indexed when absent and otherwise left as they are.
 pub fn search_corpus(
     corpus: &[Session],
     request: &SearchRequest<'_>,
     directory: Option<&Path>,
     rebuild: bool,
+    frozen: Frozen<'_>,
 ) -> Result<Vec<SearchResult>> {
     if request.limit == 0 || request.sessions.is_empty() {
         return Ok(Vec::new());
@@ -343,7 +355,7 @@ pub fn search_corpus(
     }
     let mut progress = Progress::new();
     let Some(dir) = directory else {
-        return memory_search(corpus, request, rebuild, &mut progress);
+        return memory_search(corpus, request, rebuild, frozen, &mut progress);
     };
     let mut reset_done = false;
     for attempt in 0..CACHE_MISMATCH_ATTEMPTS {
@@ -361,10 +373,10 @@ pub fn search_corpus(
             }
             Err(error) => {
                 progress.warn(&format!("Warning: search cache unavailable ({error}); searching with an in-memory BM25 index."));
-                return memory_search(corpus, request, rebuild, &mut progress);
+                return memory_search(corpus, request, rebuild, frozen, &mut progress);
             }
         };
-        if let Err(error) = sync_corpus(&mut backend, corpus, rebuild, &mut progress) {
+        if let Err(error) = sync_corpus(&mut backend, corpus, rebuild, frozen, &mut progress) {
             if error.to_string().starts_with("no such table")
                 && attempt + 1 < CACHE_MISMATCH_ATTEMPTS
             {
@@ -383,7 +395,7 @@ pub fn search_corpus(
                 continue;
             }
             progress.warn(&format!("Warning: could not save search cache ({error}); searching with an in-memory BM25 index."));
-            return memory_search(corpus, request, rebuild, &mut progress);
+            return memory_search(corpus, request, rebuild, frozen, &mut progress);
         }
         match backend.search(request) {
             Ok(results) => match indexed_session_keys_match(&backend.conn, corpus) {
@@ -395,7 +407,7 @@ pub fn search_corpus(
                 }
                 Err(error) => {
                     progress.warn(&format!("Warning: search cache query failed ({error}); searching with an in-memory BM25 index."));
-                    return memory_search(corpus, request, rebuild, &mut progress);
+                    return memory_search(corpus, request, rebuild, frozen, &mut progress);
                 }
             },
             Err(error) if is_corrupt(&error) && !reset_done => {
@@ -411,11 +423,11 @@ pub fn search_corpus(
             }
             Err(error) => {
                 progress.warn(&format!("Warning: search cache query failed ({error}); searching with an in-memory BM25 index."));
-                return memory_search(corpus, request, rebuild, &mut progress);
+                return memory_search(corpus, request, rebuild, frozen, &mut progress);
             }
         }
     }
-    memory_search(corpus, request, rebuild, &mut progress)
+    memory_search(corpus, request, rebuild, frozen, &mut progress)
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -633,6 +645,19 @@ impl Bm25Backend {
         &mut self,
         corpus: &[Session],
         rebuild: bool,
+        progress: impl FnMut(usize, usize),
+    ) -> Result<SyncStats> {
+        self.sync_frozen(corpus, rebuild, &|_| false, progress)
+    }
+
+    /// Like `sync_with_progress`, but a `frozen` session already in the index
+    /// is counted as unchanged without being looked at; one the index lacks is
+    /// indexed as usual.
+    pub fn sync_frozen(
+        &mut self,
+        corpus: &[Session],
+        rebuild: bool,
+        frozen: Frozen<'_>,
         mut progress: impl FnMut(usize, usize),
     ) -> Result<SyncStats> {
         let live: HashSet<String> = corpus.iter().map(session_key).collect();
@@ -645,6 +670,10 @@ impl Bm25Backend {
             .par_iter()
             .map(|session| {
                 let key = session_key(session);
+                if !rebuild && frozen(session) && existing.contains_key(&key) {
+                    // No stamp either: a frozen row is not restamped.
+                    return (key, None, false);
+                }
                 let previous = fingerprints.get(&key);
                 let before = fingerprint(session, previous);
                 let skip = !rebuild
