@@ -459,8 +459,30 @@ fn main() {
     } else {
         load_sessions(cli.source.as_deref())
     };
+    // The calling conversation contains the question being searched for and
+    // would rank first, so it is left out of search results; asking for it
+    // by id still finds it. It is left out of the index sync as well: it is
+    // being appended to while the search runs (so it would be re-parsed and
+    // rewritten on every search) and no hit can come from it.
+    let calling = match &cli.command {
+        Some(Commands::Search { query, .. }) if !scoring::is_uuid(query) => {
+            session::calling_sessions()
+        }
+        _ => Vec::new(),
+    };
+    let is_calling = |s: &session::Session| {
+        calling
+            .iter()
+            .any(|(source, id)| s.source.starts_with(source) && s.id.eq_ignore_ascii_case(id))
+    };
     // Stable collection statistics and freshness across project/source filters.
-    let search_corpus = bm25_search.then(|| sessions.clone());
+    let search_corpus: Option<Vec<session::Session>> = bm25_search.then(|| {
+        sessions
+            .iter()
+            .filter(|s| !is_calling(s))
+            .cloned()
+            .collect()
+    });
     if !cli.sidechains {
         sessions.retain(|s| !s.is_sidechain);
     }
@@ -520,16 +542,7 @@ fn main() {
             compact,
         }) => {
             let mut pre = filtered;
-            // The calling conversation contains the question being searched
-            // for and would rank first; asking for it by id still finds it.
-            if !scoring::is_uuid(&query) {
-                let calling = session::calling_sessions();
-                pre.retain(|s| {
-                    !calling.iter().any(|(source, id)| {
-                        s.source.starts_with(source) && s.id.eq_ignore_ascii_case(id)
-                    })
-                });
-            }
+            pre.retain(|s| !is_calling(s));
 
             if scoring::is_uuid(&query)
                 && !json_output

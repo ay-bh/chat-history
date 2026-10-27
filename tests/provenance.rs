@@ -541,3 +541,39 @@ fn a_tool_result_without_text_keeps_its_position() {
         vec![(ID_A.to_owned(), "assistant".to_owned(), Some(3))]
     );
 }
+
+/// Keys of the sessions the on-disk BM25 index currently holds.
+fn indexed_session_keys(tmp: &TempDir) -> Vec<String> {
+    let conn = rusqlite::Connection::open(tmp.path().join("cache/search-v3.db")).unwrap();
+    let mut stmt = conn.prepare("SELECT key FROM sessions").unwrap();
+    stmt.query_map([], |r| r.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+}
+
+#[test]
+fn the_calling_session_is_not_synced_into_the_index_by_its_own_search() {
+    // The calling transcript is being appended to while the search runs and
+    // can never be a hit, so indexing it is pure cost: it was re-parsed and
+    // rewritten on every search an agent made.
+    let tmp = fixture();
+    let mut inside = cmd(&tmp);
+    inside.env("CLAUDE_CODE_SESSION_ID", ID_A);
+    let without = session_ids(&search_with(inside, "pelican", &[]));
+    assert_eq!(without, vec![ID_B.to_owned()]);
+    let keys = indexed_session_keys(&tmp);
+    assert!(
+        keys.iter().any(|k| k.contains(ID_B)),
+        "other sessions are indexed: {keys:?}"
+    );
+    assert!(
+        !keys.iter().any(|k| k.contains(ID_A)),
+        "the calling session was synced into the index: {keys:?}"
+    );
+
+    // A search from anywhere else indexes it as usual.
+    let all = session_ids(&search(&tmp, "pelican"));
+    assert!(all.contains(&ID_A.to_owned()), "{all:?}");
+    assert!(indexed_session_keys(&tmp).iter().any(|k| k.contains(ID_A)));
+}
