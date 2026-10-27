@@ -648,10 +648,17 @@ impl Bm25Backend {
                 let previous = fingerprints.get(&key);
                 let before = fingerprint(session, previous);
                 let skip = !rebuild
-                    && before
-                        .as_ref()
-                        .zip(previous)
-                        .is_some_and(|(a, b)| a.matches(b));
+                    && match (before.as_ref(), previous) {
+                        (Some(now), Some(then)) => now.matches(then),
+                        // No stable stamp: the file was modified moments ago
+                        // and is still being written (the calling conversation
+                        // always is, its harness appends the search command
+                        // just before running it). Keep the rows it already
+                        // has and parse it on the next sync that finds it
+                        // quiet, rather than re-parsing it on every search.
+                        (None, Some(then)) => then.version == EXTRACTION_VERSION,
+                        (_, None) => false,
+                    };
                 (key, before, !skip)
             })
             .collect();
