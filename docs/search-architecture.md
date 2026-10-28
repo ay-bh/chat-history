@@ -180,9 +180,15 @@ index measured 383 MB of free list after months of sessions being rewritten.
 When the free list is at least 32 MiB and a quarter of the file, the search
 starts a detached `chat-history maintain --cache-dir` run that VACUUMs the index
 (3.5 s for that file, which halved it) and truncates the WAL, at most once a day;
-readers keep their snapshot meanwhile and a writer waits at most its busy
-timeout. A lock file prevents concurrent searches from each starting one, and a
-marker file beside the index records the last run.
+readers keep their snapshot meanwhile, best-effort stamp refreshes give up at
+once rather than queue behind it, and only a search that must publish parsed
+messages waits, at most its busy timeout. The run is started after the search
+has closed its own connection, since a connection closing while the VACUUM
+holds the write lock waits on it to checkpoint. A lock file prevents concurrent
+searches from each starting one, and a marker file beside the index records the
+last run. Measured on that clone: a search during the VACUUM 166 ms, the
+triggering search 278 ms against a 150 ms baseline, searches afterwards 105–150
+ms.
 
 ## Query and ranking
 

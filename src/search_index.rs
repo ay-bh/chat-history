@@ -408,9 +408,13 @@ pub fn search_corpus(
         match backend.search(request) {
             Ok(results) => match indexed_session_keys_match(&backend.conn, corpus) {
                 Ok(true) => {
-                    // Started only once the results are in, so the VACUUM's
-                    // reads never compete with this search's own.
-                    backend.schedule_compaction(dir);
+                    // Decided with the connection, started without it: the
+                    // VACUUM must not hold up this process's own close.
+                    let compact = backend.compaction_wanted(dir);
+                    drop(backend);
+                    if compact {
+                        start_compaction(dir);
+                    }
                     return Ok(results);
                 }
                 Ok(false) if attempt + 1 < CACHE_MISMATCH_ATTEMPTS => {}
@@ -1024,10 +1028,8 @@ fn compaction_due(free: u64, total: u64, last: Option<SystemTime>, now: SystemTi
 }
 
 impl Bm25Backend {
-    /// Start a detached `maintain` run when the free list is worth a VACUUM,
-    /// so that no search waits for it. A lock file keeps concurrent searches
-    /// from each starting one; the marker file records the last run.
-    fn schedule_compaction(&self, dir: &Path) {
+    /// Whether the free list is worth a VACUUM now (see `compaction_due`).
+    fn compaction_wanted(&self, dir: &Path) -> bool {
         let pragma = |name: &str| -> rusqlite::Result<u64> {
             self.conn
                 .query_row(&format!("PRAGMA {name}"), [], |r| r.get::<_, i64>(0))
@@ -1036,13 +1038,21 @@ impl Bm25Backend {
         let Ok((page, free, pages)) = pragma("page_size")
             .and_then(|page| Ok((page, pragma("freelist_count")?, pragma("page_count")?)))
         else {
-            return;
+            return false;
         };
         let marker = dir.join(format!("{INDEX_FILENAME}{MAINTAINED_SUFFIX}"));
         let last = fs::metadata(&marker).and_then(|m| m.modified()).ok();
-        if !compaction_due(free * page, pages * page, last, SystemTime::now()) {
-            return;
-        }
+        compaction_due(free * page, pages * page, last, SystemTime::now())
+    }
+}
+
+/// Start a detached `maintain` run so that no search waits for the VACUUM.
+/// Called once this process has closed its own index connection: a connection
+/// closing while the VACUUM holds the write lock waits on it to checkpoint.
+/// A lock file keeps concurrent searches from each starting a run; the marker
+/// file records the last one.
+fn start_compaction(dir: &Path) {
+    {
         let lock = dir.join(format!("{INDEX_FILENAME}{MAINTAINING_SUFFIX}"));
         if let Ok(meta) = fs::metadata(&lock) {
             let stale = meta
@@ -1113,7 +1123,15 @@ fn restamp_sessions(
     existing: &HashMap<String, String>,
     restamp: &[(&String, String)],
 ) -> Result<()> {
-    let tx = begin_immediate(conn)?;
+    // Best effort, so never wait for the lock: another process may be
+    // publishing for seconds, or vacuuming the file. The next search redoes
+    // the stamps.
+    conn.busy_timeout(Duration::ZERO)?;
+    let attempt = Transaction::new_unchecked(conn, TransactionBehavior::Immediate);
+    conn.busy_timeout(BUSY_TIMEOUT)?;
+    let Ok(tx) = attempt else {
+        return Ok(());
+    };
     {
         let mut update = tx.prepare_cached(
             "UPDATE sessions SET fingerprint = ?2 WHERE key = ?1 AND fingerprint = ?3",
