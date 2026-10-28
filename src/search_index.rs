@@ -500,6 +500,19 @@ fn recently_active(session: &Session, now_ms: u64) -> bool {
         .is_none_or(|modified| now_ms.saturating_sub(modified) < ACTIVE_WINDOW.as_millis() as u64)
 }
 
+/// Whether the digest saved in `previous` is due to be hashed from the text
+/// again: never hashed with a shape, or older than [`VERIFY_INTERVAL`] plus
+/// this conversation's share of a second interval.
+fn verify_due(previous: &CursorStamp, id: &str, now_ms: u64) -> bool {
+    let Some(verified) = previous.verified else {
+        return true;
+    };
+    let interval = VERIFY_INTERVAL.as_millis() as u64;
+    let hash = blake3::hash(id.as_bytes());
+    let share = u64::from_le_bytes(hash.as_bytes()[..8].try_into().unwrap()) % interval;
+    now_ms.saturating_sub(verified) >= interval + share
+}
+
 /// Whether the digest saved in `previous` still describes a conversation of
 /// this `shape` without hashing its text again.
 fn digest_still_valid(
@@ -509,16 +522,7 @@ fn digest_still_valid(
     id: &str,
     now_ms: u64,
 ) -> bool {
-    if active || previous.shape.as_deref() != Some(shape) {
-        return false;
-    }
-    let Some(verified) = previous.verified else {
-        return false;
-    };
-    let interval = VERIFY_INTERVAL.as_millis() as u64;
-    let hash = blake3::hash(id.as_bytes());
-    let share = u64::from_le_bytes(hash.as_bytes()[..8].try_into().unwrap()) % interval;
-    now_ms.saturating_sub(verified) < interval + share
+    !active && previous.shape.as_deref() == Some(shape) && !verify_due(previous, id, now_ms)
 }
 
 fn fingerprint(
@@ -552,8 +556,13 @@ fn fingerprint(
                 let current = crate::catalog::fingerprint(&db, true);
                 match previous {
                     // The database has not changed since this digest was saved:
-                    // one stat, no read.
-                    Some(p) if current.is_some() && p.observed == current => {
+                    // one stat, no read. A digest once reused on its shape
+                    // still comes due for a hash from the text.
+                    Some(p)
+                        if current.is_some()
+                            && p.observed == current
+                            && !verify_due(p, &session.id, now) =>
+                    {
                         (current, p.digest.clone(), p.shape.clone(), p.verified)
                     }
                     _ => {

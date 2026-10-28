@@ -227,19 +227,36 @@ fn conversation_shapes(path: &Path) -> Option<ConversationShapes> {
         }
     }
     {
-        let mut stmt = tx
-            .prepare("SELECT composerId, value FROM composerHeaders")
-            .ok()?;
+        // Every column: Cursor keeps the update time and the subagent flag
+        // beside the header JSON, and the listing's dates come from them.
+        let mut stmt = tx.prepare("SELECT * FROM composerHeaders").ok()?;
+        let id_column = stmt.column_index("composerId").ok()?;
+        let columns = stmt.column_count();
         let rows = stmt
             .query_map([], |row| {
                 use rusqlite::types::ValueRef;
-                let header = match row.get_ref(1)? {
-                    ValueRef::Text(bytes) | ValueRef::Blob(bytes) => {
-                        blake3::hash(bytes).to_hex()[..16].to_string()
+                let mut hash = blake3::Hasher::new();
+                for column in 0..columns {
+                    match row.get_ref(column)? {
+                        ValueRef::Null => {
+                            hash.update(b"n");
+                        }
+                        ValueRef::Integer(n) => {
+                            hash.update(b"i");
+                            hash.update(&n.to_le_bytes());
+                        }
+                        ValueRef::Real(x) => {
+                            hash.update(b"r");
+                            hash.update(&x.to_le_bytes());
+                        }
+                        ValueRef::Text(bytes) | ValueRef::Blob(bytes) => {
+                            hash.update(&(bytes.len() as u64).to_le_bytes());
+                            hash.update(bytes);
+                        }
                     }
-                    _ => String::new(),
-                };
-                Ok((row.get::<_, String>(0)?, header))
+                }
+                let header = hash.finalize().to_hex()[..16].to_string();
+                Ok((row.get::<_, String>(id_column)?, header))
             })
             .ok()?;
         for row in rows {

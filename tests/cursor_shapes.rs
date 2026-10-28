@@ -228,14 +228,9 @@ fn a_shape_preserving_edit_to_a_cold_conversation_is_caught_by_the_periodic_chec
         !search(&tmp, "uniquefour2").contains(ID),
         "a cold conversation whose shape did not change keeps its digest for now"
     );
-    // Pretend the digest was last hashed from content long ago.
+    // Pretend the digest was last hashed from content long ago. Nothing else
+    // touches the database: the check must run on a quiet database too.
     set_verified(&tmp, 1);
-    conn.execute(
-        "INSERT INTO cursorDiskKV VALUES ('workbench.other.state', 'unrelated')",
-        [],
-    )
-    .unwrap();
-    thread::sleep(QUIET);
     assert!(
         search(&tmp, "uniquefour2").contains(ID),
         "a stale digest is re-hashed once its periodic check is due"
@@ -298,5 +293,39 @@ fn a_cold_conversation_keeps_its_listing_row_until_its_shape_changes() {
     assert!(
         listing(&tmp).contains("flaking build"),
         "a changed shape rebuilds the row"
+    );
+}
+
+#[test]
+fn a_change_to_a_header_column_rebuilds_the_listing_row() {
+    // Cursor keeps createdAt, lastUpdatedAt and isSubagent in their own
+    // columns beside the header JSON. A conversation bumped only there must
+    // move in the listing: its date comes from that column.
+    let tmp = TempDir::new().unwrap();
+    let conn = ide_db(&tmp, "uniquetenth", OLD_MS);
+    bury(&conn);
+    thread::sleep(QUIET);
+    let today = command(&tmp)
+        .args(["--source", "cursor-ide", "--from", "today"])
+        .output()
+        .unwrap();
+    assert!(
+        !String::from_utf8_lossy(&today.stdout).contains("fedc1234"),
+        "indexed as an old conversation"
+    );
+    conn.execute(
+        "UPDATE composerHeaders SET lastUpdatedAt = ?1 WHERE composerId = ?2",
+        rusqlite::params![chrono::Utc::now().timestamp_millis(), ID],
+    )
+    .unwrap();
+    thread::sleep(QUIET);
+    let today = command(&tmp)
+        .args(["--source", "cursor-ide", "--from", "today"])
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&today.stdout).contains("fedc1234"),
+        "listed for today after its update time moved: {}",
+        String::from_utf8_lossy(&today.stdout)
     );
 }
