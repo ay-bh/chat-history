@@ -466,7 +466,7 @@ impl CursorShapes {
                 return loaded.clone();
             }
         }
-        let loaded = crate::cursor_ide::conversation_shapes(db).map(Arc::new);
+        let loaded = crate::cursor_ide::current_shapes(db);
         map.insert(db.to_path_buf(), loaded.clone());
         loaded
     }

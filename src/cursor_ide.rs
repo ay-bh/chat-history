@@ -10,6 +10,7 @@ use serde_json::Value;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 pub fn cursor_user_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("CURSOR_USER_DIR")
@@ -122,7 +123,8 @@ pub(crate) struct ConversationShapes {
     /// The database stamp the shapes describe, when it held still while they
     /// were read.
     pub(crate) stamp: Option<String>,
-    shapes: HashMap<String, String>,
+    /// Shape and bubble row count per conversation.
+    shapes: HashMap<String, (String, u64)>,
 }
 
 impl ConversationShapes {
@@ -130,16 +132,37 @@ impl ConversationShapes {
     pub(crate) fn shape(&self, id: &str) -> String {
         self.shapes
             .get(id)
-            .cloned()
+            .map(|(shape, _)| shape.clone())
             .unwrap_or_else(|| "none".into())
+    }
+
+    pub(crate) fn bubble_count(&self, id: &str) -> u64 {
+        self.shapes.get(id).map_or(0, |(_, count)| *count)
     }
 }
 
-pub(crate) fn conversation_shapes(path: &Path) -> Option<ConversationShapes> {
+/// The shapes of the database as it stands, read at most once per process for
+/// a given database state and shared by session discovery and the index sync.
+pub(crate) fn current_shapes(path: &Path) -> Option<Arc<ConversationShapes>> {
+    static SHARED: Mutex<Option<(PathBuf, Arc<ConversationShapes>)>> = Mutex::new(None);
+    let mut slot = SHARED.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((held, shapes)) = slot.as_ref()
+        && held == path
+        && shapes.stamp.is_some()
+        && shapes.stamp == crate::catalog::fingerprint(path, true)
+    {
+        return Some(shapes.clone());
+    }
+    let shapes = Arc::new(conversation_shapes(path)?);
+    *slot = Some((path.to_path_buf(), shapes.clone()));
+    Some(shapes)
+}
+
+fn conversation_shapes(path: &Path) -> Option<ConversationShapes> {
     let before = crate::catalog::fingerprint(path, true);
     let conn = open_ro(path)?;
     let tx = conn.unchecked_transaction().ok()?;
-    let mut parts: HashMap<String, [String; 3]> = HashMap::new();
+    let mut parts: HashMap<String, ([String; 3], u64)> = HashMap::new();
     {
         let mut stmt = tx
             .prepare(
@@ -158,7 +181,9 @@ pub(crate) fn conversation_shapes(path: &Path) -> Option<ConversationShapes> {
             .ok()?;
         for row in rows {
             let (id, count, newest) = row.ok()?;
-            parts.entry(id).or_default()[0] = format!("{count}@{newest}");
+            let entry = parts.entry(id).or_default();
+            entry.0[0] = format!("{count}@{newest}");
+            entry.1 = count.max(0) as u64;
         }
     }
     {
@@ -180,7 +205,7 @@ pub(crate) fn conversation_shapes(path: &Path) -> Option<ConversationShapes> {
             .ok()?;
         for row in rows {
             let (id, rowid, len) = row.ok()?;
-            parts.entry(id).or_default()[1] = format!("{rowid}:{}", len.unwrap_or(0));
+            parts.entry(id).or_default().0[1] = format!("{rowid}:{}", len.unwrap_or(0));
         }
     }
     {
@@ -201,7 +226,7 @@ pub(crate) fn conversation_shapes(path: &Path) -> Option<ConversationShapes> {
             .ok()?;
         for row in rows {
             let (id, header) = row.ok()?;
-            parts.entry(id).or_default()[2] = header;
+            parts.entry(id).or_default().0[2] = header;
         }
     }
     tx.commit().ok()?;
@@ -211,7 +236,9 @@ pub(crate) fn conversation_shapes(path: &Path) -> Option<ConversationShapes> {
         stamp,
         shapes: parts
             .into_iter()
-            .map(|(id, [bubbles, data, header])| (id, format!("{bubbles}/{data}/{header}")))
+            .map(|(id, ([bubbles, data, header], count))| {
+                (id, (format!("{bubbles}/{data}/{header}"), count))
+            })
             .collect(),
     })
 }
@@ -526,7 +553,14 @@ fn read_cursor_ide_sessions_from(db: &Path) -> Option<Vec<Session>> {
     let Ok(rows) = rows else {
         return None;
     };
-    let counts = bubble_counts(&conn);
+    // Bubble counts come from the shared shapes snapshot, which the index sync
+    // reuses; the plain count query stands in when the shapes cannot be read.
+    let shapes = current_shapes(db);
+    let counts = if shapes.is_none() {
+        bubble_counts(&conn)
+    } else {
+        HashMap::new()
+    };
     let file = db.to_string_lossy().to_string();
     for row in rows.flatten() {
         let (id, mut created_ms, mut updated_ms, mut is_sidechain, raw) = row;
@@ -565,7 +599,11 @@ fn read_cursor_ide_sessions_from(db: &Path) -> Option<Vec<Session>> {
         // and parse each one once per listing.
         let headers = composer_header_order(&conn, &id);
         let header_len = headers.as_ref().map(|h| h.len() as u64).unwrap_or(0);
-        let nmsg = header_len.max(counts.get(&id).copied().unwrap_or(0));
+        let bubbles = shapes.as_ref().map_or_else(
+            || counts.get(&id).copied().unwrap_or(0),
+            |s| s.bubble_count(&id),
+        );
+        let nmsg = header_len.max(bubbles);
         if first.is_empty() && nmsg > 0 {
             first = first_user_text(&conn, &id, headers.as_deref());
         }
@@ -696,6 +734,50 @@ pub fn parse_cursor_ide(session: &Session) -> Vec<Message> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shapes_are_read_once_per_database_state_and_again_after_a_change() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = tmp.path().join("state.vscdb");
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE composerHeaders (composerId TEXT PRIMARY KEY, createdAt INTEGER, lastUpdatedAt INTEGER, isSubagent INTEGER, value TEXT);
+             CREATE TABLE cursorDiskKV (key TEXT PRIMARY KEY, value BLOB);
+             INSERT INTO composerHeaders VALUES ('aaaa1111-bbbb-cccc-dddd-eeeeeeeeeee1', 1, 1, 0, '{}');
+             INSERT INTO cursorDiskKV VALUES ('bubbleId:aaaa1111-bbbb-cccc-dddd-eeeeeeeeeee1:b1', '{\"type\":1,\"text\":\"hello\"}');",
+        )
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2100));
+        let first = current_shapes(&db).expect("readable");
+        let again = current_shapes(&db).expect("readable");
+        assert!(
+            std::sync::Arc::ptr_eq(&first, &again),
+            "an unchanged database is not read twice"
+        );
+        assert_eq!(
+            first.bubble_count("aaaa1111-bbbb-cccc-dddd-eeeeeeeeeee1"),
+            1
+        );
+        conn.execute_batch(
+            "INSERT INTO cursorDiskKV VALUES ('bubbleId:aaaa1111-bbbb-cccc-dddd-eeeeeeeeeee1:b2', '{\"type\":1,\"text\":\"more\"}');",
+        )
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2100));
+        let changed = current_shapes(&db).expect("readable");
+        assert!(
+            !std::sync::Arc::ptr_eq(&first, &changed),
+            "a changed database is read again"
+        );
+        assert_eq!(
+            changed.bubble_count("aaaa1111-bbbb-cccc-dddd-eeeeeeeeeee1"),
+            2
+        );
+        assert_ne!(
+            first.shape("aaaa1111-bbbb-cccc-dddd-eeeeeeeeeee1"),
+            changed.shape("aaaa1111-bbbb-cccc-dddd-eeeeeeeeeee1")
+        );
+        assert_eq!(changed.shape("absent"), "none");
+    }
     use rusqlite::Connection;
 
     fn empty_schema(conn: &Connection) {
