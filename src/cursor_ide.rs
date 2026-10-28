@@ -193,23 +193,49 @@ fn conversation_shapes(path: &Path) -> Option<ConversationShapes> {
     let mut parts: HashMap<String, ([String; 3], u64, i64)> = HashMap::new();
     let mut newest = 0i64;
     {
+        // Per conversation: how many bubble rows, and the newest. Streamed in
+        // key order from the covering key index and grouped here; a GROUP BY
+        // on substr() makes SQLite sort every key in a temporary b-tree
+        // (28-38 ms against 8 ms for the scan on a real database).
         let mut stmt = tx
             .prepare(
-                "SELECT substr(key, 10, 36), count(*), max(rowid) FROM cursorDiskKV \
-                 WHERE key >= 'bubbleId:' AND key < 'bubbleId;' GROUP BY 1",
+                "SELECT key, rowid FROM cursorDiskKV \
+                 WHERE key >= 'bubbleId:' AND key < 'bubbleId;' ORDER BY key",
             )
             .ok()?;
-        let rows = stmt
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, i64>(2)?,
-                ))
-            })
-            .ok()?;
-        for row in rows {
-            let (id, count, newest_row) = row.ok()?;
+        let mut rows = stmt.query([]).ok()?;
+        let mut counts: HashMap<String, (i64, i64)> = HashMap::new();
+        let mut current: Option<(String, i64, i64)> = None;
+        while let Some(row) = rows.next().ok()? {
+            let rowid: i64 = row.get(1).ok()?;
+            let key = row.get_ref(0).ok()?.as_str().ok()?;
+            // substr(key, 10, 36): characters, not bytes.
+            let id: std::borrow::Cow<str> = if key.is_ascii() {
+                key.get(9..key.len().min(45)).unwrap_or("").into()
+            } else {
+                key.chars().skip(9).take(36).collect::<String>().into()
+            };
+            match current.as_mut() {
+                Some((held, count, newest_row)) if *held == *id => {
+                    *count += 1;
+                    *newest_row = (*newest_row).max(rowid);
+                }
+                _ => {
+                    if let Some((held, count, newest_row)) = current.take() {
+                        let entry = counts.entry(held).or_default();
+                        entry.0 += count;
+                        entry.1 = entry.1.max(newest_row);
+                    }
+                    current = Some((id.into_owned(), 1, rowid));
+                }
+            }
+        }
+        if let Some((held, count, newest_row)) = current {
+            let entry = counts.entry(held).or_default();
+            entry.0 += count;
+            entry.1 = entry.1.max(newest_row);
+        }
+        for (id, (count, newest_row)) in counts {
             let entry = parts.entry(id).or_default();
             entry.0[0] = format!("{count}@{newest_row}");
             entry.1 = count.max(0) as u64;
@@ -832,6 +858,54 @@ pub fn parse_cursor_ide(session: &Session) -> Vec<Message> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bubble_counts_in_shapes_match_sqlite_grouping_including_odd_keys() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = tmp.path().join("state.vscdb");
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE composerHeaders (composerId TEXT PRIMARY KEY, createdAt INTEGER, lastUpdatedAt INTEGER, isSubagent INTEGER, value TEXT);
+             CREATE TABLE cursorDiskKV (key TEXT PRIMARY KEY, value BLOB);",
+        )
+        .unwrap();
+        let a = "aaaa1111-bbbb-cccc-dddd-eeeeeeeeeee1";
+        let b = "aaaa1111-bbbb-cccc-dddd-eeeeeeeeeee2";
+        for key in [
+            format!("bubbleId:{a}:1"),
+            format!("bubbleId:{b}:1"),
+            format!("bubbleId:{a}:2"),
+            format!("bubbleId:{b}:2"),
+            format!("bubbleId:{b}:3"),
+            "bubbleId:short".to_string(),
+            "bubbleId:shortx".to_string(),
+            format!("bubbleId:{a}"),
+            "bubbleId:é-not-ascii-key-padding-to-forty-five:z".to_string(),
+        ] {
+            conn.execute("INSERT INTO cursorDiskKV VALUES (?1, '{}')", [key])
+                .unwrap();
+        }
+        let expected: Vec<(String, i64, i64)> = conn
+            .prepare(
+                "SELECT substr(key, 10, 36), count(*), max(rowid) FROM cursorDiskKV \
+                 WHERE key >= 'bubbleId:' AND key < 'bubbleId;' GROUP BY 1",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let shapes = conversation_shapes(&db).unwrap();
+        for (id, count, newest) in &expected {
+            assert_eq!(shapes.bubble_count(id), *count as u64, "{id}");
+            assert!(
+                shapes.shape(id).starts_with(&format!("{count}@{newest}/")),
+                "{id}: {}",
+                shapes.shape(id)
+            );
+        }
+        assert_eq!(shapes.shapes.len(), expected.len());
+    }
 
     #[test]
     fn the_sync_reuses_the_snapshot_discovery_took_even_while_the_database_is_written() {
