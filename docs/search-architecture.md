@@ -204,7 +204,10 @@ starts a detached `chat-history maintain --cache-dir` run that VACUUMs the index
 (3.5 s for that file, which halved it) and truncates the WAL, at most once a day;
 readers keep their snapshot meanwhile, best-effort stamp refreshes give up at
 once rather than queue behind it, and only a search that must publish parsed
-messages waits, at most its busy timeout. The run is started after the search
+messages waits for the VACUUM to finish (a writer gives up only after ten seconds
+without any progress by another writer, longer than a VACUUM of a large index
+takes). A failed VACUUM is recorded like a successful one, so it is not retried
+by every search until the cooldown has passed. The run is started after the search
 has closed its own connection, since a connection closing while the VACUUM
 holds the write lock waits on it to checkpoint. A lock file prevents concurrent
 searches from each starting one, and a marker file beside the index records the
