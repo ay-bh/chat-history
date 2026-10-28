@@ -2011,12 +2011,6 @@ impl SearchBackend for Bm25Backend {
         // Keep full message JSON out of SQLite's candidate sorter. A long
         // message can have thousands of matching passages but is hydrated once.
         let mut hydrate = tx.prepare_cached("SELECT payload FROM messages WHERE id = ?1")?;
-        // Compute excerpts only for accepted hits, keeping text out of the
-        // candidate sorter. FTS uses the same analyzer and winning passage.
-        let mut excerpt = tx.prepare_cached(
-            "SELECT snippet(passages_fts, -1, '', '', ' … ', 40)
-             FROM passages_fts WHERE rowid = ?1 AND passages_fts MATCH ?2",
-        )?;
         let mut seen_messages = HashSet::new();
         let mut seen_content = HashSet::new();
         let mut counts: HashMap<(String, String), usize> = HashMap::new();
@@ -2085,19 +2079,9 @@ impl SearchBackend for Bm25Backend {
             let ordinal = (!synthetic)
                 .then_some(candidate.ordinal)
                 .and_then(|stored| usize::try_from(stored).ok()?.checked_sub(2));
-            let snippet: String =
-                excerpt.query_row(params![passage_id, query.broad], |r| r.get(0))?;
-            let snippet = if snippet.trim().is_empty() {
-                let q = if request.query.len() > 4096 {
-                    &request.query[..request.query.floor_char_boundary(4096)]
-                } else {
-                    request.query
-                };
-                snippet_around_match(&message.content, q, 200)
-            } else {
-                snippet
-            };
-            let snippet = cap_excerpt(&snippet, SNIPPET_CHARS);
+            // The excerpt is computed for all accepted hits after the loop;
+            // until then a hit's snippet holds its passage id.
+            let snippet = passage_id.to_string();
             if let Some(twin) = twin {
                 // Keep the synthetic row's rank; show the message it echoed.
                 // The title and prompt rows are distinct: replace the twin.
@@ -2153,8 +2137,63 @@ impl SearchBackend for Bm25Backend {
                 break;
             }
         }
+        let wanted: Vec<i64> = results
+            .iter()
+            .flat_map(|r| {
+                std::iter::once(&r.snippet).chain(r.additional_matches.iter().map(|m| &m.snippet))
+            })
+            .filter_map(|s| s.as_deref()?.parse().ok())
+            .collect();
+        let excerpts = excerpts(&tx, &query.broad, &wanted)?;
+        let fallback = if request.query.len() > 4096 {
+            &request.query[..request.query.floor_char_boundary(4096)]
+        } else {
+            request.query
+        };
+        let finish = |message: &Message, snippet: &mut Option<String>| {
+            let Some(id) = snippet.as_deref().and_then(|s| s.parse::<i64>().ok()) else {
+                return;
+            };
+            let raw = excerpts.get(&id).map(String::as_str).unwrap_or("");
+            let text = if raw.trim().is_empty() {
+                snippet_around_match(&message.content, fallback, 200)
+            } else {
+                raw.to_owned()
+            };
+            *snippet = Some(cap_excerpt(&text, SNIPPET_CHARS));
+        };
+        for result in &mut results {
+            finish(&result.message, &mut result.snippet);
+            for extra in &mut result.additional_matches {
+                finish(&extra.message, &mut extra.snippet);
+            }
+        }
         Ok(results)
     }
+}
+
+/// FTS5 excerpts of the given passages for one MATCH expression, in a single
+/// statement: the expression is expanded once (a short prefix such as `4*`
+/// can cost tens of milliseconds) and `snippet()` runs only on these rows.
+fn excerpts(conn: &Connection, expr: &str, ids: &[i64]) -> Result<HashMap<i64, String>> {
+    let mut out = HashMap::new();
+    let (Some(&low), Some(&high)) = (ids.iter().min(), ids.iter().max()) else {
+        return Ok(out);
+    };
+    let mut stmt = conn.prepare_cached(
+        "SELECT rowid,
+                CASE WHEN rowid IN (SELECT value FROM json_each(?2))
+                     THEN snippet(passages_fts, -1, '', '', ' … ', 40) END
+         FROM passages_fts
+         WHERE passages_fts MATCH ?1 AND rowid BETWEEN ?3 AND ?4",
+    )?;
+    let mut rows = stmt.query(params![expr, serde_json::to_string(ids)?, low, high])?;
+    while let Some(row) = rows.next()? {
+        if let Some(excerpt) = row.get::<_, Option<String>>(1)? {
+            out.insert(row.get(0)?, excerpt);
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
