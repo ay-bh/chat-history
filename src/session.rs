@@ -758,6 +758,46 @@ fn decode_from_root(root: &Path, slug: &str) -> WorkspaceResolution {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Directory reads by `subdirectories`, for tests.
+    static LISTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+type Subdirectories = std::rc::Rc<Vec<(String, PathBuf)>>;
+
+/// The subdirectories of `dir`, read once per process. Every Cursor project
+/// slug is decoded from `/` down and they share most of their path, so
+/// without this each slug re-read (and stat'ed every entry of) the home
+/// directory and its parents again.
+fn subdirectories(dir: &Path) -> Subdirectories {
+    thread_local! {
+        static READ: std::cell::RefCell<HashMap<PathBuf, Subdirectories>> =
+            std::cell::RefCell::new(HashMap::new());
+    }
+    if let Some(found) = READ.with(|read| read.borrow().get(dir).cloned()) {
+        return found;
+    }
+    #[cfg(test)]
+    LISTED.with(|n| n.set(n.get() + 1));
+    let found: Subdirectories = std::rc::Rc::new(
+        fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter_map(|entry| {
+                        let path = entry.path();
+                        path.is_dir()
+                            .then(|| (entry.file_name().to_string_lossy().into_owned(), path))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+    );
+    READ.with(|read| read.borrow_mut().insert(dir.to_path_buf(), found.clone()));
+    found
+}
+
 fn existing_slug_paths(root: &Path, rest: &str) -> Vec<PathBuf> {
     if rest.is_empty() {
         return if root.is_dir() {
@@ -766,22 +806,14 @@ fn existing_slug_paths(root: &Path, rest: &str) -> Vec<PathBuf> {
             Vec::new()
         };
     }
-    let Ok(entries) = fs::read_dir(root) else {
-        return Vec::new();
-    };
     let mut out = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
-        let name = entry.file_name().to_string_lossy().into_owned();
+    for (name, path) in subdirectories(root).iter() {
         if rest == name {
-            out.push(path);
-        } else if let Some(after) = rest.strip_prefix(&name)
+            out.push(path.clone());
+        } else if let Some(after) = rest.strip_prefix(name.as_str())
             && let Some(tail) = after.strip_prefix('-')
         {
-            out.extend(existing_slug_paths(&path, tail));
+            out.extend(existing_slug_paths(path, tail));
         }
     }
     out
@@ -2411,6 +2443,26 @@ mod tests {
         assert_eq!(
             cursor_project_slug("/private/tmp/claude-501/-Users-me/x y/"),
             "private-tmp-claude-501-Users-me-x-y"
+        );
+    }
+
+    #[test]
+    fn decoding_slugs_that_share_parents_lists_each_directory_once() {
+        let root = tempfile::TempDir::new().unwrap();
+        for d in ["work/b-c", "work/d", "work/e"] {
+            std::fs::create_dir_all(root.path().join(d)).unwrap();
+        }
+        let before = LISTED.with(|n| n.get());
+        for slug in ["work-b-c", "work-d", "work-e"] {
+            assert!(matches!(
+                decode_from_root(root.path(), slug),
+                WorkspaceResolution::Exact(_)
+            ));
+        }
+        assert_eq!(
+            LISTED.with(|n| n.get()) - before,
+            2,
+            "the root and work/ are read once, not once per slug"
         );
     }
 
