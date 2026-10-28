@@ -405,10 +405,14 @@ pub fn search_corpus(
             progress.warn(&format!("Warning: could not save search cache ({error}); searching with an in-memory BM25 index."));
             return memory_search(corpus, request, rebuild, &mut progress);
         }
-        backend.schedule_compaction(dir);
         match backend.search(request) {
             Ok(results) => match indexed_session_keys_match(&backend.conn, corpus) {
-                Ok(true) => return Ok(results),
+                Ok(true) => {
+                    // Started only once the results are in, so the VACUUM's
+                    // reads never compete with this search's own.
+                    backend.schedule_compaction(dir);
+                    return Ok(results);
+                }
                 Ok(false) if attempt + 1 < CACHE_MISMATCH_ATTEMPTS => {}
                 Ok(false) => {
                     progress.warn("Warning: search cache replaced during retrieval; searching with an in-memory BM25 index.");
