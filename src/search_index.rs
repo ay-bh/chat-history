@@ -449,8 +449,12 @@ impl Fingerprint {
     }
 }
 
-/// Conversation shapes per Cursor database, read once per sync. A parse asks
-/// for a `refresh`, which re-reads them only if the database moved on since.
+/// Conversation shapes per Cursor database, read once per sync so that the plan
+/// judges every conversation against one database state; the stamp saved with
+/// a reused digest is that snapshot's stamp, so a write landing during the plan
+/// is seen by the next search, which reloads the shapes. Re-validating on every
+/// load would re-read them once per session whenever Cursor is mid-write. A
+/// parse asks for a `refresh`, which re-reads them if the database moved on.
 #[derive(Default)]
 struct CursorShapes(Mutex<HashMap<PathBuf, Option<Arc<ConversationShapes>>>>);
 
@@ -472,9 +476,10 @@ impl CursorShapes {
     }
 }
 
-/// A conversation Cursor updated inside this window is hashed from its text
-/// whenever the database changes: its rows may be edited in place while a
-/// reply streams. Older conversations are trusted to their shape.
+/// A conversation Cursor updated inside this window, or whose rows are among
+/// the newest in the database, is hashed from its text whenever the database
+/// changes: its rows may be edited in place while a reply streams. Older
+/// conversations are trusted to their shape.
 const ACTIVE_WINDOW: Duration = Duration::from_secs(24 * 3600);
 /// How long a shape-trusted digest stands before the text is hashed again,
 /// plus a per-conversation share of the same length, so conversations come
@@ -559,7 +564,10 @@ fn fingerprint(
                             // The database changed, but this conversation's rows did not.
                             Some(p)
                                 if shape.as_deref().is_some_and(|s| {
-                                    let active = recently_active(session, now);
+                                    let active = recently_active(session, now)
+                                        || shapes
+                                            .as_ref()
+                                            .is_some_and(|s| s.recently_written(&session.id));
                                     digest_still_valid(p, s, active, &session.id, now)
                                 }) =>
                             {

@@ -136,8 +136,10 @@ newest bubble rowid from the key index, its composer-data row's rowid and byte
 length from the row header, and a hash of its header row, all in one snapshot
 and without the conversation text (about a tenth of a second for ninety
 thousand rows). A conversation whose shape is unchanged keeps its digest. Only
-conversations whose shape moved, conversations updated inside the last day
-(Cursor may edit their rows in place while a reply streams) and conversations
+conversations whose shape moved, conversations updated inside the last day or whose
+newest row is among the last thousand written to the database (Cursor may edit
+their rows in place while a reply streams, and many of its conversations carry
+no update time) and conversations
 whose hourly re-check has come due (spread per conversation over a second hour,
 so a few come due per search rather than all at once) are hashed from their
 text, and only those whose digest changed are parsed. Cursor rewrites the

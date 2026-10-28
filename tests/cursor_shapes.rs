@@ -2,6 +2,10 @@
 //! every few seconds while open. A search must not re-hash every conversation's
 //! text each time that happens: a conversation whose cheap shape (row count,
 //! newest row, header) is unchanged keeps the digest it already has.
+//!
+//! Edits in these tests go to the assistant's reply, never to the first prompt:
+//! discovery reads the first prompt live and it sits in the session signature,
+//! so an edit there would be noticed for a reason unrelated to the digest.
 
 use assert_cmd::Command;
 use serde_json::{Value, json};
@@ -27,8 +31,9 @@ fn db_path(tmp: &TempDir) -> PathBuf {
     tmp.path().join("cursor-user/globalStorage/state.vscdb")
 }
 
-/// One IDE conversation with one user bubble, last updated at `updated_ms`.
-fn ide_db(tmp: &TempDir, text: &str, updated_ms: i64) -> rusqlite::Connection {
+/// One IDE conversation, last updated at `updated_ms`, with a user prompt and
+/// an assistant reply that mentions `reply_word`.
+fn ide_db(tmp: &TempDir, reply_word: &str, updated_ms: i64) -> rusqlite::Connection {
     let db = db_path(tmp);
     fs::create_dir_all(db.parent().unwrap()).unwrap();
     let conn = rusqlite::Connection::open(&db).unwrap();
@@ -38,20 +43,54 @@ fn ide_db(tmp: &TempDir, text: &str, updated_ms: i64) -> rusqlite::Connection {
     )
     .unwrap();
     conn.execute(
-        "INSERT INTO composerHeaders VALUES (?1, ?2, ?3, 0, '{}')",
+        "INSERT INTO composerHeaders VALUES (?1, ?2, ?3, 0, '{\"name\":\"Shapes\"}')",
         rusqlite::params![ID, OLD_MS, updated_ms],
     )
     .unwrap();
-    conn.execute(
-        "INSERT INTO cursorDiskKV VALUES (?1, ?2)",
-        rusqlite::params![
-            format!("bubbleId:{ID}:b1"),
-            json!({"type":1, "bubbleId":"b1", "text":text, "createdAt":"2025-01-01T00:00:00Z"})
-                .to_string()
-        ],
-    )
-    .unwrap();
+    for (bubble, ty, text) in [
+        ("b1", 1, "investigate the failing build".to_string()),
+        ("b2", 2, format!("the cause is {reply_word} in the linker")),
+    ] {
+        conn.execute(
+            "INSERT INTO cursorDiskKV VALUES (?1, ?2)",
+            rusqlite::params![
+                format!("bubbleId:{ID}:{bubble}"),
+                json!({"type":ty, "bubbleId":bubble, "text":text, "createdAt":"2025-01-01T00:00:00Z"}).to_string()
+            ],
+        )
+        .unwrap();
+    }
     conn
+}
+
+/// Rewrite the assistant reply in place with a word of the same length, so no
+/// row is added, removed or resized: nothing but the text itself changes.
+fn edit_reply(conn: &rusqlite::Connection, from: &str, to: &str) {
+    assert_eq!(from.len(), to.len(), "same length keeps the shape");
+    let changed = conn
+        .execute(
+            "UPDATE cursorDiskKV SET value = replace(value, ?2, ?3) WHERE key = ?1",
+            rusqlite::params![format!("bubbleId:{ID}:b2"), from, to],
+        )
+        .unwrap();
+    assert_eq!(changed, 1);
+}
+
+/// Later rows for another conversation, so that `ID`'s rows are no longer among
+/// the newest in the database: a conversation nobody has written to for a while.
+fn bury(conn: &rusqlite::Connection) {
+    let tx = conn.unchecked_transaction().unwrap();
+    for i in 0..1200 {
+        tx.execute(
+            "INSERT INTO cursorDiskKV VALUES (?1, ?2)",
+            rusqlite::params![
+                format!("bubbleId:fedc1234-0000-4000-8000-00000000f1ee:b{i:04}"),
+                json!({"type":2, "bubbleId":format!("b{i:04}"), "text":"filler"}).to_string()
+            ],
+        )
+        .unwrap();
+    }
+    tx.commit().unwrap();
 }
 
 fn search(tmp: &TempDir, query: &str) -> String {
@@ -91,7 +130,8 @@ fn set_verified(tmp: &TempDir, verified_ms: u64) {
 #[test]
 fn an_unrelated_change_to_the_cursor_database_keeps_a_conversation_digest() {
     let tmp = TempDir::new().unwrap();
-    let conn = ide_db(&tmp, "investigate uniquefirst failure", OLD_MS);
+    let conn = ide_db(&tmp, "uniquefirst", OLD_MS);
+    bury(&conn);
     thread::sleep(QUIET);
     assert!(search(&tmp, "uniquefirst").contains(ID), "indexed");
     let before = stored_stamp(&tmp);
@@ -123,14 +163,15 @@ fn an_unrelated_change_to_the_cursor_database_keeps_a_conversation_digest() {
 #[test]
 fn a_new_bubble_in_a_quiet_conversation_is_indexed_on_the_next_search() {
     let tmp = TempDir::new().unwrap();
-    let conn = ide_db(&tmp, "investigate uniquefirst failure", OLD_MS);
+    let conn = ide_db(&tmp, "uniquefirst", OLD_MS);
+    bury(&conn);
     thread::sleep(QUIET);
     assert!(search(&tmp, "uniquefirst").contains(ID), "indexed");
     conn.execute(
         "INSERT INTO cursorDiskKV VALUES (?1, ?2)",
         rusqlite::params![
-            format!("bubbleId:{ID}:b2"),
-            json!({"type":1, "bubbleId":"b2", "text":"then uniquesecond question", "createdAt":"2025-01-02T00:00:00Z"}).to_string()
+            format!("bubbleId:{ID}:b3"),
+            json!({"type":1, "bubbleId":"b3", "text":"then uniquesecond question", "createdAt":"2025-01-02T00:00:00Z"}).to_string()
         ],
     )
     .unwrap();
@@ -142,38 +183,58 @@ fn a_new_bubble_in_a_quiet_conversation_is_indexed_on_the_next_search() {
 }
 
 #[test]
-fn an_active_conversation_is_always_hashed_from_its_text() {
+fn a_conversation_updated_today_is_always_hashed_from_its_text() {
     let tmp = TempDir::new().unwrap();
     let now_ms = chrono::Utc::now().timestamp_millis();
-    let conn = ide_db(&tmp, "investigate uniquefifth failure", now_ms);
+    let conn = ide_db(&tmp, "uniquefifth", now_ms);
+    bury(&conn);
     thread::sleep(QUIET);
     assert!(search(&tmp, "uniquefifth").contains(ID), "indexed");
-    // Same byte length, same row, same header: the shape cannot tell.
-    conn.execute(
-        "UPDATE cursorDiskKV SET value = replace(value, 'uniquefifth', 'uniquesixth') WHERE key = ?1",
-        [format!("bubbleId:{ID}:b1")],
-    )
-    .unwrap();
+    edit_reply(&conn, "uniquefifth", "uniquesixth");
     thread::sleep(QUIET);
     assert!(
         search(&tmp, "uniquesixth").contains(ID),
-        "a conversation updated recently is re-read every time its database changes"
+        "a conversation Cursor updated recently is re-read whenever its database changes"
+    );
+}
+
+#[test]
+fn a_conversation_among_the_newest_rows_is_hashed_from_its_text_without_a_timestamp() {
+    // Many Cursor conversations carry no lastUpdatedAt at all, so recent
+    // activity is also read from where the conversation's rows sit in the
+    // database: its newest bubble row is among the newest rows written.
+    let tmp = TempDir::new().unwrap();
+    let conn = ide_db(&tmp, "uniqueseventh", OLD_MS);
+    thread::sleep(QUIET);
+    assert!(search(&tmp, "uniqueseventh").contains(ID), "indexed");
+    edit_reply(&conn, "uniqueseventh", "uniqueeightth");
+    thread::sleep(QUIET);
+    assert!(
+        search(&tmp, "uniqueeightth").contains(ID),
+        "a conversation written to recently is re-read when its database changes"
     );
 }
 
 #[test]
 fn a_shape_preserving_edit_to_a_cold_conversation_is_caught_by_the_periodic_check() {
     let tmp = TempDir::new().unwrap();
-    let conn = ide_db(&tmp, "investigate uniquethird failure", OLD_MS);
+    let conn = ide_db(&tmp, "uniquethird", OLD_MS);
+    bury(&conn);
     thread::sleep(QUIET);
     assert!(search(&tmp, "uniquethird").contains(ID), "indexed");
-    conn.execute(
-        "UPDATE cursorDiskKV SET value = replace(value, 'uniquethird', 'uniquefour2') WHERE key = ?1",
-        [format!("bubbleId:{ID}:b1")],
-    )
-    .unwrap();
+    edit_reply(&conn, "uniquethird", "uniquefour2");
+    thread::sleep(QUIET);
+    assert!(
+        !search(&tmp, "uniquefour2").contains(ID),
+        "a cold conversation whose shape did not change keeps its digest for now"
+    );
     // Pretend the digest was last hashed from content long ago.
     set_verified(&tmp, 1);
+    conn.execute(
+        "INSERT INTO cursorDiskKV VALUES ('workbench.other.state', 'unrelated')",
+        [],
+    )
+    .unwrap();
     thread::sleep(QUIET);
     assert!(
         search(&tmp, "uniquefour2").contains(ID),

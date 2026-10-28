@@ -123,21 +123,36 @@ pub(crate) struct ConversationShapes {
     /// The database stamp the shapes describe, when it held still while they
     /// were read.
     pub(crate) stamp: Option<String>,
-    /// Shape and bubble row count per conversation.
-    shapes: HashMap<String, (String, u64)>,
+    /// Shape, bubble row count and newest bubble rowid per conversation.
+    shapes: HashMap<String, (String, u64, i64)>,
+    /// The newest bubble rowid in the whole database.
+    newest: i64,
 }
+
+/// A conversation whose newest bubble row is within this many rows of the
+/// newest row in the database was written to recently: a few days of use on a
+/// busy profile. Many Cursor conversations carry no update time, so this
+/// stands in for one.
+const RECENT_BUBBLE_ROWS: i64 = 1000;
 
 impl ConversationShapes {
     /// A conversation without any rows has a shape too.
     pub(crate) fn shape(&self, id: &str) -> String {
         self.shapes
             .get(id)
-            .map(|(shape, _)| shape.clone())
+            .map(|(shape, _, _)| shape.clone())
             .unwrap_or_else(|| "none".into())
     }
 
     pub(crate) fn bubble_count(&self, id: &str) -> u64 {
-        self.shapes.get(id).map_or(0, |(_, count)| *count)
+        self.shapes.get(id).map_or(0, |(_, count, _)| *count)
+    }
+
+    /// Whether the conversation's rows are among the newest in the database.
+    pub(crate) fn recently_written(&self, id: &str) -> bool {
+        self.shapes
+            .get(id)
+            .is_some_and(|(_, _, newest)| self.newest - newest < RECENT_BUBBLE_ROWS)
     }
 }
 
@@ -162,7 +177,8 @@ fn conversation_shapes(path: &Path) -> Option<ConversationShapes> {
     let before = crate::catalog::fingerprint(path, true);
     let conn = open_ro(path)?;
     let tx = conn.unchecked_transaction().ok()?;
-    let mut parts: HashMap<String, ([String; 3], u64)> = HashMap::new();
+    let mut parts: HashMap<String, ([String; 3], u64, i64)> = HashMap::new();
+    let mut newest = 0i64;
     {
         let mut stmt = tx
             .prepare(
@@ -180,10 +196,12 @@ fn conversation_shapes(path: &Path) -> Option<ConversationShapes> {
             })
             .ok()?;
         for row in rows {
-            let (id, count, newest) = row.ok()?;
+            let (id, count, newest_row) = row.ok()?;
             let entry = parts.entry(id).or_default();
-            entry.0[0] = format!("{count}@{newest}");
+            entry.0[0] = format!("{count}@{newest_row}");
             entry.1 = count.max(0) as u64;
+            entry.2 = newest_row;
+            newest = newest.max(newest_row);
         }
     }
     {
@@ -236,10 +254,14 @@ fn conversation_shapes(path: &Path) -> Option<ConversationShapes> {
         stamp,
         shapes: parts
             .into_iter()
-            .map(|(id, ([bubbles, data, header], count))| {
-                (id, (format!("{bubbles}/{data}/{header}"), count))
+            .map(|(id, ([bubbles, data, header], count, newest_row))| {
+                (
+                    id,
+                    (format!("{bubbles}/{data}/{header}"), count, newest_row),
+                )
             })
             .collect(),
+        newest,
     })
 }
 
