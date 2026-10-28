@@ -505,7 +505,13 @@ impl CursorShapes {
                 return loaded.clone();
             }
         }
-        let loaded = crate::cursor_ide::current_shapes(db);
+        // The plan starts from the snapshot discovery took; a parse that asks
+        // for a refresh gets the database as it is now.
+        let loaded = if refresh {
+            crate::cursor_ide::current_shapes(db)
+        } else {
+            crate::cursor_ide::latest_shapes(db)
+        };
         map.insert(db.to_path_buf(), loaded.clone());
         loaded
     }

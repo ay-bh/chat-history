@@ -364,8 +364,17 @@ pub(crate) fn read_with<T: Serialize + DeserializeOwned>(
         cache.seen.insert(key.clone());
         cache.observed_at
     });
+    let previous = || {
+        ACTIVE.with(|slot| {
+            let slot = slot.borrow();
+            let entry = slot.as_ref()?.entries.get(&key)?;
+            serde_json::from_str::<T>(&entry.value).ok()
+        })
+    };
+    // A source written moments ago has no stable fingerprint: its value is
+    // not cached, but the loader still starts from the last cached one.
     let Some(before) = fingerprint_at(path, sqlite, observed_at) else {
-        return load(None);
+        return load(previous());
     };
     let hit = ACTIVE.with(|slot| {
         let mut slot = slot.borrow_mut();
@@ -379,12 +388,7 @@ pub(crate) fn read_with<T: Serialize + DeserializeOwned>(
     if hit.is_some() {
         return hit;
     }
-    let previous = ACTIVE.with(|slot| {
-        let slot = slot.borrow();
-        let entry = slot.as_ref()?.entries.get(&key)?;
-        serde_json::from_str::<T>(&entry.value).ok()
-    });
-    let result = load(previous);
+    let result = load(previous());
     let unchanged = fingerprint_at(path, sqlite, observed_at).as_ref() == Some(&before);
     ACTIVE.with(|slot| {
         let mut slot = slot.borrow_mut();
@@ -454,6 +458,37 @@ mod tests {
         fs::write(&path, "other").unwrap();
         assert_eq!(cached_text(&dir, &path, &calls), "other");
         assert_eq!(calls.get(), 2);
+    }
+
+    #[test]
+    fn an_incremental_read_of_a_source_written_moments_ago_still_gets_the_previous_value() {
+        // A source inside the racy window has no stable fingerprint, so the
+        // fresh value is not cached; the loader still starts from the last
+        // cached value instead of from nothing.
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("cache");
+        let path = tmp.path().join("source");
+        fs::write(&path, "first").unwrap();
+        let seen: std::cell::RefCell<Vec<Option<String>>> = Default::default();
+        let load = |previous: Option<String>| {
+            seen.borrow_mut().push(previous);
+            fs::read_to_string(&path).ok()
+        };
+        // Cached under a stable observation.
+        with_directory(Some(&dir), &["cursor-ide"], || {
+            read_with("cursor-ide", "sessions", &path, false, load).unwrap()
+        });
+        fs::write(&path, "second").unwrap();
+        // Observed now, with the real clock: the file was written moments ago.
+        let racy = super::with_directory(Some(&dir), &["cursor-ide"], || {
+            read_with("cursor-ide", "sessions", &path, false, load).unwrap()
+        });
+        assert_eq!(racy, "second");
+        assert_eq!(
+            *seen.borrow(),
+            vec![None, Some("first".to_string())],
+            "the racy reload is handed the last cached value"
+        );
     }
 
     #[test]

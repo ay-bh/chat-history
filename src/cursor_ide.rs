@@ -159,12 +159,25 @@ impl ConversationShapes {
 /// The shapes of the database as it stands, read at most once per process for
 /// a given database state and shared by session discovery and the index sync.
 pub(crate) fn current_shapes(path: &Path) -> Option<Arc<ConversationShapes>> {
+    shared_shapes(path, true)
+}
+
+/// The snapshot this process last took of the database, or a new one. The
+/// index sync plans against it so that, while Cursor is writing, discovery
+/// and the plan read the shapes once between them rather than twice; a
+/// digest reused against it keeps that snapshot's stamp, so a write after it
+/// is seen by the next search.
+pub(crate) fn latest_shapes(path: &Path) -> Option<Arc<ConversationShapes>> {
+    shared_shapes(path, false)
+}
+
+fn shared_shapes(path: &Path, current: bool) -> Option<Arc<ConversationShapes>> {
     static SHARED: Mutex<Option<(PathBuf, Arc<ConversationShapes>)>> = Mutex::new(None);
     let mut slot = SHARED.lock().unwrap_or_else(|e| e.into_inner());
     if let Some((held, shapes)) = slot.as_ref()
         && held == path
-        && shapes.stamp.is_some()
-        && shapes.stamp == crate::catalog::fingerprint(path, true)
+        && (!current
+            || (shapes.stamp.is_some() && shapes.stamp == crate::catalog::fingerprint(path, true)))
     {
         return Some(shapes.clone());
     }
@@ -819,6 +832,31 @@ pub fn parse_cursor_ide(session: &Session) -> Vec<Message> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_sync_reuses_the_snapshot_discovery_took_even_while_the_database_is_written() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = tmp.path().join("state.vscdb");
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE composerHeaders (composerId TEXT PRIMARY KEY, createdAt INTEGER, lastUpdatedAt INTEGER, isSubagent INTEGER, value TEXT);
+             CREATE TABLE cursorDiskKV (key TEXT PRIMARY KEY, value BLOB);",
+        )
+        .unwrap();
+        // Written moments ago: the snapshot has no stable stamp.
+        let taken = current_shapes(&db).expect("readable");
+        assert!(taken.stamp.is_none());
+        let reused = latest_shapes(&db).expect("readable");
+        assert!(
+            std::sync::Arc::ptr_eq(&taken, &reused),
+            "the sync judges against the snapshot this process already took"
+        );
+        let checked = current_shapes(&db).expect("readable");
+        assert!(
+            !std::sync::Arc::ptr_eq(&taken, &checked),
+            "a caller that needs the current state still reads it again"
+        );
+    }
 
     #[test]
     fn shapes_are_read_once_per_database_state_and_again_after_a_change() {
