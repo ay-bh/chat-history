@@ -1547,8 +1547,10 @@ pub fn parse_claude_jsonl_from(
         let terminated = buf.ends_with(b"\n");
         let parsed = match std::str::from_utf8(&buf) {
             Ok(line) => parser.feed(line),
-            // Mirrors `lines()`: an undecodable record is skipped.
-            Err(_) => true,
+            // Mirrors `lines()`: a complete record that does not decode is
+            // skipped. An unterminated one may be cut inside a multibyte
+            // character, so it waits like any torn line.
+            Err(_) => terminated,
         };
         if terminated || parsed {
             offset += n as u64;
@@ -2995,6 +2997,38 @@ mod tests {
         // Resuming from a stamp the file no longer matches is refused.
         std::fs::write(&path, "x").unwrap();
         assert!(parse_claude_jsonl_from(path.to_str().unwrap(), Some(&tail)).is_none());
+    }
+
+    #[test]
+    fn a_last_line_cut_inside_a_multibyte_character_waits_like_any_torn_line() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("session.jsonl");
+        let record = |i: usize, content: &str| {
+            serde_json::json!({"type": "user", "message": {"role": "user", "content": content},
+                "uuid": format!("u{i}"), "timestamp": "2026-09-01T10:00:00Z", "sessionId": "s"})
+            .to_string()
+        };
+        let first = record(0, "plain start") + "\n";
+        let second = record(1, "héron and 鷺 in the reeds");
+        // Cut inside the three-byte character: the bytes so far are not UTF-8.
+        let cut = second.find('鷺').unwrap() + 1;
+        let torn = &second.as_bytes()[..cut];
+        assert!(std::str::from_utf8(torn).is_err());
+        let mut bytes = first.clone().into_bytes();
+        bytes.extend_from_slice(torn);
+        std::fs::write(&path, bytes).unwrap();
+        let (messages, tail) = parse_claude_jsonl_from(path.to_str().unwrap(), None).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            tail.offset,
+            first.len() as u64,
+            "the offset stays before the torn line"
+        );
+        std::fs::write(&path, format!("{first}{second}\n")).unwrap();
+        let (rest, tail2) = parse_claude_jsonl_from(path.to_str().unwrap(), Some(&tail)).unwrap();
+        assert_eq!(rest.len(), 1, "the completed record is read on resume");
+        assert!(rest[0].content.contains("鷺"));
+        assert_eq!(tail2.offset, (first.len() + second.len() + 1) as u64);
     }
 
     #[test]
