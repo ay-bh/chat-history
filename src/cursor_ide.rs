@@ -548,6 +548,11 @@ pub fn load_cursor_ide_sessions() -> Vec<Session> {
 struct IdeListing {
     shapes: HashMap<String, String>,
     sessions: Vec<Session>,
+    /// Conversations whose first prompt comes from their own text rather
+    /// than the header: the shape does not see an in-place edit of that
+    /// text, so the prompt is read again even when the row is reused.
+    #[serde(default)]
+    text_prompts: std::collections::HashSet<String>,
 }
 
 fn load_cursor_ide_sessions_from(db: &Path) -> Vec<Session> {
@@ -571,11 +576,12 @@ fn read_cursor_ide_sessions_from(db: &Path, previous: Option<IdeListing>) -> Opt
     };
     let mut listing = IdeListing::default();
     // Rows built for conversations whose shape has not changed since.
-    let mut reusable: HashMap<String, (String, Session)> = HashMap::new();
+    let mut reusable: HashMap<String, (String, Session, bool)> = HashMap::new();
     if let Some(previous) = previous {
         for session in previous.sessions {
             if let Some(shape) = previous.shapes.get(&session.id) {
-                reusable.insert(session.id.clone(), (shape.clone(), session));
+                let text_prompt = previous.text_prompts.contains(&session.id);
+                reusable.insert(session.id.clone(), (shape.clone(), session, text_prompt));
             }
         }
     }
@@ -624,11 +630,17 @@ fn read_cursor_ide_sessions_from(db: &Path, previous: Option<IdeListing>) -> Opt
         let (id, mut created_ms, mut updated_ms, mut is_sidechain, raw) = row;
         let shape = shapes.as_ref().map(|s| s.shape(&id));
         if let Some(shape) = shape.as_deref()
-            && let Some((kept, session)) = reusable.get(&id)
+            && let Some((kept, session, text_prompt)) = reusable.get(&id)
             && kept == shape
         {
+            let mut session = session.clone();
+            if *text_prompt {
+                let headers = composer_header_order(&conn, &id);
+                session.first_prompt = first_user_text(&conn, &id, headers.as_deref());
+                listing.text_prompts.insert(id.clone());
+            }
             listing.shapes.insert(id, shape.to_string());
-            listing.sessions.push(session.clone());
+            listing.sessions.push(session);
             continue;
         }
         let meta: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
@@ -673,6 +685,9 @@ fn read_cursor_ide_sessions_from(db: &Path, previous: Option<IdeListing>) -> Opt
         let nmsg = header_len.max(bubbles);
         if first.is_empty() && nmsg > 0 {
             first = first_user_text(&conn, &id, headers.as_deref());
+        }
+        if name.is_empty() && subtitle.is_empty() {
+            listing.text_prompts.insert(id.clone());
         }
         let ts = if updated_ms > 0 {
             updated_ms
