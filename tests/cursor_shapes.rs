@@ -255,10 +255,11 @@ fn listing(tmp: &TempDir) -> String {
 }
 
 #[test]
-fn a_cold_conversation_keeps_its_listing_row_until_its_shape_changes() {
-    // Discovery reads every conversation's composer data and first prompt
-    // again whenever the database changes. A conversation whose shape is
-    // unchanged keeps the row it already has instead.
+fn a_prompt_taken_from_the_conversation_text_is_read_again_when_the_row_is_reused() {
+    // The listing reuses a cold conversation's row while its shape is
+    // unchanged, but a first prompt taken from the conversation's own text
+    // (no name or subtitle in the header) is read again every time: an
+    // in-place edit of that text keeps the shape.
     let tmp = TempDir::new().unwrap();
     let conn = ide_db(&tmp, "uniqueninth", OLD_MS);
     conn.execute("UPDATE composerHeaders SET value = '{}'", [])
@@ -269,6 +270,7 @@ fn a_cold_conversation_keeps_its_listing_row_until_its_shape_changes() {
         listing(&tmp).contains("failing build"),
         "first prompt listed"
     );
+    assert!(search(&tmp, "failing").contains(ID));
     // Same length, same rows: only the text of the first prompt changes.
     conn.execute(
         "UPDATE cursorDiskKV SET value = replace(value, 'failing build', 'flaking build') WHERE key = ?1",
@@ -278,21 +280,17 @@ fn a_cold_conversation_keeps_its_listing_row_until_its_shape_changes() {
     thread::sleep(QUIET);
     let rows = listing(&tmp);
     assert!(
-        rows.contains("failing build") && !rows.contains("flaking build"),
-        "the cached row is reused while the shape is unchanged: {rows}"
+        rows.contains("flaking build") && !rows.contains("failing build"),
+        "the edited prompt is listed at once: {rows}"
     );
-    conn.execute(
-        "INSERT INTO cursorDiskKV VALUES (?1, ?2)",
-        rusqlite::params![
-            format!("bubbleId:{ID}:b3"),
-            json!({"type":1, "bubbleId":"b3", "text":"a later question", "createdAt":"2025-01-02T00:00:00Z"}).to_string()
-        ],
-    )
-    .unwrap();
-    thread::sleep(QUIET);
     assert!(
-        listing(&tmp).contains("flaking build"),
-        "a changed shape rebuilds the row"
+        search(&tmp, "flaking").contains(ID),
+        "the new prompt matches"
+    );
+    let obsolete = search(&tmp, "failing");
+    assert!(
+        !obsolete.contains(ID),
+        "the old prompt no longer matches: {obsolete}"
     );
 }
 
@@ -305,13 +303,9 @@ fn a_change_to_a_header_column_rebuilds_the_listing_row() {
     let conn = ide_db(&tmp, "uniquetenth", OLD_MS);
     bury(&conn);
     thread::sleep(QUIET);
-    let today = command(&tmp)
-        .args(["--source", "cursor-ide", "--from", "today"])
-        .output()
-        .unwrap();
     assert!(
-        !String::from_utf8_lossy(&today.stdout).contains("fedc1234"),
-        "indexed as an old conversation"
+        listing(&tmp).contains("2025-01-01"),
+        "listed with its old update date"
     );
     conn.execute(
         "UPDATE composerHeaders SET lastUpdatedAt = ?1 WHERE composerId = ?2",
@@ -319,13 +313,9 @@ fn a_change_to_a_header_column_rebuilds_the_listing_row() {
     )
     .unwrap();
     thread::sleep(QUIET);
-    let today = command(&tmp)
-        .args(["--source", "cursor-ide", "--from", "today"])
-        .output()
-        .unwrap();
+    let rows = listing(&tmp);
     assert!(
-        String::from_utf8_lossy(&today.stdout).contains("fedc1234"),
-        "listed for today after its update time moved: {}",
-        String::from_utf8_lossy(&today.stdout)
+        rows.contains("fedc1234") && !rows.contains("2025-01-01"),
+        "listed with its new update date after only the column moved: {rows}"
     );
 }
