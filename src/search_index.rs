@@ -7,7 +7,10 @@ use crate::parser::{
 use crate::search::{
     SearchMatch, SearchResult, direct_session_search, parse_timeframe_duration, similar_search,
 };
-use crate::session::{Message, Session, parse_any_timestamp, parse_session_recovering_timestamps};
+use crate::session::{
+    ClaudeTail, Message, Session, parse_any_timestamp, parse_claude_jsonl_from,
+    parse_session_recovering_timestamps,
+};
 use chrono::{DateTime, Utc};
 use rayon::prelude::*;
 use rusqlite::{Connection, ErrorCode, Transaction, TransactionBehavior, params};
@@ -466,6 +469,10 @@ struct Fingerprint {
     version: u32,
     signature: Option<String>,
     cursor: Option<CursorStamp>,
+    /// Where the last parse of a Claude transcript stopped, so the next one
+    /// can continue from there.
+    #[serde(default)]
+    tail: Option<ClaudeTail>,
 }
 
 impl Fingerprint {
@@ -645,6 +652,7 @@ fn fingerprint(
         version: EXTRACTION_VERSION,
         signature: Some(signature),
         cursor,
+        tail: previous.and_then(|p| p.tail.clone()),
     })
 }
 
@@ -917,21 +925,73 @@ impl Bm25Backend {
                     need.push(i);
                 }
             }
-            let prepared: Vec<_> = need
-                .par_iter()
+            // A Claude transcript the index already holds, whose rows end where
+            // its last parse stopped, is parsed from that byte on.
+            let resume: Vec<Option<ClaudeTail>> = need
+                .iter()
                 .map(|&i| {
                     let session = &corpus[i];
+                    if session.source != "claude" || rebuild {
+                        return None;
+                    }
+                    let tail = fingerprints.get(&plan[i].0)?.tail.clone()?;
+                    let newest: Option<usize> = self
+                        .conn
+                        .query_row(
+                            "SELECT max(ordinal) FROM messages WHERE session_key = ?1",
+                            [&plan[i].0],
+                            |r| r.get(0),
+                        )
+                        .ok()?;
+                    (newest.is_none_or(|n| n < tail.messages + 2)).then_some(tail)
+                })
+                .collect();
+            let prepared: Vec<_> = need
+                .par_iter()
+                .zip(resume.par_iter())
+                .map(|(&i, resume)| {
+                    let session = &corpus[i];
                     let before = plan[i].1.clone();
-                    let (messages, _) = parse_session_recovering_timestamps(session, false);
-                    let after = fingerprint(session, before.as_ref(), &shapes, true);
-                    (i, extract_session(session, before, messages, after))
+                    let parsed = if session.source == "claude" {
+                        let resumed = resume
+                            .as_ref()
+                            .and_then(|t| parse_claude_jsonl_from(&session.file, Some(t)));
+                        match resumed {
+                            Some((messages, tail)) => Parsed::Tail {
+                                messages,
+                                from: resume.as_ref().map_or(0, |t| t.messages),
+                                tail,
+                            },
+                            None => match parse_claude_jsonl_from(&session.file, None) {
+                                Some((messages, tail)) => Parsed::Whole {
+                                    messages,
+                                    tail: Some(tail),
+                                },
+                                None => Parsed::Whole {
+                                    messages: Vec::new(),
+                                    tail: None,
+                                },
+                            },
+                        }
+                    } else {
+                        Parsed::Whole {
+                            messages: parse_session_recovering_timestamps(session, false).0,
+                            tail: None,
+                        }
+                    };
+                    let mut after = fingerprint(session, before.as_ref(), &shapes, true);
+                    if let Some(after) = after.as_mut() {
+                        after.tail = parsed.tail().cloned();
+                    }
+                    (i, extract_parsed(session, before, parsed, after))
                 })
                 .collect();
             let mut writes = Vec::new();
-            for (i, (stamp, extracted)) in prepared {
+            for (i, (stamp, extracted, from)) in prepared {
                 let key = &plan[i].0;
                 let current = current_fingerprint(&self.conn, key)?;
-                if !rebuild
+                if from.is_none()
+                    && !rebuild
                     && current.as_deref() == Some(stamp.as_str())
                     && matches!(stored_rows(&self.conn, key, &extracted)?, Stored::Identical)
                 {
@@ -939,7 +999,7 @@ impl Bm25Backend {
                     refreshed += 1;
                     progress(refreshed, refreshing);
                 } else {
-                    writes.push((i, stamp, extracted, current));
+                    writes.push((i, stamp, extracted, from, current));
                 }
             }
             if writes.is_empty() {
@@ -947,7 +1007,7 @@ impl Bm25Backend {
                 continue;
             }
             let tx = begin_immediate(&self.conn)?;
-            for (i, stamp, extracted, seen) in writes {
+            for (i, stamp, extracted, from, seen) in writes {
                 let key = &plan[i].0;
                 let current = current_fingerprint(&tx, key)?;
                 if current != seen
@@ -958,6 +1018,13 @@ impl Bm25Backend {
                         .is_some_and(|(c, s)| c.matches(&s))
                 {
                     stats.unchanged += 1;
+                } else if let Some(from) = from {
+                    // Another process may have published since the rows were
+                    // checked; then this partial extraction is dropped and the
+                    // next sync parses the transcript again.
+                    if append_tail(&tx, &corpus[i], key, &stamp, extracted, from)? {
+                        stats.updated += 1;
+                    }
                 } else {
                     publish_session(
                         &tx,
@@ -1200,6 +1267,129 @@ fn published_elsewhere(
 
 type Extracted = Vec<(usize, Message, bool)>;
 
+/// What a parse of a changed transcript produced.
+enum Parsed {
+    /// Every message, as for any source.
+    Whole {
+        messages: Vec<Message>,
+        tail: Option<ClaudeTail>,
+    },
+    /// Only the messages after the byte where the last parse stopped; `from`
+    /// is how many messages the transcript had before them.
+    Tail {
+        messages: Vec<Message>,
+        from: usize,
+        tail: ClaudeTail,
+    },
+}
+
+impl Parsed {
+    fn tail(&self) -> Option<&ClaudeTail> {
+        match self {
+            Parsed::Whole { tail, .. } => tail.as_ref(),
+            Parsed::Tail { tail, .. } => Some(tail),
+        }
+    }
+}
+
+/// Extracted rows plus, for a resumed parse, the count of messages that came
+/// before them (the extraction then holds only the metadata rows and the new
+/// messages).
+fn extract_parsed(
+    session: &Session,
+    before: Option<Fingerprint>,
+    parsed: Parsed,
+    after: Option<Fingerprint>,
+) -> (String, Extracted, Option<usize>) {
+    match parsed {
+        Parsed::Whole { messages, .. } => {
+            let (stamp, extracted) = extract_session(session, before, messages, after);
+            (stamp, extracted, None)
+        }
+        Parsed::Tail { messages, from, .. } => {
+            // Stable when the file held still through the parse: it was read
+            // cleanly to the offset whether or not it gained messages.
+            let stable = before
+                .as_ref()
+                .zip(after.as_ref())
+                .is_some_and(|(a, b)| a.matches(b));
+            let mut stamp = after.unwrap_or(Fingerprint {
+                version: EXTRACTION_VERSION,
+                signature: None,
+                cursor: None,
+                tail: None,
+            });
+            if !stable {
+                stamp.signature = None;
+            }
+            let stamp = serde_json::to_string(&stamp).unwrap();
+            // The title row carries the modification time, so it is refreshed;
+            // the prompt row needs the first messages and is left as stored.
+            let mut extracted = Vec::new();
+            let title = metadata_message(session);
+            if !title.content.is_empty() {
+                extracted.push((0, title, true));
+            }
+            for (k, mut message) in messages.into_iter().enumerate() {
+                if message.history_output || is_noise(&message.content_lower()) {
+                    continue;
+                }
+                message.session_id = session.id.clone();
+                message.project_path = session.project.clone();
+                extracted.push((from + k + 2, message, false));
+            }
+            (stamp, extracted, Some(from))
+        }
+    }
+}
+
+/// Publish a resumed parse: refresh the title and prompt rows if they changed
+/// and append the new messages after the rows already stored. Returns false,
+/// publishing nothing, if the stored rows no longer end where the resumed
+/// parse began.
+fn append_tail(
+    tx: &Connection,
+    session: &Session,
+    key: &str,
+    stamp: &str,
+    extracted: Extracted,
+    from: usize,
+) -> Result<bool> {
+    let newest: Option<usize> = tx.query_row(
+        "SELECT max(ordinal) FROM messages WHERE session_key = ?1",
+        [key],
+        |r| r.get(0),
+    )?;
+    let exists: i64 = tx.query_row("SELECT count(*) FROM sessions WHERE key = ?1", [key], |r| {
+        r.get(0)
+    })?;
+    if exists == 0 || newest.is_some_and(|n| n >= from + 2) {
+        return Ok(false);
+    }
+    tx.execute(
+        "UPDATE sessions SET fingerprint = ?2 WHERE key = ?1",
+        params![key, stamp],
+    )?;
+    let mut stored = tx.prepare_cached(
+        "SELECT id, payload FROM messages WHERE session_key = ?1 AND ordinal = ?2",
+    )?;
+    for (ordinal, message, metadata) in &extracted {
+        if *metadata {
+            let row: Option<(i64, String)> = stored
+                .query_row(params![key, *ordinal], |r| Ok((r.get(0)?, r.get(1)?)))
+                .ok();
+            match row {
+                Some((_, payload)) if payload == serde_json::to_string(message)? => {}
+                Some((id, _)) => replace_message(tx, id, session, message, true)?,
+                None => insert_message(tx, key, session, message, *ordinal, true)?,
+            }
+        } else {
+            insert_message(tx, key, session, message, *ordinal, false)?;
+        }
+    }
+    Ok(true)
+}
+
 /// Parsers report a failed read as an empty message list. An empty parse of a
 /// plain transcript is kept only when the file reads cleanly from start to end;
 /// SQLite-backed sources cannot be checked this way and are retried.
@@ -1229,6 +1419,7 @@ fn extract_session(
         version: EXTRACTION_VERSION,
         signature: None,
         cursor: None,
+        tail: None,
     });
     if !stable {
         stamp.signature = None;
