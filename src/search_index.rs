@@ -65,8 +65,9 @@ const COMPACT_MIN_SHARE: f64 = 0.25;
 const COMPACT_COOLDOWN: Duration = Duration::from_secs(24 * 3600);
 const MAINTAINED_SUFFIX: &str = ".maintained";
 const MAINTAINING_SUFFIX: &str = ".maintaining";
-/// A maintenance lock older than this belongs to a run that died.
-const MAINTAINING_STALE: Duration = Duration::from_secs(3600);
+/// A maintenance lock older than this belongs to a run that died: a VACUUM
+/// of even a large index takes seconds.
+const MAINTAINING_STALE: Duration = Duration::from_secs(10 * 60);
 const WRITER_STALL: Duration = Duration::from_secs(10);
 const CACHE_MISMATCH_ATTEMPTS: usize = 3;
 const SNIPPET_CHARS: usize = 400;
@@ -1051,6 +1052,10 @@ impl Bm25Backend {
 /// closing while the VACUUM holds the write lock waits on it to checkpoint.
 /// A lock file keeps concurrent searches from each starting a run; the marker
 /// file records the last one.
+fn maintenance_lock_stale(age: Duration) -> bool {
+    age >= MAINTAINING_STALE
+}
+
 fn start_compaction(dir: &Path) {
     {
         let lock = dir.join(format!("{INDEX_FILENAME}{MAINTAINING_SUFFIX}"));
@@ -1059,7 +1064,7 @@ fn start_compaction(dir: &Path) {
                 .modified()
                 .ok()
                 .and_then(|m| m.elapsed().ok())
-                .is_some_and(|age| age >= MAINTAINING_STALE);
+                .is_some_and(maintenance_lock_stale);
             if !stale {
                 return;
             }
@@ -1078,16 +1083,22 @@ fn start_compaction(dir: &Path) {
             return;
         };
         use std::process::Stdio;
-        if std::process::Command::new(exe)
+        let mut command = std::process::Command::new(exe);
+        command
             .arg("maintain")
             .arg("--cache-dir")
             .arg(dir)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .is_err()
+            .stderr(Stdio::null());
+        // Its own process group: a harness that ends the search by signalling
+        // the search's group (a timeout, Ctrl-C) must not kill the VACUUM.
+        #[cfg(unix)]
         {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
+        if command.spawn().is_err() {
             let _ = fs::remove_file(&lock);
         }
     }
@@ -1910,6 +1921,19 @@ mod tests {
     }
 
     use super::{grouped_message_oversample, match_query};
+
+    #[test]
+    fn a_maintenance_lock_from_a_run_that_died_is_reclaimed_within_minutes() {
+        use std::time::Duration;
+        assert!(
+            !super::maintenance_lock_stale(Duration::from_secs(30)),
+            "a run in progress"
+        );
+        assert!(
+            super::maintenance_lock_stale(Duration::from_secs(11 * 60)),
+            "a VACUUM takes seconds; a lock this old belongs to a run that was killed"
+        );
+    }
 
     #[test]
     fn a_checkpoint_after_removals_is_passive_unless_the_wal_has_grown() {
