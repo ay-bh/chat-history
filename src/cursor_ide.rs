@@ -112,6 +112,110 @@ pub(crate) fn conversation_fingerprint(path: &Path, id: &str) -> Option<String> 
     })
 }
 
+/// What the key index and row headers say about every conversation in the
+/// database, read in one snapshot without the conversation text: the bubble
+/// row count and newest bubble rowid, the composerData row's rowid and byte
+/// length, and a hash of the header row. Cursor rewrites this database every
+/// few seconds while it is open; comparing shapes tells which conversations
+/// changed without hashing the text of all of them.
+pub(crate) struct ConversationShapes {
+    /// The database stamp the shapes describe, when it held still while they
+    /// were read.
+    pub(crate) stamp: Option<String>,
+    shapes: HashMap<String, String>,
+}
+
+impl ConversationShapes {
+    /// A conversation without any rows has a shape too.
+    pub(crate) fn shape(&self, id: &str) -> String {
+        self.shapes
+            .get(id)
+            .cloned()
+            .unwrap_or_else(|| "none".into())
+    }
+}
+
+pub(crate) fn conversation_shapes(path: &Path) -> Option<ConversationShapes> {
+    let before = crate::catalog::fingerprint(path, true);
+    let conn = open_ro(path)?;
+    let tx = conn.unchecked_transaction().ok()?;
+    let mut parts: HashMap<String, [String; 3]> = HashMap::new();
+    {
+        let mut stmt = tx
+            .prepare(
+                "SELECT substr(key, 10, 36), count(*), max(rowid) FROM cursorDiskKV \
+                 WHERE key >= 'bubbleId:' AND key < 'bubbleId;' GROUP BY 1",
+            )
+            .ok()?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .ok()?;
+        for row in rows {
+            let (id, count, newest) = row.ok()?;
+            parts.entry(id).or_default()[0] = format!("{count}@{newest}");
+        }
+    }
+    {
+        // octet_length reads the row header, not the large payload.
+        let mut stmt = tx
+            .prepare(
+                "SELECT substr(key, 14), rowid, octet_length(value) FROM cursorDiskKV \
+                 WHERE key >= 'composerData:' AND key < 'composerData;'",
+            )
+            .ok()?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                ))
+            })
+            .ok()?;
+        for row in rows {
+            let (id, rowid, len) = row.ok()?;
+            parts.entry(id).or_default()[1] = format!("{rowid}:{}", len.unwrap_or(0));
+        }
+    }
+    {
+        let mut stmt = tx
+            .prepare("SELECT composerId, value FROM composerHeaders")
+            .ok()?;
+        let rows = stmt
+            .query_map([], |row| {
+                use rusqlite::types::ValueRef;
+                let header = match row.get_ref(1)? {
+                    ValueRef::Text(bytes) | ValueRef::Blob(bytes) => {
+                        blake3::hash(bytes).to_hex()[..16].to_string()
+                    }
+                    _ => String::new(),
+                };
+                Ok((row.get::<_, String>(0)?, header))
+            })
+            .ok()?;
+        for row in rows {
+            let (id, header) = row.ok()?;
+            parts.entry(id).or_default()[2] = header;
+        }
+    }
+    tx.commit().ok()?;
+    let after = crate::catalog::fingerprint(path, true);
+    let stamp = before.filter(|b| Some(b) == after.as_ref());
+    Some(ConversationShapes {
+        stamp,
+        shapes: parts
+            .into_iter()
+            .map(|(id, [bubbles, data, header])| (id, format!("{bubbles}/{data}/{header}")))
+            .collect(),
+    })
+}
+
 pub fn workspace_path(value: &Value) -> String {
     value
         .pointer("/workspaceIdentifier/uri/fsPath")

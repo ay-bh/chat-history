@@ -131,12 +131,23 @@ Agent JSONL sessions also depend on the database for timestamp recovery.
 Session metadata and the enrichment profile remain fingerprinted.
 
 Stable database and WAL observations allow digest reuse. After the database
-changes, digests are recomputed and only conversations whose digest changed are
-parsed. An unchanged conversation has its stored observation refreshed in one
-best-effort write so later searches skip the digest again until the next
-change. This still reads conversation bytes; it is not a change feed. Cached
-read connections reopen when the database file identity changes, including
-atomic replacement on Unix.
+changes, each conversation's shape is read first: its bubble row count and
+newest bubble rowid from the key index, its composer-data row's rowid and byte
+length from the row header, and a hash of its header row, all in one snapshot
+and without the conversation text (about a tenth of a second for ninety
+thousand rows). A conversation whose shape is unchanged keeps its digest. Only
+conversations whose shape moved, conversations updated inside the last day
+(Cursor may edit their rows in place while a reply streams) and conversations
+whose hourly re-check has come due (spread per conversation over a second hour,
+so a few come due per search rather than all at once) are hashed from their
+text, and only those whose digest changed are parsed. Cursor rewrites the
+shared database every few seconds while it is open, mostly for unrelated
+state; before shapes, every such write cost a hash of every conversation's text
+on the next search (1.2 GB, 0.9 s warm and several seconds cold on a real
+database). An unchanged conversation has its stored observation and shape
+refreshed in one best-effort write so later searches skip even the shape read
+until the next change. Cached read connections reopen when the database file
+identity changes, including atomic replacement on Unix.
 
 **Parsing.** Stable unchanged sessions skip transcript parsing. Changed sources
 are checked before and after parsing, and unstable or failed reads are retried
@@ -287,9 +298,10 @@ cover the ranking function itself.
 - Source parsers expose empty results rather than structured read errors, which
   is why empty parses are trusted only for plain files that were re-read
   successfully.
-- The shared Cursor database has no change feed. While Cursor is writing, each
-  search after a write re-hashes every dependent conversation before digests
-  can be reused again.
+- The shared Cursor database has no change feed. Conversation shapes stand in
+  for one: an edit that keeps a cold conversation's row count, newest rowid,
+  composer-data length and header unchanged is noticed by its periodic re-check
+  (within about two hours) rather than at once.
 - FTS damage that raises no SQLite error, such as a segment that decodes to
   nothing, is not detected at query time. `--rebuild-index` repairs it.
 
