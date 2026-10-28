@@ -327,22 +327,34 @@ pub(crate) fn read<T: Serialize + DeserializeOwned>(
     sqlite: bool,
     load: impl FnOnce() -> Option<T>,
 ) -> Option<T> {
+    read_with(source, kind, path, sqlite, |_| load())
+}
+
+/// [`read`], except that a reload is handed the value cached for the source
+/// before it changed, so a loader can carry over the parts that did not.
+pub(crate) fn read_with<T: Serialize + DeserializeOwned>(
+    source: &str,
+    kind: &str,
+    path: &Path,
+    sqlite: bool,
+    load: impl FnOnce(Option<T>) -> Option<T>,
+) -> Option<T> {
     if !ACTIVE.with(|slot| {
         slot.borrow()
             .as_ref()
             .is_some_and(|c| c.sources.iter().any(|s| s == source))
     }) {
-        return load();
+        return load(None);
     }
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else if let Ok(cwd) = std::env::current_dir() {
         cwd.join(path)
     } else {
-        return load();
+        return load(None);
     };
     let Some(path_key) = absolute.to_str() else {
-        return load();
+        return load(None);
     };
     let key = serde_json::to_string(&(source, kind, path_key)).ok()?;
     let observed_at = ACTIVE.with(|slot| {
@@ -353,7 +365,7 @@ pub(crate) fn read<T: Serialize + DeserializeOwned>(
         cache.observed_at
     });
     let Some(before) = fingerprint_at(path, sqlite, observed_at) else {
-        return load();
+        return load(None);
     };
     let hit = ACTIVE.with(|slot| {
         let mut slot = slot.borrow_mut();
@@ -367,7 +379,12 @@ pub(crate) fn read<T: Serialize + DeserializeOwned>(
     if hit.is_some() {
         return hit;
     }
-    let result = load();
+    let previous = ACTIVE.with(|slot| {
+        let slot = slot.borrow();
+        let entry = slot.as_ref()?.entries.get(&key)?;
+        serde_json::from_str::<T>(&entry.value).ok()
+    });
+    let result = load(previous);
     let unchanged = fingerprint_at(path, sqlite, observed_at).as_ref() == Some(&before);
     ACTIVE.with(|slot| {
         let mut slot = slot.borrow_mut();
@@ -437,6 +454,39 @@ mod tests {
         fs::write(&path, "other").unwrap();
         assert_eq!(cached_text(&dir, &path, &calls), "other");
         assert_eq!(calls.get(), 2);
+    }
+
+    #[test]
+    fn an_incremental_read_is_handed_the_previous_value_when_the_source_changed() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("cache");
+        let path = tmp.path().join("source");
+        fs::write(&path, "first").unwrap();
+        let seen: std::cell::RefCell<Vec<Option<String>>> = Default::default();
+        let read_now = || {
+            with_directory(Some(&dir), &["cursor-ide"], || {
+                read_with(
+                    "cursor-ide",
+                    "sessions",
+                    &path,
+                    false,
+                    |previous: Option<String>| {
+                        seen.borrow_mut().push(previous);
+                        fs::read_to_string(&path).ok()
+                    },
+                )
+                .unwrap()
+            })
+        };
+        assert_eq!(read_now(), "first");
+        assert_eq!(read_now(), "first", "a hit does not call load at all");
+        fs::write(&path, "second").unwrap();
+        assert_eq!(read_now(), "second");
+        assert_eq!(
+            *seen.borrow(),
+            vec![None, Some("first".to_string())],
+            "the first load starts from nothing; the reload starts from the stale value"
+        );
     }
 
     #[cfg(unix)]

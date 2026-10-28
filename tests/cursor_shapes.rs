@@ -245,3 +245,58 @@ fn a_shape_preserving_edit_to_a_cold_conversation_is_caught_by_the_periodic_chec
         "the check time moves forward"
     );
 }
+
+fn listing(tmp: &TempDir) -> String {
+    let out = command(tmp)
+        .args(["--source", "cursor-ide"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout).unwrap()
+}
+
+#[test]
+fn a_cold_conversation_keeps_its_listing_row_until_its_shape_changes() {
+    // Discovery reads every conversation's composer data and first prompt
+    // again whenever the database changes. A conversation whose shape is
+    // unchanged keeps the row it already has instead.
+    let tmp = TempDir::new().unwrap();
+    let conn = ide_db(&tmp, "uniqueninth", OLD_MS);
+    conn.execute("UPDATE composerHeaders SET value = '{}'", [])
+        .unwrap();
+    bury(&conn);
+    thread::sleep(QUIET);
+    assert!(
+        listing(&tmp).contains("failing build"),
+        "first prompt listed"
+    );
+    // Same length, same rows: only the text of the first prompt changes.
+    conn.execute(
+        "UPDATE cursorDiskKV SET value = replace(value, 'failing build', 'flaking build') WHERE key = ?1",
+        [format!("bubbleId:{ID}:b1")],
+    )
+    .unwrap();
+    thread::sleep(QUIET);
+    let rows = listing(&tmp);
+    assert!(
+        rows.contains("failing build") && !rows.contains("flaking build"),
+        "the cached row is reused while the shape is unchanged: {rows}"
+    );
+    conn.execute(
+        "INSERT INTO cursorDiskKV VALUES (?1, ?2)",
+        rusqlite::params![
+            format!("bubbleId:{ID}:b3"),
+            json!({"type":1, "bubbleId":"b3", "text":"a later question", "createdAt":"2025-01-02T00:00:00Z"}).to_string()
+        ],
+    )
+    .unwrap();
+    thread::sleep(QUIET);
+    assert!(
+        listing(&tmp).contains("flaking build"),
+        "a changed shape rebuilds the row"
+    );
+}

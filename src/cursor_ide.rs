@@ -524,14 +524,24 @@ pub fn load_cursor_ide_sessions() -> Vec<Session> {
     load_cursor_ide_sessions_from(&global_vscdb())
 }
 
+/// The listed IDE conversations with the shape each row was built from, so
+/// that after the database changes only the rows whose conversation changed
+/// are read again.
+#[derive(Default, serde::Deserialize, serde::Serialize)]
+struct IdeListing {
+    shapes: HashMap<String, String>,
+    sessions: Vec<Session>,
+}
+
 fn load_cursor_ide_sessions_from(db: &Path) -> Vec<Session> {
-    crate::catalog::read("cursor-ide", "sessions", db, true, || {
-        read_cursor_ide_sessions_from(db)
+    crate::catalog::read_with("cursor-ide", "listing", db, true, |previous| {
+        read_cursor_ide_sessions_from(db, previous)
     })
+    .map(|listing| listing.sessions)
     .unwrap_or_default()
 }
 
-fn read_cursor_ide_sessions_from(db: &Path) -> Option<Vec<Session>> {
+fn read_cursor_ide_sessions_from(db: &Path, previous: Option<IdeListing>) -> Option<IdeListing> {
     if !db.exists() {
         return None;
     }
@@ -542,7 +552,16 @@ fn read_cursor_ide_sessions_from(db: &Path) -> Option<Vec<Session>> {
         );
         return None;
     };
-    let mut sessions = Vec::new();
+    let mut listing = IdeListing::default();
+    // Rows built for conversations whose shape has not changed since.
+    let mut reusable: HashMap<String, (String, Session)> = HashMap::new();
+    if let Some(previous) = previous {
+        for session in previous.sessions {
+            if let Some(shape) = previous.shapes.get(&session.id) {
+                reusable.insert(session.id.clone(), (shape.clone(), session));
+            }
+        }
+    }
     // Required columns identify the supported storage family; the message
     // table is checked too so header-only rows never masquerade as readable
     // conversations. Optional header columns vary between Cursor versions and
@@ -586,6 +605,15 @@ fn read_cursor_ide_sessions_from(db: &Path) -> Option<Vec<Session>> {
     let file = db.to_string_lossy().to_string();
     for row in rows.flatten() {
         let (id, mut created_ms, mut updated_ms, mut is_sidechain, raw) = row;
+        let shape = shapes.as_ref().map(|s| s.shape(&id));
+        if let Some(shape) = shape.as_deref()
+            && let Some((kept, session)) = reusable.get(&id)
+            && kept == shape
+        {
+            listing.shapes.insert(id, shape.to_string());
+            listing.sessions.push(session.clone());
+            continue;
+        }
         let meta: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
         if created_ms <= 0 {
             created_ms = meta.get("createdAt").and_then(Value::as_i64).unwrap_or(0);
@@ -639,7 +667,10 @@ fn read_cursor_ide_sessions_from(db: &Path) -> Option<Vec<Session>> {
         // No fabricated creation time: an absent createdAt stays unknown
         // rather than becoming the last-update time.
         let created = ms_to_iso(created_ms);
-        sessions.push(Session {
+        if let Some(shape) = shape {
+            listing.shapes.insert(id.clone(), shape);
+        }
+        listing.sessions.push(Session {
             source: "cursor-ide".into(),
             id,
             summary: name,
@@ -655,7 +686,7 @@ fn read_cursor_ide_sessions_from(db: &Path) -> Option<Vec<Session>> {
             also_ide: false,
         });
     }
-    Some(sessions)
+    Some(listing)
 }
 
 /// Enrich only unambiguous matches. Do not reorder, replace, or drop transcript
