@@ -335,3 +335,41 @@ fn a_same_length_edit_deep_inside_a_transcript_waits_for_a_parse_from_the_start(
         "seen after the parse from the start"
     );
 }
+
+#[test]
+fn a_record_cut_inside_a_multibyte_character_is_indexed_once_completed() {
+    let tmp = TempDir::new().unwrap();
+    let path = write(&tmp, &[("user", json!("the initial pelican question"))]);
+    thread::sleep(QUIET);
+    assert!(search(&tmp, "pelican").contains(ID));
+    let initial_offset = stamp(&tmp)["tail"]["offset"].as_u64().unwrap();
+    let complete = format!(
+        "{}\n",
+        record(1, "assistant", json!("caf\u{e9} heronbeakanswer"))
+    );
+    let cut = complete.find('\u{e9}').unwrap() + 1;
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(&complete.as_bytes()[..cut])
+        .unwrap();
+    thread::sleep(QUIET);
+    search(&tmp, "pelican");
+    let partial_offset = stamp(&tmp)["tail"]["offset"].as_u64().unwrap();
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(&complete.as_bytes()[cut..])
+        .unwrap();
+    thread::sleep(QUIET);
+    let found = search(&tmp, "heronbeakanswer").contains(ID);
+    eprintln!(
+        "initial offset={initial_offset}; partial offset={partial_offset}; completed record found={found}"
+    );
+    assert!(
+        found,
+        "the completed UTF-8 record must not be permanently skipped"
+    );
+}
