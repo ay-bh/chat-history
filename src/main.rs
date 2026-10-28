@@ -237,6 +237,13 @@ enum Commands {
         /// Shell to generate completions for
         shell: clap_complete::Shell,
     },
+    /// Compact the search index in a cache directory; search starts this
+    /// itself, detached, when removed sessions have freed enough of the file
+    #[command(hide = true)]
+    Maintain {
+        #[arg(long)]
+        cache_dir: std::path::PathBuf,
+    },
 }
 
 /// Resolve a session id or prefix, or exit: candidates are listed on an
@@ -433,6 +440,14 @@ fn main() {
 
     if let Some(Commands::InstallSkill { force }) = &cli.command {
         install_skill(*force);
+        return;
+    }
+
+    if let Some(Commands::Maintain { cache_dir }) = &cli.command {
+        if let Err(e) = search_index::maintain(cache_dir) {
+            eprintln!("Warning: search cache maintenance failed ({e}).");
+            std::process::exit(1);
+        }
         return;
     }
 
@@ -798,6 +813,7 @@ fn main() {
         }
         Some(Commands::InstallSkill { .. })
         | Some(Commands::Completions { .. })
+        | Some(Commands::Maintain { .. })
         | Some(Commands::CursorHook) => unreachable!(),
         None => {
             if cli.summarize {

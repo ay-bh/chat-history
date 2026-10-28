@@ -17,7 +17,7 @@ use std::fs;
 use std::hash::BuildHasher;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 pub type SearchError = Box<dyn std::error::Error + Send + Sync>;
 pub type Result<T> = std::result::Result<T, SearchError>;
@@ -49,6 +49,24 @@ const PARSE_BATCH_BYTES: u64 = 32 << 20;
 // the text parsed; they weigh at most this much in a batch.
 const SHARED_DATABASE_WEIGHT: u64 = 4 << 20;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+/// A checkpoint after removals truncates the WAL only once it has grown past
+/// this; otherwise it is passive and never waits on readers or writers.
+const WAL_TRUNCATE_ABOVE: u64 = 4 << 20;
+/// FTS5 merge work after removals: a few bounded passes, each writing at most
+/// this many leaf pages, rather than an 'optimize' that rewrites the index.
+const MERGE_PAGES: i64 = 64;
+const MERGE_ROUNDS: usize = 4;
+/// Pages freed by removed sessions stay on SQLite's free list until a VACUUM.
+/// One runs detached from the search (`chat-history maintain`) once the free
+/// list is at least this large and this share of the file, then not again for
+/// a day. The run leaves a marker file beside the index.
+const COMPACT_MIN_FREE: u64 = 32 << 20;
+const COMPACT_MIN_SHARE: f64 = 0.25;
+const COMPACT_COOLDOWN: Duration = Duration::from_secs(24 * 3600);
+const MAINTAINED_SUFFIX: &str = ".maintained";
+const MAINTAINING_SUFFIX: &str = ".maintaining";
+/// A maintenance lock older than this belongs to a run that died.
+const MAINTAINING_STALE: Duration = Duration::from_secs(3600);
 const WRITER_STALL: Duration = Duration::from_secs(10);
 const CACHE_MISMATCH_ATTEMPTS: usize = 3;
 const SNIPPET_CHARS: usize = 400;
@@ -387,6 +405,7 @@ pub fn search_corpus(
             progress.warn(&format!("Warning: could not save search cache ({error}); searching with an in-memory BM25 index."));
             return memory_search(corpus, request, rebuild, &mut progress);
         }
+        backend.schedule_compaction(dir);
         match backend.search(request) {
             Ok(results) => match indexed_session_keys_match(&backend.conn, corpus) {
                 Ok(true) => return Ok(results),
@@ -845,13 +864,25 @@ impl Bm25Backend {
             }
             tx.commit()?;
             if stats.removed > 0 {
+                // Fold the deletions into the FTS segments a little at a time;
+                // the free list is handed back by `maintain`, not here.
                 let tx = begin_immediate(&self.conn)?;
-                tx.execute(
-                    "INSERT INTO passages_fts(passages_fts) VALUES('optimize')",
-                    [],
-                )?;
+                for _ in 0..MERGE_ROUNDS {
+                    tx.execute(
+                        "INSERT INTO passages_fts(passages_fts, rank) VALUES('merge', ?1)",
+                        [MERGE_PAGES],
+                    )?;
+                }
                 tx.commit()?;
-                let _ = self.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)");
+                let wal = self
+                    .conn
+                    .path()
+                    .map(|p| format!("{p}-wal"))
+                    .and_then(|p| fs::metadata(p).ok())
+                    .map_or(0, |m| m.len());
+                let _ = self
+                    .conn
+                    .execute_batch(&format!("PRAGMA wal_checkpoint({})", checkpoint_mode(wal)));
             }
         }
         let order = std::collections::hash_map::RandomState::new();
@@ -966,6 +997,111 @@ fn batches<'a>(
         }
         Some(batch)
     })
+}
+
+fn checkpoint_mode(wal_bytes: u64) -> &'static str {
+    if wal_bytes > WAL_TRUNCATE_ABOVE {
+        "TRUNCATE"
+    } else {
+        "PASSIVE"
+    }
+}
+
+/// Whether a free list of `free` bytes in a file of `total` bytes is worth a
+/// VACUUM now, given when the last one ran.
+fn compaction_due(free: u64, total: u64, last: Option<SystemTime>, now: SystemTime) -> bool {
+    if total == 0 || free < COMPACT_MIN_FREE || (free as f64) < COMPACT_MIN_SHARE * total as f64 {
+        return false;
+    }
+    last.is_none_or(|last| {
+        now.duration_since(last)
+            .is_ok_and(|age| age >= COMPACT_COOLDOWN)
+    })
+}
+
+impl Bm25Backend {
+    /// Start a detached `maintain` run when the free list is worth a VACUUM,
+    /// so that no search waits for it. A lock file keeps concurrent searches
+    /// from each starting one; the marker file records the last run.
+    fn schedule_compaction(&self, dir: &Path) {
+        let pragma = |name: &str| -> rusqlite::Result<u64> {
+            self.conn
+                .query_row(&format!("PRAGMA {name}"), [], |r| r.get::<_, i64>(0))
+                .map(|v| v.max(0) as u64)
+        };
+        let Ok((page, free, pages)) = pragma("page_size")
+            .and_then(|page| Ok((page, pragma("freelist_count")?, pragma("page_count")?)))
+        else {
+            return;
+        };
+        let marker = dir.join(format!("{INDEX_FILENAME}{MAINTAINED_SUFFIX}"));
+        let last = fs::metadata(&marker).and_then(|m| m.modified()).ok();
+        if !compaction_due(free * page, pages * page, last, SystemTime::now()) {
+            return;
+        }
+        let lock = dir.join(format!("{INDEX_FILENAME}{MAINTAINING_SUFFIX}"));
+        if let Ok(meta) = fs::metadata(&lock) {
+            let stale = meta
+                .modified()
+                .ok()
+                .and_then(|m| m.elapsed().ok())
+                .is_some_and(|age| age >= MAINTAINING_STALE);
+            if !stale {
+                return;
+            }
+            let _ = fs::remove_file(&lock);
+        }
+        if fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock)
+            .is_err()
+        {
+            return;
+        }
+        let Ok(exe) = std::env::current_exe() else {
+            let _ = fs::remove_file(&lock);
+            return;
+        };
+        use std::process::Stdio;
+        if std::process::Command::new(exe)
+            .arg("maintain")
+            .arg("--cache-dir")
+            .arg(dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .is_err()
+        {
+            let _ = fs::remove_file(&lock);
+        }
+    }
+}
+
+/// Give the pages freed by removed sessions back to the file system: VACUUM
+/// the index in `dir` and truncate its WAL. Readers keep reading their
+/// snapshot meanwhile; a writer waits at most its busy timeout. Records the
+/// run in a marker file and releases the scheduling lock.
+pub fn maintain(dir: &Path) -> Result<()> {
+    let path = dir.join(INDEX_FILENAME);
+    let lock = dir.join(format!("{INDEX_FILENAME}{MAINTAINING_SUFFIX}"));
+    let result = (|| -> Result<()> {
+        if !path.exists() {
+            return Ok(());
+        }
+        let conn = Connection::open(&path)?;
+        conn.busy_timeout(BUSY_TIMEOUT)?;
+        conn.execute_batch("VACUUM")?;
+        let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)");
+        fs::write(
+            dir.join(format!("{INDEX_FILENAME}{MAINTAINED_SUFFIX}")),
+            b"",
+        )?;
+        Ok(())
+    })();
+    let _ = fs::remove_file(lock);
+    result
 }
 
 fn restamp_sessions(
@@ -1752,6 +1888,48 @@ mod tests {
     }
 
     use super::{grouped_message_oversample, match_query};
+
+    #[test]
+    fn a_checkpoint_after_removals_is_passive_unless_the_wal_has_grown() {
+        assert_eq!(super::checkpoint_mode(0), "PASSIVE");
+        assert_eq!(super::checkpoint_mode(super::WAL_TRUNCATE_ABOVE), "PASSIVE");
+        assert_eq!(
+            super::checkpoint_mode(super::WAL_TRUNCATE_ABOVE + 1),
+            "TRUNCATE"
+        );
+    }
+
+    #[test]
+    fn compaction_is_due_for_a_bloated_index_at_most_once_a_day() {
+        use std::time::{Duration, SystemTime};
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let mib = 1u64 << 20;
+        let due = |free: u64, total: u64, last: Option<SystemTime>| {
+            super::compaction_due(free, total, last, now)
+        };
+        assert!(due(400 * mib, 750 * mib, None), "half the file is free");
+        assert!(
+            !due(20 * mib, 40 * mib, None),
+            "half free but too small to be worth a vacuum"
+        );
+        assert!(
+            !due(100 * mib, 1000 * mib, None),
+            "a tenth free is below the ratio"
+        );
+        assert!(
+            !due(400 * mib, 750 * mib, Some(now - Duration::from_secs(3600))),
+            "compacted an hour ago"
+        );
+        assert!(
+            due(
+                400 * mib,
+                750 * mib,
+                Some(now - super::COMPACT_COOLDOWN - Duration::from_secs(1))
+            ),
+            "the cooldown has passed"
+        );
+        assert!(!due(0, 0, None), "an empty file");
+    }
 
     #[test]
     fn a_cursor_digest_is_trusted_to_its_shape_until_its_check_is_due() {

@@ -305,13 +305,9 @@ fn a_change_to_a_header_column_rebuilds_the_listing_row() {
     let conn = ide_db(&tmp, "uniquetenth", OLD_MS);
     bury(&conn);
     thread::sleep(QUIET);
-    let today = command(&tmp)
-        .args(["--source", "cursor-ide", "--from", "today"])
-        .output()
-        .unwrap();
     assert!(
-        !String::from_utf8_lossy(&today.stdout).contains("fedc1234"),
-        "indexed as an old conversation"
+        listing(&tmp).contains("2025-01-01"),
+        "listed with its old update date"
     );
     conn.execute(
         "UPDATE composerHeaders SET lastUpdatedAt = ?1 WHERE composerId = ?2",
@@ -319,13 +315,9 @@ fn a_change_to_a_header_column_rebuilds_the_listing_row() {
     )
     .unwrap();
     thread::sleep(QUIET);
-    let today = command(&tmp)
-        .args(["--source", "cursor-ide", "--from", "today"])
-        .output()
-        .unwrap();
+    let rows = listing(&tmp);
     assert!(
-        String::from_utf8_lossy(&today.stdout).contains("fedc1234"),
-        "listed for today after its update time moved: {}",
-        String::from_utf8_lossy(&today.stdout)
+        rows.contains("fedc1234") && !rows.contains("2025-01-01"),
+        "listed with its new update date after only the column moved: {rows}"
     );
 }
