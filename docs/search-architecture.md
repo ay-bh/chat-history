@@ -142,7 +142,11 @@ their rows in place while a reply streams, and many of its conversations carry
 no update time) and conversations
 whose hourly re-check has come due (spread per conversation over a second hour,
 so a few come due per search rather than all at once) are hashed from their
-text, and only those whose digest changed are parsed. Cursor rewrites the
+text, and only those whose digest changed are parsed. Discovery reuses a listing row
+whose conversation shape is unchanged, except that a first prompt taken from
+the conversation's own text (no name or subtitle in its header, 271 of 958 on a
+real profile) is read again every time, since the shape does not see an
+in-place edit of that text. Cursor rewrites the
 shared database every few seconds while it is open, mostly for unrelated
 state; before shapes, every such write cost a hash of every conversation's text
 on the next search (1.2 GB, 0.9 s warm and several seconds cold on a real
