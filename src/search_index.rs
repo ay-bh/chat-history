@@ -1184,12 +1184,19 @@ pub fn maintain(dir: &Path) -> Result<()> {
         }
         let conn = Connection::open(&path)?;
         conn.busy_timeout(BUSY_TIMEOUT)?;
-        conn.execute_batch("VACUUM")?;
-        let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)");
-        fs::write(
+        let vacuum = conn.execute_batch("VACUUM");
+        if vacuum.is_ok() {
+            let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)");
+        }
+        // Recorded whether or not it worked: a VACUUM that fails (a writer
+        // holding the lock, too little disk for the copy) is not retried by
+        // every search until the cooldown has passed.
+        let marker = fs::write(
             dir.join(format!("{INDEX_FILENAME}{MAINTAINED_SUFFIX}")),
             b"",
-        )?;
+        );
+        vacuum?;
+        marker?;
         Ok(())
     })();
     let _ = fs::remove_file(lock);
