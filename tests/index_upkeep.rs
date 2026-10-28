@@ -101,3 +101,26 @@ fn maintain_gives_freed_pages_back_and_the_index_keeps_working() {
     )
     .unwrap();
 }
+
+#[test]
+fn a_failed_compaction_is_recorded_so_searches_do_not_retry_it_all_day() {
+    let tmp = TempDir::new().unwrap();
+    write_claude(tmp.path(), ID_B, 6, "bittern");
+    thread::sleep(Duration::from_millis(2100));
+    assert!(search(&tmp, "bittern").contains(ID_B), "indexed");
+    // Another process holds the write lock for longer than maintenance waits.
+    let holder = rusqlite::Connection::open(tmp.path().join("cache/search-v3.db")).unwrap();
+    holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let out = command(&tmp)
+        .args(["maintain", "--cache-dir"])
+        .arg(tmp.path().join("cache"))
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "the VACUUM could not run");
+    assert!(
+        tmp.path().join("cache/search-v3.db.maintained").exists(),
+        "the attempt is recorded, so the next searches do not start another"
+    );
+    assert!(!tmp.path().join("cache/search-v3.db.maintaining").exists());
+    holder.execute_batch("ROLLBACK").unwrap();
+}
