@@ -1484,16 +1484,19 @@ fn extract_session(
 enum Stored {
     /// Every stored row matches and the transcript gained nothing.
     Identical,
-    /// The stored conversation is a prefix of the extraction. `replace` names
-    /// title or prompt rows whose payload changed (their timestamp follows the
-    /// transcript's modification time), as (stored id, extracted index);
-    /// `extracted[append..]` are the messages the transcript gained.
-    Prefix {
+    /// The stored rows match the extraction up to `extracted[keep]`. `replace`
+    /// names title or prompt rows among them whose payload changed (their
+    /// timestamp follows the transcript's modification time), as (stored id,
+    /// extracted index). Stored rows after the kept ones are deleted (`trim`)
+    /// and `extracted[keep..]` inserted. An active transcript usually only
+    /// grows, so this inserts its new messages; a Codex rollout also changes
+    /// its last assistant message (a tool call names itself there), and then
+    /// only that message is replaced rather than every row of the session.
+    Changed {
         replace: Vec<(i64, usize)>,
-        append: usize,
+        keep: usize,
+        trim: bool,
     },
-    /// Anything else: a rewritten or shortened transcript, or a parser change.
-    Different,
 }
 
 fn stored_rows(conn: &Connection, key: &str, extracted: &Extracted) -> Result<Stored> {
@@ -1502,31 +1505,33 @@ fn stored_rows(conn: &Connection, key: &str, extracted: &Extracted) -> Result<St
     )?;
     let mut rows = stmt.query([key])?;
     let mut replace = Vec::new();
-    let mut matched = 0;
+    let mut keep = 0;
+    let mut diverged = false;
     for (n, (ordinal, message, metadata)) in extracted.iter().enumerate() {
         let Some(row) = rows.next()? else {
             break;
         };
         if row.get::<_, usize>(1)? != *ordinal {
-            return Ok(Stored::Different);
+            diverged = true;
+            break;
         }
         if row.get::<_, String>(2)? != serde_json::to_string(message)? {
             if !*metadata {
-                return Ok(Stored::Different);
+                diverged = true;
+                break;
             }
             replace.push((row.get::<_, i64>(0)?, n));
         }
-        matched = n + 1;
+        keep = n + 1;
     }
-    if rows.next()?.is_some() {
-        return Ok(Stored::Different);
-    }
-    if matched == extracted.len() && replace.is_empty() {
+    let trim = diverged || rows.next()?.is_some();
+    if !trim && keep == extracted.len() && replace.is_empty() {
         return Ok(Stored::Identical);
     }
-    Ok(Stored::Prefix {
+    Ok(Stored::Changed {
         replace,
-        append: matched,
+        keep,
+        trim,
     })
 }
 
@@ -1555,10 +1560,14 @@ fn publish_session(
                 }
                 return Ok(());
             }
-            // Active transcripts only grow. Appending the new messages keeps
-            // the stored rows (and their ids) and costs a few passage
-            // inserts instead of re-tokenizing every message twice.
-            Stored::Prefix { replace, append } => {
+            // Keeping the rows that still match keeps their ids and postings
+            // and costs a few passage inserts instead of re-tokenizing every
+            // message twice.
+            Stored::Changed {
+                replace,
+                keep,
+                trim,
+            } => {
                 tx.execute(
                     "UPDATE sessions SET fingerprint = ?2 WHERE key = ?1",
                     params![key, stamp],
@@ -1567,12 +1576,20 @@ fn publish_session(
                     let (_, message, metadata) = &extracted[n];
                     replace_message(tx, id, session, message, *metadata)?;
                 }
-                for (ordinal, message, metadata) in &extracted[append..] {
+                if trim {
+                    // Ordinals increase along the rows, so everything after
+                    // the last kept row goes.
+                    let last_kept = keep.checked_sub(1).map_or(-1, |n| extracted[n].0 as i64);
+                    tx.execute(
+                        "DELETE FROM messages WHERE session_key = ?1 AND ordinal > ?2",
+                        params![key, last_kept],
+                    )?;
+                }
+                for (ordinal, message, metadata) in &extracted[keep..] {
                     insert_message(tx, key, session, message, *ordinal, *metadata)?;
                 }
                 return Ok(());
             }
-            Stored::Different => {}
         }
     }
     // The cascading delete is a multi-write statement and takes a savepoint,
