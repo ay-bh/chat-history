@@ -505,7 +505,13 @@ impl CursorShapes {
                 return loaded.clone();
             }
         }
-        let loaded = crate::cursor_ide::current_shapes(db);
+        // The plan starts from the snapshot discovery took; a parse that asks
+        // for a refresh gets the database as it is now.
+        let loaded = if refresh {
+            crate::cursor_ide::current_shapes(db)
+        } else {
+            crate::cursor_ide::latest_shapes(db)
+        };
         map.insert(db.to_path_buf(), loaded.clone());
         loaded
     }
@@ -787,7 +793,6 @@ impl Bm25Backend {
             }
             tx.commit()?;
         }
-        conn.execute_batch("CREATE TEMP TABLE allowed_sessions (key TEXT PRIMARY KEY)")?;
         Ok(Self { conn })
     }
 
@@ -1487,16 +1492,19 @@ fn extract_session(
 enum Stored {
     /// Every stored row matches and the transcript gained nothing.
     Identical,
-    /// The stored conversation is a prefix of the extraction. `replace` names
-    /// title or prompt rows whose payload changed (their timestamp follows the
-    /// transcript's modification time), as (stored id, extracted index);
-    /// `extracted[append..]` are the messages the transcript gained.
-    Prefix {
+    /// The stored rows match the extraction up to `extracted[keep]`. `replace`
+    /// names title or prompt rows among them whose payload changed (their
+    /// timestamp follows the transcript's modification time), as (stored id,
+    /// extracted index). Stored rows after the kept ones are deleted (`trim`)
+    /// and `extracted[keep..]` inserted. An active transcript usually only
+    /// grows, so this inserts its new messages; a Codex rollout also changes
+    /// its last assistant message (a tool call names itself there), and then
+    /// only that message is replaced rather than every row of the session.
+    Changed {
         replace: Vec<(i64, usize)>,
-        append: usize,
+        keep: usize,
+        trim: bool,
     },
-    /// Anything else: a rewritten or shortened transcript, or a parser change.
-    Different,
 }
 
 fn stored_rows(conn: &Connection, key: &str, extracted: &Extracted) -> Result<Stored> {
@@ -1505,31 +1513,33 @@ fn stored_rows(conn: &Connection, key: &str, extracted: &Extracted) -> Result<St
     )?;
     let mut rows = stmt.query([key])?;
     let mut replace = Vec::new();
-    let mut matched = 0;
+    let mut keep = 0;
+    let mut diverged = false;
     for (n, (ordinal, message, metadata)) in extracted.iter().enumerate() {
         let Some(row) = rows.next()? else {
             break;
         };
         if row.get::<_, usize>(1)? != *ordinal {
-            return Ok(Stored::Different);
+            diverged = true;
+            break;
         }
         if row.get::<_, String>(2)? != serde_json::to_string(message)? {
             if !*metadata {
-                return Ok(Stored::Different);
+                diverged = true;
+                break;
             }
             replace.push((row.get::<_, i64>(0)?, n));
         }
-        matched = n + 1;
+        keep = n + 1;
     }
-    if rows.next()?.is_some() {
-        return Ok(Stored::Different);
-    }
-    if matched == extracted.len() && replace.is_empty() {
+    let trim = diverged || rows.next()?.is_some();
+    if !trim && keep == extracted.len() && replace.is_empty() {
         return Ok(Stored::Identical);
     }
-    Ok(Stored::Prefix {
+    Ok(Stored::Changed {
         replace,
-        append: matched,
+        keep,
+        trim,
     })
 }
 
@@ -1558,10 +1568,14 @@ fn publish_session(
                 }
                 return Ok(());
             }
-            // Active transcripts only grow. Appending the new messages keeps
-            // the stored rows (and their ids) and costs a few passage
-            // inserts instead of re-tokenizing every message twice.
-            Stored::Prefix { replace, append } => {
+            // Keeping the rows that still match keeps their ids and postings
+            // and costs a few passage inserts instead of re-tokenizing every
+            // message twice.
+            Stored::Changed {
+                replace,
+                keep,
+                trim,
+            } => {
                 tx.execute(
                     "UPDATE sessions SET fingerprint = ?2 WHERE key = ?1",
                     params![key, stamp],
@@ -1570,12 +1584,20 @@ fn publish_session(
                     let (_, message, metadata) = &extracted[n];
                     replace_message(tx, id, session, message, *metadata)?;
                 }
-                for (ordinal, message, metadata) in &extracted[append..] {
+                if trim {
+                    // Ordinals increase along the rows, so everything after
+                    // the last kept row goes.
+                    let last_kept = keep.checked_sub(1).map_or(-1, |n| extracted[n].0 as i64);
+                    tx.execute(
+                        "DELETE FROM messages WHERE session_key = ?1 AND ordinal > ?2",
+                        params![key, last_kept],
+                    )?;
+                }
+                for (ordinal, message, metadata) in &extracted[keep..] {
                     insert_message(tx, key, session, message, *ordinal, *metadata)?;
                 }
                 return Ok(());
             }
-            Stored::Different => {}
         }
     }
     // The cascading delete is a multi-write statement and takes a savepoint,
@@ -1915,70 +1937,117 @@ impl SearchBackend for Bm25Backend {
             .map(|s| (session_key(s), s))
             .collect();
         let tx = self.conn.savepoint()?;
-        tx.execute("DELETE FROM allowed_sessions", [])?;
-        {
-            let mut insert = tx.prepare("INSERT INTO allowed_sessions VALUES (?1)")?;
-            for key in selected.keys() {
-                insert.execute([key])?;
+        // Passages that match every term, and the query as a phrase: each a
+        // small set that lifts a candidate's score.
+        let matching = |expr: &Option<String>| -> Result<HashSet<i64>> {
+            let mut ids = HashSet::new();
+            if let Some(expr) = expr {
+                let mut stmt = tx
+                    .prepare_cached("SELECT rowid FROM passages_fts WHERE passages_fts MATCH ?1")?;
+                let mut rows = stmt.query([expr])?;
+                while let Some(row) = rows.next()? {
+                    ids.insert(row.get(0)?);
+                }
             }
-        }
+            Ok(ids)
+        };
+        let complete = matching(&query.complete)?;
+        let phrase = matching(&query.phrase)?;
+        // Session keys in SQLite's BINARY order, so that a rank compares as
+        // the key itself does.
+        let mut keys: Vec<&String> = selected.keys().collect();
+        keys.sort();
+        let rank: HashMap<&str, usize> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, k)| (k.as_str(), i))
+            .collect();
         // Apply filters before consuming ranked candidates. No fixed oversampling
         // limit: duplicates or a busy session must not starve later sessions.
-        let mut stmt = tx.prepare(
-            "WITH complete AS MATERIALIZED (
-                SELECT rowid FROM passages_fts WHERE ?4 IS NOT NULL AND passages_fts MATCH ?4
-             ), phrase AS MATERIALIZED (
-                SELECT rowid FROM passages_fts WHERE ?5 IS NOT NULL AND passages_fts MATCH ?5
-             )
-             SELECT m.id, m.session_key,
-                    -bm25(passages_fts, 1.0, 3.0, 2.0, 0.5, 0.5, ?6)
-                    * (1.0 + 0.25 * (complete.rowid IS NOT NULL)
-                           + 0.15 * (phrase.rowid IS NOT NULL)) AS score, p.id,
-                    m.ordinal
-             FROM passages_fts
-             JOIN passages p ON p.id = passages_fts.rowid
-             JOIN messages m ON m.id = p.message_id
-             JOIN allowed_sessions a ON a.key = m.session_key
-             LEFT JOIN complete ON complete.rowid = p.id
-             LEFT JOIN phrase ON phrase.rowid = p.id
-             WHERE passages_fts MATCH ?1
-               AND (?2 IS NULL OR m.timestamp >= ?2)
-               AND (?3 != 'errors' OR m.errors = 1)
-               AND (?3 != 'tools' OR m.tools = 1)
-               AND (?3 != 'files' OR m.files = 1)
-             ORDER BY score DESC,
-                      m.timestamp DESC, m.session_key, m.ordinal, p.id",
-        )?;
-        let mut rows = stmt.query(params![
-            query.broad,
-            cutoff,
-            request.scope,
-            query.complete,
-            query.phrase,
-            TOOL_OUTPUT_WEIGHT
-        ])?;
+        // Scoring and ordering happen here rather than in SQLite: joining every
+        // candidate to the two sets and sorting there cost more than the match.
+        struct Candidate {
+            score: f64,
+            timestamp: Option<i64>,
+            key: usize,
+            ordinal: i64,
+            passage: i64,
+            message: i64,
+        }
+        let mut candidates = Vec::new();
+        {
+            let mut stmt = tx.prepare(
+                "SELECT m.id, m.session_key, -bm25(passages_fts, 1.0, 3.0, 2.0, 0.5, 0.5, ?4),
+                        p.id, m.ordinal, m.timestamp
+                 FROM passages_fts
+                 JOIN passages p ON p.id = passages_fts.rowid
+                 JOIN messages m ON m.id = p.message_id
+                 WHERE passages_fts MATCH ?1
+                   AND (?2 IS NULL OR m.timestamp >= ?2)
+                   AND (?3 != 'errors' OR m.errors = 1)
+                   AND (?3 != 'tools' OR m.tools = 1)
+                   AND (?3 != 'files' OR m.files = 1)",
+            )?;
+            let mut rows = stmt.query(params![
+                query.broad,
+                cutoff,
+                request.scope,
+                TOOL_OUTPUT_WEIGHT
+            ])?;
+            while let Some(row) = rows.next()? {
+                let Some(&key) = row.get_ref(1)?.as_str().ok().and_then(|key| rank.get(key)) else {
+                    continue;
+                };
+                let passage: i64 = row.get(3)?;
+                let bm25: f64 = row.get(2)?;
+                // The same operations, in the same order, as the SQL it replaces.
+                let all = if complete.contains(&passage) {
+                    1.0
+                } else {
+                    0.0
+                };
+                let together = if phrase.contains(&passage) { 1.0 } else { 0.0 };
+                candidates.push(Candidate {
+                    score: bm25 * (1.0 + 0.25 * all + 0.15 * together),
+                    timestamp: row.get(5)?,
+                    key,
+                    ordinal: row.get(4)?,
+                    passage,
+                    message: row.get(0)?,
+                });
+            }
+        }
+        // ORDER BY score DESC, timestamp DESC (NULL last), session_key,
+        // ordinal, passage id.
+        candidates.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| match (a.timestamp, b.timestamp) {
+                    (Some(x), Some(y)) => y.cmp(&x),
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => std::cmp::Ordering::Equal,
+                })
+                .then(a.key.cmp(&b.key))
+                .then(a.ordinal.cmp(&b.ordinal))
+                .then(a.passage.cmp(&b.passage))
+        });
         // Keep full message JSON out of SQLite's candidate sorter. A long
         // message can have thousands of matching passages but is hydrated once.
         let mut hydrate = tx.prepare_cached("SELECT payload FROM messages WHERE id = ?1")?;
-        // Compute excerpts only for accepted hits, keeping text out of the
-        // candidate sorter. FTS uses the same analyzer and winning passage.
-        let mut excerpt = tx.prepare_cached(
-            "SELECT snippet(passages_fts, -1, '', '', ' … ', 40)
-             FROM passages_fts WHERE rowid = ?1 AND passages_fts MATCH ?2",
-        )?;
         let mut seen_messages = HashSet::new();
         let mut seen_content = HashSet::new();
         let mut counts: HashMap<(String, String), usize> = HashMap::new();
         let mut groups: HashMap<(String, String), usize> = HashMap::new();
         let mut echoes: HashMap<(String, String), Vec<Echo>> = HashMap::new();
         let mut results: Vec<SearchResult> = Vec::new();
-        while let Some(row) = rows.next()? {
-            let id: i64 = row.get(0)?;
+        for candidate in &candidates {
+            let id = candidate.message;
             if !seen_messages.insert(id) {
                 continue;
             }
-            let key: String = row.get(1)?;
-            let session = selected[&key];
+            let session = selected[keys[candidate.key]];
             let logical_session = (session.source.clone(), session.id.to_lowercase());
             if request.group_by_session
                 && results.len() == request.limit
@@ -2026,29 +2095,18 @@ impl SearchBackend for Bm25Backend {
             if synthetic && twin.is_some() {
                 continue;
             }
-            let score: f64 = row.get(2)?;
+            let score = candidate.score;
             message.relevance_score = score;
             message.final_score = score;
-            let passage_id: i64 = row.get(3)?;
+            let passage_id = candidate.passage;
             // Stored ordinals 0 and 1 are the title and prompt rows; real
             // messages are stored at their transcript position + 2.
             let ordinal = (!synthetic)
-                .then(|| row.get::<_, i64>(4))
-                .transpose()?
+                .then_some(candidate.ordinal)
                 .and_then(|stored| usize::try_from(stored).ok()?.checked_sub(2));
-            let snippet: String =
-                excerpt.query_row(params![passage_id, query.broad], |r| r.get(0))?;
-            let snippet = if snippet.trim().is_empty() {
-                let q = if request.query.len() > 4096 {
-                    &request.query[..request.query.floor_char_boundary(4096)]
-                } else {
-                    request.query
-                };
-                snippet_around_match(&message.content, q, 200)
-            } else {
-                snippet
-            };
-            let snippet = cap_excerpt(&snippet, SNIPPET_CHARS);
+            // The excerpt is computed for all accepted hits after the loop;
+            // until then a hit's snippet holds its passage id.
+            let snippet = passage_id.to_string();
             if let Some(twin) = twin {
                 // Keep the synthetic row's rank; show the message it echoed.
                 // The title and prompt rows are distinct: replace the twin.
@@ -2104,8 +2162,63 @@ impl SearchBackend for Bm25Backend {
                 break;
             }
         }
+        let wanted: Vec<i64> = results
+            .iter()
+            .flat_map(|r| {
+                std::iter::once(&r.snippet).chain(r.additional_matches.iter().map(|m| &m.snippet))
+            })
+            .filter_map(|s| s.as_deref()?.parse().ok())
+            .collect();
+        let excerpts = excerpts(&tx, &query.broad, &wanted)?;
+        let fallback = if request.query.len() > 4096 {
+            &request.query[..request.query.floor_char_boundary(4096)]
+        } else {
+            request.query
+        };
+        let finish = |message: &Message, snippet: &mut Option<String>| {
+            let Some(id) = snippet.as_deref().and_then(|s| s.parse::<i64>().ok()) else {
+                return;
+            };
+            let raw = excerpts.get(&id).map(String::as_str).unwrap_or("");
+            let text = if raw.trim().is_empty() {
+                snippet_around_match(&message.content, fallback, 200)
+            } else {
+                raw.to_owned()
+            };
+            *snippet = Some(cap_excerpt(&text, SNIPPET_CHARS));
+        };
+        for result in &mut results {
+            finish(&result.message, &mut result.snippet);
+            for extra in &mut result.additional_matches {
+                finish(&extra.message, &mut extra.snippet);
+            }
+        }
         Ok(results)
     }
+}
+
+/// FTS5 excerpts of the given passages for one MATCH expression, in a single
+/// statement: the expression is expanded once (a short prefix such as `4*`
+/// can cost tens of milliseconds) and `snippet()` runs only on these rows.
+fn excerpts(conn: &Connection, expr: &str, ids: &[i64]) -> Result<HashMap<i64, String>> {
+    let mut out = HashMap::new();
+    let (Some(&low), Some(&high)) = (ids.iter().min(), ids.iter().max()) else {
+        return Ok(out);
+    };
+    let mut stmt = conn.prepare_cached(
+        "SELECT rowid,
+                CASE WHEN rowid IN (SELECT value FROM json_each(?2))
+                     THEN snippet(passages_fts, -1, '', '', ' … ', 40) END
+         FROM passages_fts
+         WHERE passages_fts MATCH ?1 AND rowid BETWEEN ?3 AND ?4",
+    )?;
+    let mut rows = stmt.query(params![expr, serde_json::to_string(ids)?, low, high])?;
+    while let Some(row) = rows.next()? {
+        if let Some(excerpt) = row.get::<_, Option<String>>(1)? {
+            out.insert(row.get(0)?, excerpt);
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

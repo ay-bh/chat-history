@@ -734,3 +734,77 @@ fn ranking_from_the_calling_session_does_not_depend_on_cache_history() {
         "grown: vs rebuilt"
     );
 }
+
+#[test]
+fn a_changed_last_message_keeps_the_rows_before_it() {
+    // A Codex tool call attaches its name to the last assistant message, so
+    // a growing rollout changes an earlier row as well as adding new ones.
+    // The rows before the first changed one are kept, not rewritten.
+    let tmp = TempDir::new().unwrap();
+    let user = |ts, text: &str| {
+        codex_item(
+            ts,
+            json!({"type": "message", "role": "user",
+            "content": [{"type": "input_text", "text": text}]}),
+        )
+    };
+    let assistant = |ts, text: &str| {
+        codex_item(
+            ts,
+            json!({"type": "message", "role": "assistant",
+            "content": [{"type": "output_text", "text": text}]}),
+        )
+    };
+    let mut records = vec![
+        user(1, "check the pelicanflow job"),
+        assistant(2, "Looking at the pelicanflow logs."),
+        user(3, "and the heronqueue?"),
+        assistant(4, "Checking heronqueue now."),
+    ];
+    write_codex(tmp.path(), &records);
+    std::thread::sleep(std::time::Duration::from_millis(2100));
+    assert!(!hits(&search(&tmp, "pelicanflow")).is_empty(), "indexed");
+    // Another session indexed afterwards takes the next row ids, so a
+    // rewrite of the Codex rows could not hand them their old ids back.
+    write_claude(
+        tmp.path(),
+        ID_B,
+        vec![("user", json!("an unrelated ibisnote question"))],
+    );
+    std::thread::sleep(std::time::Duration::from_millis(2100));
+    assert!(
+        !hits(&search(&tmp, "ibisnote")).is_empty(),
+        "second session indexed"
+    );
+    let before = stored_messages(&tmp, CODEX_ID);
+    records.push(codex_item(
+        5,
+        json!({"type": "function_call", "name": "exec_command",
+        "call_id": "c9", "arguments": "{\"cmd\":\"queue-status\"}"}),
+    ));
+    records.push(codex_item(
+        6,
+        json!({"type": "function_call_output", "call_id": "c9",
+        "output": "egretsignal: 12 jobs waiting"}),
+    ));
+    write_codex(tmp.path(), &records);
+    std::thread::sleep(std::time::Duration::from_millis(2100));
+    assert!(
+        !hits(&search(&tmp, "egretsignal")).is_empty(),
+        "the new output is found"
+    );
+    let after = stored_messages(&tmp, CODEX_ID);
+    assert_eq!(after.len(), before.len() + 1, "one message added");
+    let ids = |rows: &[(i64, String)]| rows.iter().map(|r| r.0).collect::<Vec<_>>();
+    let kept = before.len() - 1;
+    assert_eq!(
+        ids(&after[..kept]),
+        ids(&before[..kept]),
+        "every row before the changed assistant message keeps its id"
+    );
+    assert!(
+        after[kept].1.contains("exec_command"),
+        "the assistant message now names its tool: {}",
+        after[kept].1
+    );
+}
