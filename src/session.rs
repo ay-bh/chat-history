@@ -1236,67 +1236,65 @@ pub fn merge_cursor_sessions(agents: Vec<Session>, ide: Vec<Session>) -> Vec<Ses
     agents
 }
 
-pub fn parse_claude_jsonl(
-    filepath: &str,
+/// The state a Claude JSONL parse carries from one record to the next, so a
+/// parse can stop at a byte offset and a later one continue from it.
+struct ClaudeParser {
     extract_meta: bool,
-) -> (Vec<Message>, Option<SessionMeta>) {
-    let file = match fs::File::open(filepath) {
-        Ok(f) => f,
-        Err(_) => {
-            return (
-                Vec::new(),
-                if extract_meta {
-                    Some(SessionMeta::default())
-                } else {
-                    None
-                },
-            );
-        }
-    };
-    let reader = BufReader::new(file);
-    let mut messages = Vec::new();
-    let mut meta = SessionMeta::default();
-    let mut skip_next_assistant = false;
+    messages: Vec<Message>,
+    meta: SessionMeta,
+    skip_next_assistant: bool,
     // One API response is stored as one JSONL record per content block, each
     // repeating the same message id and usage — count usage once per id.
-    let mut counted_usage_ids: HashSet<String> = HashSet::new();
-    let mut user_texts = Vec::new();
+    counted_usage_ids: HashSet<String>,
+    user_texts: Vec<String>,
     // Tool calls that ran chat-history, by tool_use id: their results repeat
     // other sessions and are marked so search skips them.
-    let mut history_calls: HashSet<String> = HashSet::new();
+    history_calls: HashSet<String>,
+}
 
-    for line in reader.lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => continue,
-        };
+impl ClaudeParser {
+    fn new(extract_meta: bool) -> Self {
+        Self {
+            extract_meta,
+            messages: Vec::new(),
+            meta: SessionMeta::default(),
+            skip_next_assistant: false,
+            counted_usage_ids: HashSet::new(),
+            user_texts: Vec::new(),
+            history_calls: HashSet::new(),
+        }
+    }
+
+    /// Consume one record. Returns whether the line held JSON at all (a torn
+    /// final line does not, and must be read again once it is complete).
+    fn feed(&mut self, line: &str) -> bool {
         let trimmed = line.trim().to_string();
         if trimmed.is_empty() {
-            continue;
+            return true;
         }
         let entry: Value = match serde_json::from_str(&trimmed) {
             Ok(v) => v,
-            Err(_) => continue,
+            Err(_) => return false,
         };
         let etype = entry.get("type").and_then(Value::as_str).unwrap_or("");
 
-        if etype == "summary" && extract_meta && meta.summary.is_none() {
-            meta.summary = entry
+        if etype == "summary" && self.extract_meta && self.meta.summary.is_none() {
+            self.meta.summary = entry
                 .get("summary")
                 .and_then(Value::as_str)
                 .map(String::from);
-            continue;
+            return true;
         }
-        if etype == "ai-title" && extract_meta {
+        if etype == "ai-title" && self.extract_meta {
             if let Some(title) = entry.get("aiTitle").and_then(Value::as_str) {
                 let title = title.trim();
                 if !title.is_empty() {
-                    meta.summary = Some(title.to_string());
+                    self.meta.summary = Some(title.to_string());
                 }
             }
-            continue;
+            return true;
         }
-        if (etype == "custom-title" || etype == "custom_title") && extract_meta {
+        if (etype == "custom-title" || etype == "custom_title") && self.extract_meta {
             let title = entry
                 .get("customTitle")
                 .or_else(|| entry.get("custom_title"))
@@ -1304,12 +1302,12 @@ pub fn parse_claude_jsonl(
                 .unwrap_or("")
                 .trim()
                 .to_string();
-            meta.custom_title = if title.is_empty() { None } else { Some(title) };
-            continue;
+            self.meta.custom_title = if title.is_empty() { None } else { Some(title) };
+            return true;
         }
 
         if etype != "user" && etype != "assistant" {
-            continue;
+            return true;
         }
 
         let msg_obj = entry
@@ -1327,7 +1325,7 @@ pub fn parse_claude_jsonl(
                     && crate::parser::is_history_command(command)
                     && let Some(id) = block.get("id").and_then(Value::as_str)
                 {
-                    history_calls.insert(id.to_owned());
+                    self.history_calls.insert(id.to_owned());
                 }
             }
         }
@@ -1354,14 +1352,14 @@ pub fn parse_claude_jsonl(
             let history_output = results.iter().any(|b| {
                 b.get("tool_use_id")
                     .and_then(Value::as_str)
-                    .is_some_and(|id| history_calls.contains(id))
+                    .is_some_and(|id| self.history_calls.contains(id))
             });
             let ctx = crate::parser::extract_context(&Value::Array(results));
             let mut message = claude_message(&entry, "tool", text, ctx);
             message.history_output = history_output;
-            messages.push(message);
+            self.messages.push(message);
             if rest.is_empty() {
-                continue;
+                return true;
             }
             content_raw = Value::Array(rest);
         }
@@ -1372,29 +1370,29 @@ pub fn parse_claude_jsonl(
             if let Some(command) = slash_command_text(&text) {
                 text = command;
             } else if is_meta {
-                continue;
+                return true;
             }
-            user_texts.push(text.clone());
+            self.user_texts.push(text.clone());
             if is_warmup_message(&text) {
-                skip_next_assistant = true;
-                continue;
+                self.skip_next_assistant = true;
+                return true;
             }
             if is_clear_metadata(&text) {
-                continue;
+                return true;
             }
         }
 
         if etype == "assistant" {
-            if extract_meta
-                && meta.model.is_none()
+            if self.extract_meta
+                && self.meta.model.is_none()
                 && let Some(m) = msg_obj.get("model").and_then(Value::as_str)
             {
-                meta.model = Some(m.to_string());
+                self.meta.model = Some(m.to_string());
             }
             let msg_id = msg_obj.get("id").and_then(Value::as_str).unwrap_or("");
-            if extract_meta
+            if self.extract_meta
                 && let Some(usage) = msg_obj.get("usage")
-                && (msg_id.is_empty() || counted_usage_ids.insert(msg_id.to_string()))
+                && (msg_id.is_empty() || self.counted_usage_ids.insert(msg_id.to_string()))
             {
                 let tok = usage
                     .get("input_tokens")
@@ -1412,11 +1410,11 @@ pub fn parse_claude_jsonl(
                         .get("cache_read_input_tokens")
                         .and_then(Value::as_u64)
                         .unwrap_or(0);
-                meta.total_tokens += tok;
+                self.meta.total_tokens += tok;
             }
-            if skip_next_assistant {
-                skip_next_assistant = false;
-                continue;
+            if self.skip_next_assistant {
+                self.skip_next_assistant = false;
+                return true;
             }
         }
 
@@ -1426,16 +1424,155 @@ pub fn parse_claude_jsonl(
             .and_then(Value::as_str)
             .unwrap_or(etype)
             .to_string();
-        messages.push(claude_message(&entry, &role, text, ctx));
+        self.messages.push(claude_message(&entry, &role, text, ctx));
+        true
     }
 
-    if extract_meta {
-        if crate::parser::is_clear_only_conversation(&user_texts) {
-            return (Vec::new(), Some(meta));
+    fn finish(self) -> (Vec<Message>, Option<SessionMeta>) {
+        if self.extract_meta {
+            if crate::parser::is_clear_only_conversation(&self.user_texts) {
+                return (Vec::new(), Some(self.meta));
+            }
+            return (self.messages, Some(self.meta));
         }
-        return (messages, Some(meta));
+        (self.messages, None)
     }
-    (messages, None)
+}
+
+pub fn parse_claude_jsonl(
+    filepath: &str,
+    extract_meta: bool,
+) -> (Vec<Message>, Option<SessionMeta>) {
+    let file = match fs::File::open(filepath) {
+        Ok(f) => f,
+        Err(_) => {
+            return (
+                Vec::new(),
+                if extract_meta {
+                    Some(SessionMeta::default())
+                } else {
+                    None
+                },
+            );
+        }
+    };
+    let mut parser = ClaudeParser::new(extract_meta);
+    for line in BufReader::new(file).lines() {
+        let Ok(line) = line else {
+            continue;
+        };
+        parser.feed(&line);
+    }
+    parser.finish()
+}
+
+/// Where a Claude transcript parse stopped, and what it carried: enough to
+/// continue from `offset` and produce exactly the messages a parse from the
+/// start would have produced for the bytes after it. `head` fingerprints the
+/// first bytes of the file and `pre` the bytes just before `offset`; a
+/// transcript that was rewritten rather than appended to fails one of them.
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+pub struct ClaudeTail {
+    pub offset: u64,
+    pub head: String,
+    pub pre: String,
+    /// Messages produced so far: the ordinal base for the next ones.
+    pub messages: usize,
+    pub skip_next_assistant: bool,
+    pub history_calls: Vec<String>,
+}
+
+const TAIL_HEAD_BYTES: u64 = 1024;
+const TAIL_PRE_BYTES: u64 = 512;
+
+fn tail_hash(bytes: &[u8]) -> String {
+    blake3::hash(bytes).to_hex()[..16].to_string()
+}
+
+fn read_span(file: &mut fs::File, start: u64, len: u64) -> std::io::Result<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut buf = vec![0u8; len as usize];
+    file.seek(SeekFrom::Start(start))?;
+    file.read_exact(&mut buf)?;
+    Ok(buf)
+}
+
+/// Parse a Claude transcript for indexing (no metadata), from the start or,
+/// with `resume`, from where an earlier parse stopped. Returns the messages
+/// produced by this call and where it stopped. `None` when the file cannot be
+/// read, or when `resume` no longer describes it (the caller then parses from
+/// the start). Only complete lines are consumed; a final line without a
+/// newline is taken only if it already holds valid JSON, otherwise it is left
+/// for the next parse.
+pub fn parse_claude_jsonl_from(
+    filepath: &str,
+    resume: Option<&ClaudeTail>,
+) -> Option<(Vec<Message>, ClaudeTail)> {
+    use std::io::{BufRead, Seek, SeekFrom};
+    let mut file = fs::File::open(filepath).ok()?;
+    let len = file.metadata().ok()?.len();
+    // The head covers the first bytes up to the offset, so that a stamp taken
+    // on a short transcript still describes the same bytes once it has grown.
+    let head_of = |file: &mut fs::File, offset: u64| -> Option<String> {
+        Some(tail_hash(
+            &read_span(file, 0, offset.min(TAIL_HEAD_BYTES)).ok()?,
+        ))
+    };
+    let mut parser = ClaudeParser::new(false);
+    let mut offset = 0u64;
+    let mut messages_before = 0usize;
+    if let Some(resume) = resume {
+        let pre_len = resume.offset.min(TAIL_PRE_BYTES);
+        if resume.offset > len
+            || resume.head != head_of(&mut file, resume.offset)?
+            || tail_hash(&read_span(&mut file, resume.offset - pre_len, pre_len).ok()?)
+                != resume.pre
+        {
+            return None;
+        }
+        offset = resume.offset;
+        messages_before = resume.messages;
+        parser.skip_next_assistant = resume.skip_next_assistant;
+        parser.history_calls = resume.history_calls.iter().cloned().collect();
+    }
+    file.seek(SeekFrom::Start(offset)).ok()?;
+    let mut reader = BufReader::new(&mut file);
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        let n = reader.read_until(b'\n', &mut buf).ok()?;
+        if n == 0 {
+            break;
+        }
+        let terminated = buf.ends_with(b"\n");
+        let parsed = match std::str::from_utf8(&buf) {
+            Ok(line) => parser.feed(line),
+            // Mirrors `lines()`: a complete record that does not decode is
+            // skipped. An unterminated one may be cut inside a multibyte
+            // character, so it waits like any torn line.
+            Err(_) => terminated,
+        };
+        if terminated || parsed {
+            offset += n as u64;
+        } else {
+            break;
+        }
+    }
+    let pre_len = offset.min(TAIL_PRE_BYTES);
+    let pre = tail_hash(&read_span(&mut file, offset - pre_len, pre_len).ok()?);
+    let head = head_of(&mut file, offset)?;
+    let history_calls = parser.history_calls.iter().cloned().collect();
+    let skip_next_assistant = parser.skip_next_assistant;
+    let (messages, _) = parser.finish();
+    let tail = ClaudeTail {
+        offset,
+        head,
+        pre,
+        messages: messages_before + messages.len(),
+        skip_next_assistant,
+        history_calls,
+    };
+    Some((messages, tail))
 }
 
 fn claude_message(
@@ -2797,6 +2934,101 @@ mod tests {
         );
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].id, "1");
+    }
+
+    #[test]
+    fn a_resumed_parse_produces_what_a_parse_from_the_start_produces() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("session.jsonl");
+        let record = |i: usize, role: &str, content: serde_json::Value| {
+            serde_json::json!({"type": role, "message": {"role": role, "content": content},
+                "uuid": format!("u{i}"), "timestamp": "2026-09-01T10:00:00Z", "sessionId": "s"})
+            .to_string()
+        };
+        let first = [
+            record(0, "user", "find the notes".into()),
+            record(
+                1,
+                "assistant",
+                serde_json::json!([{"type": "tool_use", "id": "t1", "name": "Bash",
+                "input": {"command": "chat-history search notes --json"}}]),
+            ),
+            record(2, "user", "warmup".into()),
+        ]
+        .join("\n")
+            + "\n";
+        let second = [
+            record(3, "assistant", "skipped after the warmup".into()),
+            record(
+                4,
+                "user",
+                serde_json::json!([{"type": "tool_result", "tool_use_id": "t1",
+                "content": "echo of other sessions"}]),
+            ),
+            record(5, "assistant", "the answer".into()),
+        ]
+        .join("\n")
+            + "\n";
+        std::fs::write(&path, &first).unwrap();
+        let (head_messages, tail) = parse_claude_jsonl_from(path.to_str().unwrap(), None).unwrap();
+        assert_eq!(tail.offset, first.len() as u64);
+        assert_eq!(tail.messages, head_messages.len());
+        assert!(tail.skip_next_assistant, "the warm-up is carried over");
+        assert_eq!(tail.history_calls, vec!["t1".to_string()]);
+        std::fs::write(&path, format!("{first}{second}")).unwrap();
+        let (rest, tail2) = parse_claude_jsonl_from(path.to_str().unwrap(), Some(&tail)).unwrap();
+        let (whole, _) = parse_claude_jsonl(path.to_str().unwrap(), false);
+        let mut resumed = head_messages;
+        resumed.extend(rest);
+        assert_eq!(resumed.len(), whole.len());
+        for (a, b) in resumed.iter().zip(&whole) {
+            assert_eq!(a.uuid, b.uuid);
+            assert_eq!(a.content, b.content);
+            assert_eq!(a.role, b.role);
+            assert_eq!(a.history_output, b.history_output);
+        }
+        assert!(
+            resumed.iter().any(|m| m.history_output),
+            "the tool result is marked"
+        );
+        assert!(!resumed.iter().any(|m| m.content.contains("skipped after")));
+        assert_eq!(tail2.offset, (first.len() + second.len()) as u64);
+        assert_eq!(tail2.messages, whole.len());
+        // Resuming from a stamp the file no longer matches is refused.
+        std::fs::write(&path, "x").unwrap();
+        assert!(parse_claude_jsonl_from(path.to_str().unwrap(), Some(&tail)).is_none());
+    }
+
+    #[test]
+    fn a_last_line_cut_inside_a_multibyte_character_waits_like_any_torn_line() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("session.jsonl");
+        let record = |i: usize, content: &str| {
+            serde_json::json!({"type": "user", "message": {"role": "user", "content": content},
+                "uuid": format!("u{i}"), "timestamp": "2026-09-01T10:00:00Z", "sessionId": "s"})
+            .to_string()
+        };
+        let first = record(0, "plain start") + "\n";
+        let second = record(1, "héron and 鷺 in the reeds");
+        // Cut inside the three-byte character: the bytes so far are not UTF-8.
+        let cut = second.find('鷺').unwrap() + 1;
+        let torn = &second.as_bytes()[..cut];
+        assert!(std::str::from_utf8(torn).is_err());
+        let mut bytes = first.clone().into_bytes();
+        bytes.extend_from_slice(torn);
+        std::fs::write(&path, bytes).unwrap();
+        let (messages, tail) = parse_claude_jsonl_from(path.to_str().unwrap(), None).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            tail.offset,
+            first.len() as u64,
+            "the offset stays before the torn line"
+        );
+        std::fs::write(&path, format!("{first}{second}\n")).unwrap();
+        let (rest, tail2) = parse_claude_jsonl_from(path.to_str().unwrap(), Some(&tail)).unwrap();
+        assert_eq!(rest.len(), 1, "the completed record is read on resume");
+        assert!(rest[0].content.contains("鷺"));
+        assert_eq!(tail2.offset, (first.len() + second.len() + 1) as u64);
     }
 
     #[test]

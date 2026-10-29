@@ -155,6 +155,24 @@ refreshed in one best-effort write so later searches skip even the shape read
 until the next change. Cached read connections reopen when the database file
 identity changes, including atomic replacement on Unix.
 
+**Resuming a Claude transcript.** A Claude Code transcript only grows, so once it
+is indexed its stamp also records where the parse stopped: the byte offset after
+the last complete line, a fingerprint of the first bytes of the file (up to 1 KiB,
+never past the offset) and of the 512 bytes before the offset, how many messages
+came before, and the two pieces of parser state that cross records (a pending
+warm-up skip, the ids of chat-history's own tool calls whose results are left
+out). The next sync of a changed transcript checks that the file is at least as
+long and that both fingerprints still match, then parses only the bytes after the
+offset and appends the messages they hold after the rows already stored, exactly
+as a parse from the start would have produced them. A final line without a
+newline is taken only if it already holds valid JSON; otherwise it waits. A
+shorter file, a changed head or changed bytes before the offset, or stored rows
+that do not end where the stamp says, mean a parse from byte 0 as before. This is
+how log shippers resume (Fluent Bit's offset marker, Splunk's seek CRC, clio and
+atuin for these transcripts); like theirs, it does not see a same-length edit
+that lies after the head and before the pre-offset window until something makes
+a parse start from byte 0.
+
 **Parsing.** Stable unchanged sessions skip transcript parsing. Changed sources
 are checked before and after parsing, and unstable or failed reads are retried
 on the next invocation. An empty parse of a SQLite-backed source also retries.
