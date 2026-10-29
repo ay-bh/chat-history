@@ -10,6 +10,7 @@ use serde_json::Value;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 pub fn cursor_user_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("CURSOR_USER_DIR")
@@ -109,6 +110,175 @@ pub(crate) fn conversation_fingerprint(path: &Path, id: &str) -> Option<String> 
         }
         tx.commit().ok()?;
         Some(hash.finalize().to_hex().to_string())
+    })
+}
+
+/// What the key index and row headers say about every conversation in the
+/// database, read in one snapshot without the conversation text: the bubble
+/// row count and newest bubble rowid, the composerData row's rowid and byte
+/// length, and a hash of the header row. Cursor rewrites this database every
+/// few seconds while it is open; comparing shapes tells which conversations
+/// changed without hashing the text of all of them.
+pub(crate) struct ConversationShapes {
+    /// The database stamp the shapes describe, when it held still while they
+    /// were read.
+    pub(crate) stamp: Option<String>,
+    /// Shape, bubble row count and newest bubble rowid per conversation.
+    shapes: HashMap<String, (String, u64, i64)>,
+    /// The newest bubble rowid in the whole database.
+    newest: i64,
+}
+
+/// A conversation whose newest bubble row is within this many rows of the
+/// newest row in the database was written to recently: a few days of use on a
+/// busy profile. Many Cursor conversations carry no update time, so this
+/// stands in for one.
+const RECENT_BUBBLE_ROWS: i64 = 1000;
+
+impl ConversationShapes {
+    /// A conversation without any rows has a shape too.
+    pub(crate) fn shape(&self, id: &str) -> String {
+        self.shapes
+            .get(id)
+            .map(|(shape, _, _)| shape.clone())
+            .unwrap_or_else(|| "none".into())
+    }
+
+    pub(crate) fn bubble_count(&self, id: &str) -> u64 {
+        self.shapes.get(id).map_or(0, |(_, count, _)| *count)
+    }
+
+    /// Whether the conversation's rows are among the newest in the database.
+    pub(crate) fn recently_written(&self, id: &str) -> bool {
+        self.shapes
+            .get(id)
+            .is_some_and(|(_, _, newest)| self.newest - newest < RECENT_BUBBLE_ROWS)
+    }
+}
+
+/// The shapes of the database as it stands, read at most once per process for
+/// a given database state and shared by session discovery and the index sync.
+pub(crate) fn current_shapes(path: &Path) -> Option<Arc<ConversationShapes>> {
+    static SHARED: Mutex<Option<(PathBuf, Arc<ConversationShapes>)>> = Mutex::new(None);
+    let mut slot = SHARED.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((held, shapes)) = slot.as_ref()
+        && held == path
+        && shapes.stamp.is_some()
+        && shapes.stamp == crate::catalog::fingerprint(path, true)
+    {
+        return Some(shapes.clone());
+    }
+    let shapes = Arc::new(conversation_shapes(path)?);
+    *slot = Some((path.to_path_buf(), shapes.clone()));
+    Some(shapes)
+}
+
+fn conversation_shapes(path: &Path) -> Option<ConversationShapes> {
+    let before = crate::catalog::fingerprint(path, true);
+    let conn = open_ro(path)?;
+    let tx = conn.unchecked_transaction().ok()?;
+    let mut parts: HashMap<String, ([String; 3], u64, i64)> = HashMap::new();
+    let mut newest = 0i64;
+    {
+        let mut stmt = tx
+            .prepare(
+                "SELECT substr(key, 10, 36), count(*), max(rowid) FROM cursorDiskKV \
+                 WHERE key >= 'bubbleId:' AND key < 'bubbleId;' GROUP BY 1",
+            )
+            .ok()?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .ok()?;
+        for row in rows {
+            let (id, count, newest_row) = row.ok()?;
+            let entry = parts.entry(id).or_default();
+            entry.0[0] = format!("{count}@{newest_row}");
+            entry.1 = count.max(0) as u64;
+            entry.2 = newest_row;
+            newest = newest.max(newest_row);
+        }
+    }
+    {
+        // octet_length reads the row header, not the large payload.
+        let mut stmt = tx
+            .prepare(
+                "SELECT substr(key, 14), rowid, octet_length(value) FROM cursorDiskKV \
+                 WHERE key >= 'composerData:' AND key < 'composerData;'",
+            )
+            .ok()?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                ))
+            })
+            .ok()?;
+        for row in rows {
+            let (id, rowid, len) = row.ok()?;
+            parts.entry(id).or_default().0[1] = format!("{rowid}:{}", len.unwrap_or(0));
+        }
+    }
+    {
+        // Every column: Cursor keeps the update time and the subagent flag
+        // beside the header JSON, and the listing's dates come from them.
+        let mut stmt = tx.prepare("SELECT * FROM composerHeaders").ok()?;
+        let id_column = stmt.column_index("composerId").ok()?;
+        let columns = stmt.column_count();
+        let rows = stmt
+            .query_map([], |row| {
+                use rusqlite::types::ValueRef;
+                let mut hash = blake3::Hasher::new();
+                for column in 0..columns {
+                    match row.get_ref(column)? {
+                        ValueRef::Null => {
+                            hash.update(b"n");
+                        }
+                        ValueRef::Integer(n) => {
+                            hash.update(b"i");
+                            hash.update(&n.to_le_bytes());
+                        }
+                        ValueRef::Real(x) => {
+                            hash.update(b"r");
+                            hash.update(&x.to_le_bytes());
+                        }
+                        ValueRef::Text(bytes) | ValueRef::Blob(bytes) => {
+                            hash.update(&(bytes.len() as u64).to_le_bytes());
+                            hash.update(bytes);
+                        }
+                    }
+                }
+                let header = hash.finalize().to_hex()[..16].to_string();
+                Ok((row.get::<_, String>(id_column)?, header))
+            })
+            .ok()?;
+        for row in rows {
+            let (id, header) = row.ok()?;
+            parts.entry(id).or_default().0[2] = header;
+        }
+    }
+    tx.commit().ok()?;
+    let after = crate::catalog::fingerprint(path, true);
+    let stamp = before.filter(|b| Some(b) == after.as_ref());
+    Some(ConversationShapes {
+        stamp,
+        shapes: parts
+            .into_iter()
+            .map(|(id, ([bubbles, data, header], count, newest_row))| {
+                (
+                    id,
+                    (format!("{bubbles}/{data}/{header}"), count, newest_row),
+                )
+            })
+            .collect(),
+        newest,
     })
 }
 
@@ -371,14 +541,29 @@ pub fn load_cursor_ide_sessions() -> Vec<Session> {
     load_cursor_ide_sessions_from(&global_vscdb())
 }
 
+/// The listed IDE conversations with the shape each row was built from, so
+/// that after the database changes only the rows whose conversation changed
+/// are read again.
+#[derive(Default, serde::Deserialize, serde::Serialize)]
+struct IdeListing {
+    shapes: HashMap<String, String>,
+    sessions: Vec<Session>,
+    /// Conversations whose first prompt comes from their own text rather
+    /// than the header: the shape does not see an in-place edit of that
+    /// text, so the prompt is read again even when the row is reused.
+    #[serde(default)]
+    text_prompts: std::collections::HashSet<String>,
+}
+
 fn load_cursor_ide_sessions_from(db: &Path) -> Vec<Session> {
-    crate::catalog::read("cursor-ide", "sessions", db, true, || {
-        read_cursor_ide_sessions_from(db)
+    crate::catalog::read_with("cursor-ide", "listing", db, true, |previous| {
+        read_cursor_ide_sessions_from(db, previous)
     })
+    .map(|listing| listing.sessions)
     .unwrap_or_default()
 }
 
-fn read_cursor_ide_sessions_from(db: &Path) -> Option<Vec<Session>> {
+fn read_cursor_ide_sessions_from(db: &Path, previous: Option<IdeListing>) -> Option<IdeListing> {
     if !db.exists() {
         return None;
     }
@@ -389,7 +574,17 @@ fn read_cursor_ide_sessions_from(db: &Path) -> Option<Vec<Session>> {
         );
         return None;
     };
-    let mut sessions = Vec::new();
+    let mut listing = IdeListing::default();
+    // Rows built for conversations whose shape has not changed since.
+    let mut reusable: HashMap<String, (String, Session, bool)> = HashMap::new();
+    if let Some(previous) = previous {
+        for session in previous.sessions {
+            if let Some(shape) = previous.shapes.get(&session.id) {
+                let text_prompt = previous.text_prompts.contains(&session.id);
+                reusable.insert(session.id.clone(), (shape.clone(), session, text_prompt));
+            }
+        }
+    }
     // Required columns identify the supported storage family; the message
     // table is checked too so header-only rows never masquerade as readable
     // conversations. Optional header columns vary between Cursor versions and
@@ -422,10 +617,32 @@ fn read_cursor_ide_sessions_from(db: &Path) -> Option<Vec<Session>> {
     let Ok(rows) = rows else {
         return None;
     };
-    let counts = bubble_counts(&conn);
+    // Bubble counts come from the shared shapes snapshot, which the index sync
+    // reuses; the plain count query stands in when the shapes cannot be read.
+    let shapes = current_shapes(db);
+    let counts = if shapes.is_none() {
+        bubble_counts(&conn)
+    } else {
+        HashMap::new()
+    };
     let file = db.to_string_lossy().to_string();
     for row in rows.flatten() {
         let (id, mut created_ms, mut updated_ms, mut is_sidechain, raw) = row;
+        let shape = shapes.as_ref().map(|s| s.shape(&id));
+        if let Some(shape) = shape.as_deref()
+            && let Some((kept, session, text_prompt)) = reusable.get(&id)
+            && kept == shape
+        {
+            let mut session = session.clone();
+            if *text_prompt {
+                let headers = composer_header_order(&conn, &id);
+                session.first_prompt = first_user_text(&conn, &id, headers.as_deref());
+                listing.text_prompts.insert(id.clone());
+            }
+            listing.shapes.insert(id, shape.to_string());
+            listing.sessions.push(session);
+            continue;
+        }
         let meta: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
         if created_ms <= 0 {
             created_ms = meta.get("createdAt").and_then(Value::as_i64).unwrap_or(0);
@@ -461,9 +678,16 @@ fn read_cursor_ide_sessions_from(db: &Path) -> Option<Vec<Session>> {
         // and parse each one once per listing.
         let headers = composer_header_order(&conn, &id);
         let header_len = headers.as_ref().map(|h| h.len() as u64).unwrap_or(0);
-        let nmsg = header_len.max(counts.get(&id).copied().unwrap_or(0));
+        let bubbles = shapes.as_ref().map_or_else(
+            || counts.get(&id).copied().unwrap_or(0),
+            |s| s.bubble_count(&id),
+        );
+        let nmsg = header_len.max(bubbles);
         if first.is_empty() && nmsg > 0 {
             first = first_user_text(&conn, &id, headers.as_deref());
+        }
+        if name.is_empty() && subtitle.is_empty() {
+            listing.text_prompts.insert(id.clone());
         }
         let ts = if updated_ms > 0 {
             updated_ms
@@ -475,7 +699,10 @@ fn read_cursor_ide_sessions_from(db: &Path) -> Option<Vec<Session>> {
         // No fabricated creation time: an absent createdAt stays unknown
         // rather than becoming the last-update time.
         let created = ms_to_iso(created_ms);
-        sessions.push(Session {
+        if let Some(shape) = shape {
+            listing.shapes.insert(id.clone(), shape);
+        }
+        listing.sessions.push(Session {
             source: "cursor-ide".into(),
             id,
             summary: name,
@@ -491,7 +718,7 @@ fn read_cursor_ide_sessions_from(db: &Path) -> Option<Vec<Session>> {
             also_ide: false,
         });
     }
-    Some(sessions)
+    Some(listing)
 }
 
 /// Enrich only unambiguous matches. Do not reorder, replace, or drop transcript
@@ -592,6 +819,50 @@ pub fn parse_cursor_ide(session: &Session) -> Vec<Message> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shapes_are_read_once_per_database_state_and_again_after_a_change() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = tmp.path().join("state.vscdb");
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE composerHeaders (composerId TEXT PRIMARY KEY, createdAt INTEGER, lastUpdatedAt INTEGER, isSubagent INTEGER, value TEXT);
+             CREATE TABLE cursorDiskKV (key TEXT PRIMARY KEY, value BLOB);
+             INSERT INTO composerHeaders VALUES ('aaaa1111-bbbb-cccc-dddd-eeeeeeeeeee1', 1, 1, 0, '{}');
+             INSERT INTO cursorDiskKV VALUES ('bubbleId:aaaa1111-bbbb-cccc-dddd-eeeeeeeeeee1:b1', '{\"type\":1,\"text\":\"hello\"}');",
+        )
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2100));
+        let first = current_shapes(&db).expect("readable");
+        let again = current_shapes(&db).expect("readable");
+        assert!(
+            std::sync::Arc::ptr_eq(&first, &again),
+            "an unchanged database is not read twice"
+        );
+        assert_eq!(
+            first.bubble_count("aaaa1111-bbbb-cccc-dddd-eeeeeeeeeee1"),
+            1
+        );
+        conn.execute_batch(
+            "INSERT INTO cursorDiskKV VALUES ('bubbleId:aaaa1111-bbbb-cccc-dddd-eeeeeeeeeee1:b2', '{\"type\":1,\"text\":\"more\"}');",
+        )
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2100));
+        let changed = current_shapes(&db).expect("readable");
+        assert!(
+            !std::sync::Arc::ptr_eq(&first, &changed),
+            "a changed database is read again"
+        );
+        assert_eq!(
+            changed.bubble_count("aaaa1111-bbbb-cccc-dddd-eeeeeeeeeee1"),
+            2
+        );
+        assert_ne!(
+            first.shape("aaaa1111-bbbb-cccc-dddd-eeeeeeeeeee1"),
+            changed.shape("aaaa1111-bbbb-cccc-dddd-eeeeeeeeeee1")
+        );
+        assert_eq!(changed.shape("absent"), "none");
+    }
     use rusqlite::Connection;
 
     fn empty_schema(conn: &Connection) {

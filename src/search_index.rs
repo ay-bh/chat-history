@@ -1,5 +1,6 @@
 //! Replaceable lexical retrieval over a disposable, incrementally refreshed index.
 //! Source transcripts remain authoritative. See docs/search-architecture.md.
+use crate::cursor_ide::ConversationShapes;
 use crate::parser::{
     cap_excerpt, clean_first_prompt, is_noise, snippet_around_match, strip_terminal_controls,
 };
@@ -15,6 +16,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::hash::BuildHasher;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 pub type SearchError = Box<dyn std::error::Error + Send + Sync>;
@@ -261,9 +263,9 @@ impl Progress {
         // The same index may be in memory and rebuilt next time, so this
         // makes no promise about later searches.
         Some(if self.terminal {
-            format!("\rUpdating search index: {done}/{total} sessions")
+            format!("\rUpdating search index: {done}/{total} changed sessions")
         } else {
-            format!("Updating search index ({total} sessions)…\n")
+            format!("Updating search index ({total} changed sessions)…\n")
         })
     }
 
@@ -423,6 +425,13 @@ struct CursorStamp {
     path: PathBuf,
     observed: Option<String>,
     digest: String,
+    /// The conversation's shape when `digest` was last known to match it.
+    #[serde(default)]
+    shape: Option<String>,
+    /// When `digest` was last hashed from the conversation's text, in
+    /// milliseconds since the epoch.
+    #[serde(default)]
+    verified: Option<u64>,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -440,7 +449,88 @@ impl Fingerprint {
     }
 }
 
-fn fingerprint(session: &Session, previous: Option<&Fingerprint>) -> Option<Fingerprint> {
+/// Conversation shapes per Cursor database, read once per sync so that the plan
+/// judges every conversation against one database state; the stamp saved with
+/// a reused digest is that snapshot's stamp, so a write landing during the plan
+/// is seen by the next search, which reloads the shapes. Re-validating on every
+/// load would re-read them once per session whenever Cursor is mid-write. A
+/// parse asks for a `refresh`, which re-reads them if the database moved on.
+#[derive(Default)]
+struct CursorShapes(Mutex<HashMap<PathBuf, Option<Arc<ConversationShapes>>>>);
+
+impl CursorShapes {
+    fn load(&self, db: &Path, refresh: bool) -> Option<Arc<ConversationShapes>> {
+        let mut map = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(loaded) = map.get(db) {
+            let stale = refresh
+                && loaded.as_ref().is_none_or(|s| {
+                    s.stamp.is_none() || s.stamp != crate::catalog::fingerprint(db, true)
+                });
+            if !stale {
+                return loaded.clone();
+            }
+        }
+        let loaded = crate::cursor_ide::current_shapes(db);
+        map.insert(db.to_path_buf(), loaded.clone());
+        loaded
+    }
+}
+
+/// A conversation Cursor updated inside this window, or whose rows are among
+/// the newest in the database, is hashed from its text whenever the database
+/// changes: its rows may be edited in place while a reply streams. Older
+/// conversations are trusted to their shape.
+const ACTIVE_WINDOW: Duration = Duration::from_secs(24 * 3600);
+/// How long a shape-trusted digest stands before the text is hashed again,
+/// plus a per-conversation share of the same length, so conversations come
+/// due a few per search rather than all at once.
+const VERIFY_INTERVAL: Duration = Duration::from_secs(3600);
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// The session changed inside [`ACTIVE_WINDOW`], or when it changed is unknown.
+fn recently_active(session: &Session, now_ms: u64) -> bool {
+    parse_any_timestamp(&session.modified)
+        .map(|t| t.timestamp_millis().max(0) as u64)
+        .is_none_or(|modified| now_ms.saturating_sub(modified) < ACTIVE_WINDOW.as_millis() as u64)
+}
+
+/// Whether the digest saved in `previous` is due to be hashed from the text
+/// again: never hashed with a shape, or older than [`VERIFY_INTERVAL`] plus
+/// this conversation's share of a second interval.
+fn verify_due(previous: &CursorStamp, id: &str, now_ms: u64) -> bool {
+    let Some(verified) = previous.verified else {
+        return true;
+    };
+    let interval = VERIFY_INTERVAL.as_millis() as u64;
+    let hash = blake3::hash(id.as_bytes());
+    let share = u64::from_le_bytes(hash.as_bytes()[..8].try_into().unwrap()) % interval;
+    now_ms.saturating_sub(verified) >= interval + share
+}
+
+/// Whether the digest saved in `previous` still describes a conversation of
+/// this `shape` without hashing its text again.
+fn digest_still_valid(
+    previous: &CursorStamp,
+    shape: &str,
+    active: bool,
+    id: &str,
+    now_ms: u64,
+) -> bool {
+    !active && previous.shape.as_deref() == Some(shape) && !verify_due(previous, id, now_ms)
+}
+
+fn fingerprint(
+    session: &Session,
+    previous: Option<&Fingerprint>,
+    shapes: &CursorShapes,
+    refresh: bool,
+) -> Option<Fingerprint> {
     let path = Path::new(&session.file);
     let sqlite = session.file.ends_with(".db") || session.file.ends_with(".vscdb");
     let ide = session.source == "cursor-ide";
@@ -457,28 +547,63 @@ fn fingerprint(session: &Session, previous: Option<&Fingerprint>) -> Option<Fing
         } else {
             crate::cursor_ide::global_vscdb()
         };
-        let (observed, digest) = match fs::metadata(&db) {
+        let previous = previous
+            .and_then(|p| p.cursor.as_ref())
+            .filter(|p| p.path == db);
+        let (observed, digest, shape, verified) = match fs::metadata(&db) {
             Ok(_) => {
-                let observed = crate::catalog::fingerprint(&db, true);
-                let cached = previous
-                    .and_then(|p| p.cursor.as_ref())
-                    .filter(|p| p.path == db && observed.is_some() && p.observed == observed);
-                if let Some(cached) = cached {
-                    (observed, cached.digest.clone())
-                } else {
-                    let digest = crate::cursor_ide::conversation_fingerprint(&db, &session.id)?;
-                    let after = crate::catalog::fingerprint(&db, true);
-                    let observed = if observed == after { observed } else { None };
-                    (observed, digest)
+                let now = now_ms();
+                let current = crate::catalog::fingerprint(&db, true);
+                match previous {
+                    // The database has not changed since this digest was saved:
+                    // one stat, no read. A digest once reused on its shape
+                    // still comes due for a hash from the text.
+                    Some(p)
+                        if current.is_some()
+                            && p.observed == current
+                            && !verify_due(p, &session.id, now) =>
+                    {
+                        (current, p.digest.clone(), p.shape.clone(), p.verified)
+                    }
+                    _ => {
+                        let shapes = shapes.load(&db, refresh);
+                        let observed = shapes.as_ref().and_then(|s| s.stamp.clone());
+                        let shape = shapes.as_ref().map(|s| s.shape(&session.id));
+                        match previous {
+                            // The database changed, but this conversation's rows did not.
+                            Some(p)
+                                if shape.as_deref().is_some_and(|s| {
+                                    let active = recently_active(session, now)
+                                        || shapes
+                                            .as_ref()
+                                            .is_some_and(|s| s.recently_written(&session.id));
+                                    digest_still_valid(p, s, active, &session.id, now)
+                                }) =>
+                            {
+                                (observed, p.digest.clone(), shape, p.verified)
+                            }
+                            _ => {
+                                let digest =
+                                    crate::cursor_ide::conversation_fingerprint(&db, &session.id)?;
+                                let after = crate::catalog::fingerprint(&db, true);
+                                let observed = if observed == after { observed } else { None };
+                                (observed, digest, shape, Some(now))
+                            }
+                        }
+                    }
                 }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound && !ide => (None, "missing".into()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && !ide => {
+                (None, "missing".into(), None, None)
+            }
             Err(_) => return None,
         };
         Some(CursorStamp {
             path: db,
             observed,
             digest,
+            shape,
+            verified,
         })
     } else {
         None
@@ -644,6 +769,7 @@ impl Bm25Backend {
     ) -> Result<SyncStats> {
         let live: HashSet<String> = corpus.iter().map(session_key).collect();
         let existing = read_existing(&self.conn)?;
+        let shapes = CursorShapes::default();
         let fingerprints: HashMap<_, Fingerprint> = existing
             .iter()
             .filter_map(|(k, v)| serde_json::from_str(v).ok().map(|s| (k.clone(), s)))
@@ -653,7 +779,7 @@ impl Bm25Backend {
             .map(|session| {
                 let key = session_key(session);
                 let previous = fingerprints.get(&key);
-                let before = fingerprint(session, previous);
+                let before = fingerprint(session, previous, &shapes, false);
                 let skip = !rebuild
                     && match (before.as_ref(), previous) {
                         (Some(now), Some(then)) => now.matches(then),
@@ -731,7 +857,8 @@ impl Bm25Backend {
         let order = std::collections::hash_map::RandomState::new();
         let mut todo = todo;
         todo.sort_by_cached_key(|&i| order.hash_one(&plan[i].0));
-        let mut done = stats.unchanged;
+        let refreshing = todo.len();
+        let mut refreshed = 0;
         let source_bytes = |i: usize| {
             let size = fs::metadata(&corpus[i].file).map(|m| m.len()).unwrap_or(0);
             if corpus[i].source == "cursor-ide" || corpus[i].is_cursor_store_only() {
@@ -746,7 +873,7 @@ impl Bm25Backend {
                 let current = current_fingerprint(&self.conn, &plan[i].0)?;
                 if published_elsewhere(&current, existing.get(&plan[i].0), plan[i].1.as_ref()) {
                     stats.unchanged += 1;
-                    done += 1;
+                    refreshed += 1;
                 } else {
                     need.push(i);
                 }
@@ -757,7 +884,7 @@ impl Bm25Backend {
                     let session = &corpus[i];
                     let before = plan[i].1.clone();
                     let (messages, _) = parse_session_recovering_timestamps(session, false);
-                    let after = fingerprint(session, before.as_ref());
+                    let after = fingerprint(session, before.as_ref(), &shapes, true);
                     (i, extract_session(session, before, messages, after))
                 })
                 .collect();
@@ -770,14 +897,14 @@ impl Bm25Backend {
                     && matches!(stored_rows(&self.conn, key, &extracted)?, Stored::Identical)
                 {
                     stats.unchanged += 1;
-                    done += 1;
-                    progress(done, corpus.len());
+                    refreshed += 1;
+                    progress(refreshed, refreshing);
                 } else {
                     writes.push((i, stamp, extracted, current));
                 }
             }
             if writes.is_empty() {
-                progress(done, corpus.len());
+                progress(refreshed, refreshing);
                 continue;
             }
             let tx = begin_immediate(&self.conn)?;
@@ -804,8 +931,8 @@ impl Bm25Backend {
                     )?;
                     stats.updated += 1;
                 }
-                done += 1;
-                progress(done, corpus.len());
+                refreshed += 1;
+                progress(refreshed, refreshing);
             }
             tx.commit()?;
         }
@@ -1627,6 +1754,53 @@ mod tests {
     use super::{grouped_message_oversample, match_query};
 
     #[test]
+    fn a_cursor_digest_is_trusted_to_its_shape_until_its_check_is_due() {
+        let stamp = super::CursorStamp {
+            path: "state.vscdb".into(),
+            observed: None,
+            digest: "digest".into(),
+            shape: Some("3@17/9:120/abcd".into()),
+            verified: Some(1_000_000),
+        };
+        let soon = 1_000_000 + 60_000;
+        let valid = |stamp: &super::CursorStamp, shape: &str, active: bool, now: u64| {
+            super::digest_still_valid(stamp, shape, active, "conversation", now)
+        };
+        assert!(valid(&stamp, "3@17/9:120/abcd", false, soon));
+        assert!(!valid(&stamp, "4@18/9:120/abcd", false, soon), "a new row");
+        assert!(
+            !valid(&stamp, "3@17/9:121/abcd", false, soon),
+            "a longer composerData"
+        );
+        assert!(
+            !valid(&stamp, "3@17/9:120/ef01", false, soon),
+            "a changed header"
+        );
+        assert!(
+            !valid(&stamp, "3@17/9:120/abcd", true, soon),
+            "an active conversation"
+        );
+        let late = 1_000_000 + 2 * super::VERIFY_INTERVAL.as_millis() as u64;
+        assert!(
+            !valid(&stamp, "3@17/9:120/abcd", false, late),
+            "the periodic check is due"
+        );
+        let unverified = super::CursorStamp {
+            verified: None,
+            ..stamp.clone()
+        };
+        assert!(
+            !valid(&unverified, "3@17/9:120/abcd", false, soon),
+            "a stamp from an index that never hashed with a shape"
+        );
+        let shapeless = super::CursorStamp {
+            shape: None,
+            ..stamp
+        };
+        assert!(!valid(&shapeless, "3@17/9:120/abcd", false, soon));
+    }
+
+    #[test]
     fn progress_off_a_terminal_is_one_line_and_only_when_slow() {
         let start = Instant::now();
         let mut p = Progress::starting_at(false, start);
@@ -1638,7 +1812,7 @@ mod tests {
         let first = p.tick(40, 100, start + Duration::from_millis(800));
         assert_eq!(
             first.as_deref(),
-            Some("Updating search index (100 sessions)…\n")
+            Some("Updating search index (100 changed sessions)…\n")
         );
         assert_eq!(p.tick(70, 100, start + Duration::from_secs(3)), None);
         assert_eq!(p.tick(99, 100, start + Duration::from_secs(9)), None);
@@ -1654,13 +1828,13 @@ mod tests {
         assert_eq!(
             p.tick(40, 100, start + Duration::from_millis(800))
                 .as_deref(),
-            Some("\rUpdating search index: 40/100 sessions")
+            Some("\rUpdating search index: 40/100 changed sessions")
         );
         assert_eq!(p.tick(41, 100, start + Duration::from_millis(900)), None);
         assert_eq!(
             p.tick(90, 100, start + Duration::from_millis(1600))
                 .as_deref(),
-            Some("\rUpdating search index: 90/100 sessions")
+            Some("\rUpdating search index: 90/100 changed sessions")
         );
         assert_eq!(p.finish().as_deref(), Some("\r\x1b[2K"));
     }
