@@ -124,14 +124,10 @@ fn ensure_skills_runs_on_normal_invocation() {
         .env_remove("CODEX_HOME")
         .assert()
         .success();
+    assert!(tmp.path().join(".claude/skills/history/SKILL.md").exists());
     assert!(
         tmp.path()
-            .join(".claude/skills/chat-history/SKILL.md")
-            .exists()
-    );
-    assert!(
-        tmp.path()
-            .join(".claude/skills/chat-history/.chat-history-managed")
+            .join(".claude/skills/history/.chat-history-managed")
             .exists()
     );
 }
@@ -240,11 +236,7 @@ fn skill_targets_honor_userprofile_without_home() {
         .assert()
         .success()
         .stdout(predicate::str::contains("installed"));
-    assert!(
-        tmp.path()
-            .join(".claude/skills/chat-history/SKILL.md")
-            .exists()
-    );
+    assert!(tmp.path().join(".claude/skills/history/SKILL.md").exists());
 }
 
 #[test]

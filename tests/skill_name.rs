@@ -34,8 +34,16 @@ fn managed_old_copy(dir: &Path, text: &str) {
     .unwrap();
 }
 
+/// What 0.8 installed: the same managed copy in three places.
+fn old_layout(h: &Path) {
+    let old = "---\nname: chat-history\ndescription: old\n---\nold skill\n";
+    for root in [".claude/skills", ".cursor/skills", ".codex/skills"] {
+        managed_old_copy(&h.join(root).join("chat-history"), old);
+    }
+}
+
 #[test]
-fn a_fresh_install_is_named_history_in_two_places_with_a_name_only_stub() {
+fn a_fresh_install_is_named_history_in_two_places_without_the_old_name() {
     let home = TempDir::new().unwrap();
     let h = home.path();
     cmd(h).arg("install-skill").assert().success();
@@ -43,16 +51,11 @@ fn a_fresh_install_is_named_history_in_two_places_with_a_name_only_stub() {
         let skill = read(h.join(root).join("history/SKILL.md"));
         assert!(skill.contains("\nname: history\n"), "{root}: {skill}");
         assert!(!skill.contains("disable-model-invocation"));
-        let stub = read(h.join(root).join("chat-history/SKILL.md"));
-        assert!(stub.contains("\nname: chat-history\n"), "{stub}");
-        assert!(stub.contains("disable-model-invocation: true"), "{stub}");
-        assert!(stub.contains("deprecated"), "{stub}");
-        assert!(stub.contains("/history"), "{stub}");
+        assert!(
+            !h.join(root).join("chat-history").exists(),
+            "a new user never had /chat-history, so no stub"
+        );
     }
-    assert!(
-        read(h.join(".agents/skills/chat-history/agents/openai.yaml"))
-            .contains("allow_implicit_invocation: false")
-    );
     assert!(
         !h.join(".cursor/skills").exists(),
         "Cursor reads ~/.agents/skills"
@@ -83,9 +86,24 @@ fn an_upgrade_retires_old_managed_copies_and_leaves_edited_ones() {
     cmd(h).args(["--from", "today"]).assert().success();
 
     assert!(read(h.join(".claude/skills/history/SKILL.md")).contains("name: history"));
+    for root in [".claude/skills", ".agents/skills"] {
+        let stub = read(h.join(root).join("chat-history/SKILL.md"));
+        assert!(stub.contains("\nname: chat-history\n"), "{stub}");
+        assert!(stub.contains("disable-model-invocation: true"), "{stub}");
+        assert!(stub.contains("deprecated"), "{stub}");
+        assert!(stub.contains("/history"), "{stub}");
+        for stub_root in [".claude/skills", ".agents/skills"] {
+            let folder = h.join(stub_root).join("chat-history");
+            assert!(
+                stub.contains(folder.to_str().unwrap()),
+                "the stub offers to delete {}: {stub}",
+                folder.display()
+            );
+        }
+    }
     assert!(
-        read(h.join(".claude/skills/chat-history/SKILL.md")).contains("deprecated"),
-        "our old copy became the stub"
+        read(h.join(".agents/skills/chat-history/agents/openai.yaml"))
+            .contains("allow_implicit_invocation: false")
     );
     assert!(
         !h.join(".codex/skills/chat-history").exists(),
@@ -102,6 +120,7 @@ fn an_upgrade_retires_old_managed_copies_and_leaves_edited_ones() {
 fn the_user_can_choose_the_name_and_it_survives_upgrades() {
     let home = TempDir::new().unwrap();
     let h = home.path();
+    old_layout(h);
     cmd(h).arg("install-skill").assert().success();
     cmd(h)
         .args(["install-skill", "--name", "past-chats"])
@@ -162,4 +181,30 @@ fn names_that_break_the_rules_or_shadow_a_built_in_command_are_refused() {
             .stderr(predicate::str::contains(bad));
     }
     assert!(!h.join(".claude/skills").exists(), "nothing was written");
+}
+
+#[test]
+fn a_deleted_stub_stays_deleted() {
+    let home = TempDir::new().unwrap();
+    let h = home.path();
+    old_layout(h);
+    cmd(h).args(["--from", "today"]).assert().success();
+    assert!(
+        h.join(".claude/skills/chat-history/SKILL.md").exists(),
+        "stub installed"
+    );
+    // What the stub offers to do when the user agrees.
+    fs::remove_dir_all(h.join(".claude/skills/chat-history")).unwrap();
+    fs::remove_dir_all(h.join(".agents/skills/chat-history")).unwrap();
+    cmd(h).args(["--from", "today"]).assert().success();
+    cmd(h).arg("install-skill").assert().success();
+    assert!(
+        !h.join(".claude/skills/chat-history").exists(),
+        "not put back"
+    );
+    assert!(
+        !h.join(".agents/skills/chat-history").exists(),
+        "not put back"
+    );
+    assert!(h.join(".claude/skills/history/SKILL.md").exists());
 }

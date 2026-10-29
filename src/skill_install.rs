@@ -226,9 +226,15 @@ fn skill_content(name: &str) -> String {
     out
 }
 
-/// The deprecated `chat-history` skill: only runs when typed, says it was
-/// renamed, then hands over to the skill under its current name.
-fn stub_content(name: &str, skill: &Path) -> String {
+/// The deprecated `chat-history` skill: only runs when typed. It does what
+/// was asked through the skill under its current name, then offers to remove
+/// the old name; once the user deletes the stub folders it is not put back.
+fn stub_content(name: &str, skill: &Path, stub_dirs: &[PathBuf]) -> String {
+    let dirs = stub_dirs
+        .iter()
+        .map(|d| d.display().to_string())
+        .collect::<Vec<_>>()
+        .join(" and ");
     format!(
         "---\n\
          name: {LEGACY_NAME}\n\
@@ -238,9 +244,11 @@ fn stub_content(name: &str, skill: &Path) -> String {
          \n\
          # /{LEGACY_NAME} is deprecated\n\
          \n\
-         This skill was renamed. First tell the user, in one short line: \
-         \"/{LEGACY_NAME} is deprecated; use /{name} (in Codex, ${name}).\" \
-         Then do what they asked by following the {name} skill: read {} and use it as your instructions.\n",
+         This skill was renamed to {name}. /{name} (in Codex, ${name}) is the same skill and loads it directly.\n\
+         \n\
+         1. Do what the user asked by following the {name} skill: read {} and use it as your instructions.\n\
+         2. When that is done, tell the user in one short line that /{LEGACY_NAME} is deprecated and /{name} is the same skill under a shorter name, and ask whether to remove the old name.\n\
+         3. Only if they agree, delete {dirs}. These folders hold only files chat-history installed, and they are not reinstalled afterwards.\n",
         skill.display()
     )
 }
@@ -270,13 +278,32 @@ fn roots() -> Vec<(PathBuf, &'static str)> {
 }
 
 fn copies(name: &str) -> Vec<Copy> {
+    // The stub is for people who used /chat-history: it is created only where
+    // an old copy is being replaced (Codex and Cursor read ~/.agents/skills,
+    // so their old copies count for it) and afterwards only refreshed, so a
+    // stub the user deleted stays deleted. New users never get one.
+    let had_old = old_locations().iter().any(|d| skill_path(d).exists());
+    let stub_roots: Vec<(PathBuf, &'static str)> = if name == LEGACY_NAME {
+        Vec::new()
+    } else {
+        roots()
+            .into_iter()
+            .filter(|(root, label)| {
+                skill_path(&root.join(LEGACY_NAME)).exists() || (*label != "Claude Code" && had_old)
+            })
+            .collect()
+    };
+    let stub_dirs: Vec<PathBuf> = stub_roots
+        .iter()
+        .map(|(r, _)| r.join(LEGACY_NAME))
+        .collect();
     let mut out = Vec::new();
     for (root, label) in roots() {
         let skill_dir = root.join(name);
-        if name != LEGACY_NAME {
+        if stub_roots.iter().any(|(r, _)| *r == root) {
             out.push(Copy {
                 dir: root.join(LEGACY_NAME),
-                content: stub_content(name, &skill_path(&skill_dir)),
+                content: stub_content(name, &skill_path(&skill_dir), &stub_dirs),
                 extra: (label != "Claude Code").then_some(("agents/openai.yaml", STUB_OPENAI_YAML)),
                 label,
             });
