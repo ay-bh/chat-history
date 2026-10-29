@@ -116,6 +116,13 @@ same-size edit with a restored mtime can require `--rebuild-index` there.
 Fingerprints are versioned objects; older serialized arrays trigger a one-time
 conservative refresh.
 
+A transcript modified inside that window is still being written. If the index
+already holds it, its rows are kept as they are and it is parsed again by the
+next sync that finds it quiet; a transcript the index has never seen is indexed
+at once. The calling conversation is always in this state, because its harness
+appends the search command to it just before running it, so a search never
+re-parses the conversation it runs in.
+
 **Cursor's shared database.** Each conversation depends on a BLAKE3 digest of
 its raw bubble, composer-data and composer-header rows, read in one SQLite
 snapshot. Indexed range and point queries stream those values without

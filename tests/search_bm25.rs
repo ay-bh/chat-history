@@ -807,6 +807,9 @@ fn persistent_index_refreshes_edits_metadata_deletions_and_rebuilds() {
         &["Updated uniqueafter message for cache verification."],
     );
     corpus[0].summary = "Renamed uniquetitle".into();
+    // A transcript written moments ago is left alone until it is quiet.
+    assert_eq!(index.sync(&corpus, false).unwrap().unchanged, 1);
+    std::thread::sleep(std::time::Duration::from_millis(2100));
     assert_eq!(index.sync(&corpus, false).unwrap().updated, 1);
     assert!(search(&mut index, &corpus, "uniquebefore", 10).is_empty());
     assert!(!search(&mut index, &corpus, "uniqueafter", 10).is_empty());
@@ -1311,6 +1314,7 @@ fn locked_cache_uses_ephemeral_bm25_and_preserves_json() {
             .join("projects/demo/11111111-2222-3333-4444-555555555555.jsonl"),
         &["Investigate uniquecli authentication failures during login. extra uniquecli refresh"],
     );
+    std::thread::sleep(std::time::Duration::from_millis(2100));
     let conn =
         rusqlite::Connection::open(tmp.path().join(".chat-history/cache").join(INDEX_FILENAME))
             .unwrap();

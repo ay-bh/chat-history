@@ -496,6 +496,13 @@ fn fingerprint(session: &Session, previous: Option<&Fingerprint>) -> Option<Fing
     })
 }
 
+/// The transcript, or for IDE rows the shared database, was modified inside
+/// the racy window.
+fn still_written(session: &Session) -> bool {
+    let sqlite = session.file.ends_with(".db") || session.file.ends_with(".vscdb");
+    crate::catalog::recently_written(Path::new(&session.file), sqlite)
+}
+
 impl Bm25Backend {
     /// None builds an ephemeral index with identical ranking semantics.
     pub fn open(directory: Option<&Path>) -> Result<Self> {
@@ -648,10 +655,21 @@ impl Bm25Backend {
                 let previous = fingerprints.get(&key);
                 let before = fingerprint(session, previous);
                 let skip = !rebuild
-                    && before
-                        .as_ref()
-                        .zip(previous)
-                        .is_some_and(|(a, b)| a.matches(b));
+                    && match (before.as_ref(), previous) {
+                        (Some(now), Some(then)) => now.matches(then),
+                        // The file was modified moments ago and is still being
+                        // written (the calling conversation always is, its
+                        // harness appends the search command just before
+                        // running it). Keep the rows it already has and parse
+                        // it on the next sync that finds it quiet, rather than
+                        // re-parsing it on every search. A stamp missing for
+                        // any other reason, such as an unreadable Cursor
+                        // database, still gets the parse and retry it always had.
+                        (None, Some(then)) => {
+                            then.version == EXTRACTION_VERSION && still_written(session)
+                        }
+                        (_, None) => false,
+                    };
                 (key, before, !skip)
             })
             .collect();

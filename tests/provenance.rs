@@ -589,6 +589,8 @@ fn an_appended_transcript_adds_rows_to_the_index_instead_of_rewriting_it() {
     // the in-place refresh of the synthetic rows is exercised as well.
     std::thread::sleep(std::time::Duration::from_millis(1100));
     append_claude(tmp.path(), ID_A, "pelican appendeduniquetoken follow-up");
+    // Picked up once the transcript has been quiet for the racy window.
+    std::thread::sleep(std::time::Duration::from_millis(2100));
     assert_eq!(
         session_ids(&search(&tmp, "appendeduniquetoken")),
         vec![ID_A.to_owned()]
@@ -619,6 +621,7 @@ fn a_rewritten_transcript_is_still_replaced_whole() {
             json!("rewrittenuniquetoken replaces the old transcript"),
         )],
     );
+    std::thread::sleep(std::time::Duration::from_millis(2100));
     assert_eq!(
         session_ids(&search(&tmp, "rewrittenuniquetoken")),
         vec![ID_A.to_owned()]
@@ -628,6 +631,54 @@ fn a_rewritten_transcript_is_still_replaced_whole() {
         stored_messages(&tmp, ID_A).len(),
         3,
         "title, prompt, one message"
+    );
+}
+
+#[test]
+fn a_transcript_written_moments_ago_keeps_its_rows_until_it_is_quiet() {
+    // A transcript modified inside the racy window is still being written;
+    // the calling conversation always is, because its harness appends the
+    // search command to it just before running it. Its indexed rows are
+    // left as they are and it is parsed again once it has been quiet.
+    let tmp = fixture();
+    search(&tmp, "pelican");
+    std::thread::sleep(std::time::Duration::from_millis(2100));
+    search(&tmp, "pelican");
+    let before = stored_messages(&tmp, ID_A);
+    append_claude(
+        tmp.path(),
+        ID_A,
+        "pelican freshuniquetoken written just now",
+    );
+    assert!(session_ids(&search(&tmp, "freshuniquetoken")).is_empty());
+    assert_eq!(
+        stored_messages(&tmp, ID_A),
+        before,
+        "rows changed while written"
+    );
+    std::thread::sleep(std::time::Duration::from_millis(2100));
+    assert_eq!(
+        session_ids(&search(&tmp, "freshuniquetoken")),
+        vec![ID_A.to_owned()]
+    );
+    assert_eq!(stored_messages(&tmp, ID_A).len(), before.len() + 1);
+}
+
+#[test]
+fn a_transcript_new_to_the_index_is_indexed_even_while_written() {
+    // Same-day discovery must not wait: a session the index has never seen
+    // is indexed at once, even inside the racy window.
+    let tmp = fixture();
+    search(&tmp, "pelican");
+    let id = "eeeeeeee-1111-2222-3333-eeeeeeeeeeee";
+    write_claude(
+        tmp.path(),
+        id,
+        vec![("user", json!("a brand new heronuniquetoken session"))],
+    );
+    assert_eq!(
+        session_ids(&search(&tmp, "heronuniquetoken")),
+        vec![id.to_owned()]
     );
 }
 
@@ -670,6 +721,7 @@ fn ranking_from_the_calling_session_does_not_depend_on_cache_history() {
     for i in 0..20 {
         append_claude(tmp.path(), ID_A, &format!("more albatross talk {i}"));
     }
+    std::thread::sleep(std::time::Duration::from_millis(2100));
     let grown = from_a(&["--limit", "1"]);
     assert_eq!(
         grown,
