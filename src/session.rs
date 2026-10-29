@@ -766,16 +766,42 @@ thread_local! {
 
 type Subdirectories = std::rc::Rc<Vec<(String, PathBuf)>>;
 
-/// The subdirectories of `dir`, read once per process. Every Cursor project
-/// slug is decoded from `/` down and they share most of their path, so
-/// without this each slug re-read (and stat'ed every entry of) the home
-/// directory and its parents again.
-fn subdirectories(dir: &Path) -> Subdirectories {
-    thread_local! {
-        static READ: std::cell::RefCell<HashMap<PathBuf, Subdirectories>> =
-            std::cell::RefCell::new(HashMap::new());
+thread_local! {
+    /// Directory listings shared by the slug decodes of one discovery pass.
+    static LISTINGS: std::cell::RefCell<Option<HashMap<PathBuf, Subdirectories>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f` with directory listings shared between its slug decodes. Every
+/// Cursor project slug is decoded from `/` down and they share most of their
+/// path, so without this each slug re-read (and stat'ed every entry of) the
+/// home directory and its parents again. Outside such a pass every decode
+/// reads the directories as they are.
+fn with_directory_listings<T>(f: impl FnOnce() -> T) -> T {
+    struct Reset(bool);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            if self.0 {
+                LISTINGS.with(|l| *l.borrow_mut() = None);
+            }
+        }
     }
-    if let Some(found) = READ.with(|read| read.borrow().get(dir).cloned()) {
+    let outermost = LISTINGS.with(|l| {
+        let mut l = l.borrow_mut();
+        let outermost = l.is_none();
+        if outermost {
+            *l = Some(HashMap::new());
+        }
+        outermost
+    });
+    let _reset = Reset(outermost);
+    f()
+}
+
+/// The subdirectories of `dir`, from the current pass's listings if there is
+/// one (see [`with_directory_listings`]).
+fn subdirectories(dir: &Path) -> Subdirectories {
+    if let Some(found) = LISTINGS.with(|l| l.borrow().as_ref().and_then(|m| m.get(dir).cloned())) {
         return found;
     }
     #[cfg(test)]
@@ -794,7 +820,11 @@ fn subdirectories(dir: &Path) -> Subdirectories {
             })
             .unwrap_or_default(),
     );
-    READ.with(|read| read.borrow_mut().insert(dir.to_path_buf(), found.clone()));
+    LISTINGS.with(|l| {
+        if let Some(m) = l.borrow_mut().as_mut() {
+            m.insert(dir.to_path_buf(), found.clone());
+        }
+    });
     found
 }
 
@@ -830,6 +860,10 @@ pub fn load_cursor_sessions() -> Vec<Session> {
 }
 
 fn load_cursor_transcripts() -> Vec<Session> {
+    with_directory_listings(load_cursor_transcripts_in_pass)
+}
+
+fn load_cursor_transcripts_in_pass() -> Vec<Session> {
     let base = cursor_projects_dir();
     if !base.exists() {
         return Vec::new();
@@ -2447,23 +2481,31 @@ mod tests {
     }
 
     #[test]
-    fn decoding_slugs_that_share_parents_lists_each_directory_once() {
+    fn decoding_slugs_that_share_parents_lists_each_directory_once_per_pass() {
         let root = tempfile::TempDir::new().unwrap();
         for d in ["work/b-c", "work/d", "work/e"] {
             std::fs::create_dir_all(root.path().join(d)).unwrap();
         }
         let before = LISTED.with(|n| n.get());
-        for slug in ["work-b-c", "work-d", "work-e"] {
-            assert!(matches!(
-                decode_from_root(root.path(), slug),
-                WorkspaceResolution::Exact(_)
-            ));
-        }
+        with_directory_listings(|| {
+            for slug in ["work-b-c", "work-d", "work-e"] {
+                assert!(matches!(
+                    decode_from_root(root.path(), slug),
+                    WorkspaceResolution::Exact(_)
+                ));
+            }
+        });
         assert_eq!(
             LISTED.with(|n| n.get()) - before,
             2,
-            "the root and work/ are read once, not once per slug"
+            "the root and work/ are read once within a pass, not once per slug"
         );
+        // Outside a pass every decode sees the directory as it is now.
+        std::fs::create_dir_all(root.path().join("work/f")).unwrap();
+        assert!(matches!(
+            decode_from_root(root.path(), "work-f"),
+            WorkspaceResolution::Exact(_)
+        ));
     }
 
     #[test]
