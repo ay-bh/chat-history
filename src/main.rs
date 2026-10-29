@@ -231,6 +231,11 @@ enum Commands {
         /// Overwrite existing skills even if they were user-edited
         #[arg(long)]
         force: bool,
+        /// Name to install the skill under (default: history); remembered
+        /// for later upgrades. Typed as /NAME in Claude Code and Cursor,
+        /// $NAME in Codex.
+        #[arg(long, value_name = "NAME")]
+        name: Option<String>,
     },
     /// Generate shell completions (bash, zsh, fish, elvish, powershell)
     Completions {
@@ -438,8 +443,8 @@ fn main() {
         return;
     }
 
-    if let Some(Commands::InstallSkill { force }) = &cli.command {
-        install_skill(*force);
+    if let Some(Commands::InstallSkill { force, name }) = &cli.command {
+        install_skill(*force, name.as_deref());
         return;
     }
 

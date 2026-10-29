@@ -103,26 +103,15 @@ fn install_skill_creates_files() {
         .assert()
         .success()
         .stdout(predicate::str::contains("installed"));
-    assert!(
-        tmp.path()
-            .join(".claude/skills/chat-history/SKILL.md")
-            .exists()
-    );
-    assert!(
-        tmp.path()
-            .join(".claude/skills/chat-history/.chat-history-managed")
-            .exists()
-    );
-    assert!(
-        tmp.path()
-            .join(".cursor/skills/chat-history/SKILL.md")
-            .exists()
-    );
-    assert!(
-        tmp.path()
-            .join(".codex/skills/chat-history/SKILL.md")
-            .exists()
-    );
+    for root in [".claude/skills", ".agents/skills"] {
+        assert!(tmp.path().join(root).join("history/SKILL.md").exists());
+        assert!(
+            tmp.path()
+                .join(root)
+                .join("history/.chat-history-managed")
+                .exists()
+        );
+    }
 }
 
 #[test]
@@ -438,12 +427,9 @@ fn empty_codex_home_is_treated_as_unset() {
         .env("CODEX_HOME", "")
         .assert()
         .success();
-    // Falls back to ~/.codex instead of a cwd-relative skills/ directory.
-    assert!(
-        tmp.path()
-            .join(".codex/skills/chat-history/SKILL.md")
-            .exists()
-    );
+    // Codex reads ~/.agents/skills; an empty CODEX_HOME never makes a
+    // cwd-relative skills/ directory.
+    assert!(tmp.path().join(".agents/skills/history/SKILL.md").exists());
     assert!(!cwd.path().join("skills").exists());
 }
 

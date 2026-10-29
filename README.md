@@ -16,19 +16,23 @@ cargo install chat-history
 
 `cargo install` puts `chat-history` and `ch` on `PATH` (`~/.cargo/bin/`).
 
-The first time you run `chat-history` / `ch`, it quietly installs the bundled agent skill to:
+The first time you run `chat-history` / `ch`, it quietly installs the bundled agent skill as `history`:
 
-- `~/.claude/skills/chat-history/SKILL.md`
-- `$CODEX_HOME/skills/chat-history/SKILL.md` (or `~/.codex/...`)
-- `~/.cursor/skills/chat-history/SKILL.md`
+- `~/.claude/skills/history/SKILL.md` for Claude Code, typed as `/history`
+- `~/.agents/skills/history/SKILL.md` for Codex (typed as `$history`) and Cursor (`/history`); both read this shared location
 
-On Windows, the same paths are under `%USERPROFILE%`. Later CLI upgrades refresh **managed** copies automatically (those written by this CLI, tracked via a `.chat-history-managed` sidecar). User-edited skills are left alone. Skills installed by older versions without that sidecar are left alone by the quiet path — run `install-skill` once after upgrading to adopt them.
+To use another name, run `chat-history install-skill --name <name>` (1-64 lowercase letters, digits and single hyphens; Claude Code's built-in command names such as `resume` or `export` are refused because a skill would silently replace them). The name is remembered in `~/.chat-history/skill-name`, so later upgrades keep it, and copies under the previous name are removed.
+
+The skill was called `chat-history` up to 0.8. A `chat-history` stub stays installed so `/chat-history` (`$chat-history` in Codex) still works: it says the name is deprecated and then runs the skill under its current name. It only runs when typed, never on its own. Copies that 0.8 wrote to `~/.cursor/skills/chat-history` and `$CODEX_HOME/skills/chat-history` (Codex has deprecated that folder) are removed on upgrade.
+
+On Windows, the same paths are under `%USERPROFILE%`. Later CLI upgrades refresh **managed** copies automatically (those written by this CLI, tracked via a `.chat-history-managed` sidecar) and remove only managed copies nobody edited. User-edited skills are left alone. Skills installed by older versions without that sidecar are left alone by the quiet path — run `install-skill` once after upgrading to adopt them.
 
 Optional explicit install / reinstall:
 
 ```bash
-chat-history install-skill           # refresh managed + adopt legacy (pre-sidecar) installs
-chat-history install-skill --force   # overwrite even user-edited skills
+chat-history install-skill                    # refresh managed + adopt legacy (pre-sidecar) installs
+chat-history install-skill --name past-chats  # install under another name
+chat-history install-skill --force            # overwrite even user-edited skills
 ```
 
 The skill is active immediately — no restart needed.
