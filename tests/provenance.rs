@@ -541,3 +541,144 @@ fn a_tool_result_without_text_keeps_its_position() {
         vec![(ID_A.to_owned(), "assistant".to_owned(), Some(3))]
     );
 }
+
+/// The stored messages of a session in the on-disk BM25 index, as
+/// (rowid, payload) pairs in ordinal order.
+fn stored_messages(tmp: &TempDir, id: &str) -> Vec<(i64, String)> {
+    let conn = rusqlite::Connection::open(tmp.path().join("cache/search-v3.db")).unwrap();
+    let mut stmt = conn
+        .prepare("SELECT id, payload FROM messages WHERE session_key LIKE ?1 ORDER BY ordinal")
+        .unwrap();
+    stmt.query_map([format!("%{id}%")], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+}
+
+/// Appends one user message to a Claude transcript written by `write_claude`.
+fn append_claude(root: &Path, id: &str, text: &str) {
+    let path = root
+        .join(".claude/projects/-Users-test-proj")
+        .join(format!("{id}.jsonl"));
+    let mut content = fs::read_to_string(&path).unwrap();
+    let lines = content.lines().count();
+    content.push('\n');
+    content.push_str(&claude_record(id, lines, "user", json!(text)));
+    fs::write(&path, content).unwrap();
+}
+
+#[test]
+fn an_appended_transcript_adds_rows_to_the_index_instead_of_rewriting_it() {
+    // Active transcripts only ever grow. Re-indexing one meant deleting and
+    // reinserting every message; the new messages are appended instead and
+    // the stored rows keep their ids.
+    let tmp = fixture();
+    search(&tmp, "pelican");
+    let before = stored_messages(&tmp, ID_A);
+    assert!(before.len() > 2, "{before:?}");
+    // Another session indexed after A, so a delete-and-reinsert of A could
+    // not get its old rowids back.
+    write_claude(
+        tmp.path(),
+        "eeeeeeee-1111-2222-3333-eeeeeeeeeeee",
+        vec![("user", json!("a later session about herons"))],
+    );
+    search(&tmp, "herons");
+    assert_eq!(stored_messages(&tmp, ID_A), before);
+    // A later modification second, so the title row's timestamp changes and
+    // the in-place refresh of the synthetic rows is exercised as well.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    append_claude(tmp.path(), ID_A, "pelican appendeduniquetoken follow-up");
+    assert_eq!(
+        session_ids(&search(&tmp, "appendeduniquetoken")),
+        vec![ID_A.to_owned()]
+    );
+    let after = stored_messages(&tmp, ID_A);
+    assert_eq!(after.len(), before.len() + 1, "{after:?}");
+    let ids = |rows: &[(i64, String)]| rows.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+    assert_eq!(
+        ids(&after[..before.len()]),
+        ids(&before),
+        "stored rows were rewritten"
+    );
+    // The title and prompt rows (ordinals 0 and 1) carry the transcript's
+    // modification time and may be refreshed in place; messages are untouched.
+    assert_eq!(&after[2..before.len()], &before[2..]);
+    assert!(after[before.len()].1.contains("appendeduniquetoken"));
+}
+
+#[test]
+fn a_rewritten_transcript_is_still_replaced_whole() {
+    let tmp = fixture();
+    search(&tmp, "pelican");
+    write_claude(
+        tmp.path(),
+        ID_A,
+        vec![(
+            "user",
+            json!("rewrittenuniquetoken replaces the old transcript"),
+        )],
+    );
+    assert_eq!(
+        session_ids(&search(&tmp, "rewrittenuniquetoken")),
+        vec![ID_A.to_owned()]
+    );
+    assert!(!session_ids(&search(&tmp, "pelican")).contains(&ID_A.to_owned()));
+    assert_eq!(
+        stored_messages(&tmp, ID_A).len(),
+        3,
+        "title, prompt, one message"
+    );
+}
+
+#[test]
+fn ranking_from_the_calling_session_does_not_depend_on_cache_history() {
+    // BM25 weights come from the whole index, so the index must hold the
+    // same rows whether it is fresh, warm, rebuilt or in memory, including
+    // after the calling transcript has grown.
+    let tmp = TempDir::new().unwrap();
+    write_claude(
+        tmp.path(),
+        ID_A,
+        (0..40)
+            .map(|i| ("user", json!(format!("albatross discussion number {i}"))))
+            .collect(),
+    );
+    write_claude(
+        tmp.path(),
+        ID_B,
+        vec![("user", json!("albatross reference notes"))],
+    );
+    write_claude(
+        tmp.path(),
+        ID_C,
+        vec![("user", json!("pelican reference notes"))],
+    );
+    let from_a = |extra: &[&str]| {
+        let mut inside = cmd(&tmp);
+        inside.env("CLAUDE_CODE_SESSION_ID", ID_A);
+        session_ids(&search_with(inside, "albatross pelican", extra))
+    };
+    let cold = from_a(&["--limit", "1"]);
+    search(&tmp, "albatross pelican");
+    assert_eq!(cold, from_a(&["--limit", "1"]), "cold vs warm cache");
+    assert_eq!(
+        cold,
+        from_a(&["--limit", "1", "--no-cache"]),
+        "vs in-memory"
+    );
+    for i in 0..20 {
+        append_claude(tmp.path(), ID_A, &format!("more albatross talk {i}"));
+    }
+    let grown = from_a(&["--limit", "1"]);
+    assert_eq!(
+        grown,
+        from_a(&["--limit", "1", "--no-cache"]),
+        "grown: vs in-memory"
+    );
+    assert_eq!(
+        grown,
+        from_a(&["--limit", "1", "--rebuild-index"]),
+        "grown: vs rebuilt"
+    );
+}
