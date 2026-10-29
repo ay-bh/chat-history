@@ -373,3 +373,63 @@ fn a_record_cut_inside_a_multibyte_character_is_indexed_once_completed() {
         "the completed UTF-8 record must not be permanently skipped"
     );
 }
+
+#[test]
+fn a_stamp_from_another_extraction_version_is_parsed_from_the_start() {
+    // An extraction-version bump must re-extract every transcript, including
+    // the ones a resume would otherwise continue.
+    let tmp = TempDir::new().unwrap();
+    let path = write(
+        &tmp,
+        &[
+            ("user", json!("about the shearwater")),
+            ("assistant", json!("Shearwater facts.")),
+        ],
+    );
+    thread::sleep(QUIET);
+    assert!(search(&tmp, "shearwater").contains(ID), "indexed");
+    // Another session indexed afterwards takes the next row ids, so a parse
+    // from the start cannot hand the old rows their ids back.
+    let other = tmp
+        .path()
+        .join(".claude/projects/-Users-test-proj/bbbbbbbb-1111-2222-3333-bbbbbbbbbbbb.jsonl");
+    fs::write(
+        &other,
+        json!({"type": "user", "cwd": "/Users/test/proj", "message": {"role": "user", "content": "unrelated fulmarword"},
+            "timestamp": "2026-09-01T11:00:00Z", "uuid": "o-0", "sessionId": "bbbbbbbb-1111-2222-3333-bbbbbbbbbbbb"})
+        .to_string()
+            + "\n",
+    )
+    .unwrap();
+    thread::sleep(QUIET);
+    assert!(!search(&tmp, "fulmarword").is_empty());
+    let before = stored_ids(&tmp);
+    {
+        let conn = rusqlite::Connection::open(tmp.path().join("cache/search-v3.db")).unwrap();
+        conn.execute(
+            "UPDATE sessions SET fingerprint = json_set(fingerprint, '$.version', 1) WHERE key LIKE ?1",
+            [format!("[\"claude\",\"{ID}\"%")],
+        )
+        .unwrap();
+    }
+    append(
+        &path,
+        &format!("{}\n", record(2, "user", json!("now the petrelword"))),
+    );
+    thread::sleep(QUIET);
+    assert!(
+        search(&tmp, "petrelword").contains(ID),
+        "the new message is found"
+    );
+    let after = stored_ids(&tmp);
+    assert_eq!(after.len(), before.len() + 1);
+    assert!(
+        after.iter().all(|id| !before.contains(id)),
+        "every row was extracted again: before {before:?}, after {after:?}"
+    );
+    assert_ne!(
+        stamp(&tmp)["version"].as_u64(),
+        Some(1),
+        "restamped with the current version"
+    );
+}
