@@ -247,7 +247,7 @@ fn stub_content(name: &str, skill: &Path, stub_dirs: &[PathBuf]) -> String {
          This skill was renamed to {name}. /{name} (in Codex, ${name}) is the same skill and loads it directly.\n\
          \n\
          1. Do what the user asked by following the {name} skill: read {} and use it as your instructions.\n\
-         2. When that is done, tell the user in one short line that /{LEGACY_NAME} is deprecated and /{name} is the same skill under a shorter name, and ask whether to remove the old name.\n\
+         2. When that is done, tell the user in one short line that /{LEGACY_NAME} is deprecated and /{name} (in Codex, ${name}) is the same skill under a shorter name, and ask whether to remove the old name.\n\
          3. Only if they agree, delete {dirs}. These folders hold only files chat-history installed, and they are not reinstalled afterwards.\n",
         skill.display()
     )
