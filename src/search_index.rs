@@ -940,7 +940,12 @@ impl Bm25Backend {
                     if session.source != "claude" || rebuild {
                         return None;
                     }
-                    let tail = fingerprints.get(&plan[i].0)?.tail.clone()?;
+                    // A stamp from another extraction version is parsed from
+                    // the start, so that its stored rows are extracted again.
+                    let previous = fingerprints
+                        .get(&plan[i].0)
+                        .filter(|p| p.version == EXTRACTION_VERSION)?;
+                    let tail = previous.tail.clone()?;
                     let newest: Option<usize> = self
                         .conn
                         .query_row(
@@ -1025,10 +1030,13 @@ impl Bm25Backend {
                 {
                     stats.unchanged += 1;
                 } else if let Some(from) = from {
-                    // Another process may have published since the rows were
-                    // checked; then this partial extraction is dropped and the
-                    // next sync parses the transcript again.
-                    if append_tail(&tx, &corpus[i], key, &stamp, extracted, from)? {
+                    // A resumed parse continues the rows the stamp described.
+                    // If another process published since they were read, the
+                    // partial extraction is dropped and the next sync parses
+                    // the transcript again.
+                    if current == seen
+                        && append_tail(&tx, &corpus[i], key, &stamp, extracted, from)?
+                    {
                         stats.updated += 1;
                     }
                 } else {
