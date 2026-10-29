@@ -176,6 +176,27 @@ extraction-version changes always regenerate passages. Sessions absent from the 
 index. An unavailable source is therefore indexed again when it returns. Source
 files are never modified.
 
+**Upkeep.** After removals the FTS5 deletions are folded into the segments by a
+few bounded `merge` passes rather than an `optimize`, which rewrites the whole
+index (1.2 s on a 750 MB index), and the WAL is checkpointed passively unless it
+has grown past 4 MiB. SQLite never returns freed pages on its own: a 747 MB
+index measured 383 MB of free list after months of sessions being rewritten.
+When the free list is at least 32 MiB and a quarter of the file, the search
+starts a detached `chat-history maintain --cache-dir` run that VACUUMs the index
+(3.5 s for that file, which halved it) and truncates the WAL, at most once a day;
+readers keep their snapshot meanwhile, best-effort stamp refreshes give up at
+once rather than queue behind it, and only a search that must publish parsed
+messages waits for the VACUUM to finish (a writer gives up only after ten seconds
+without any progress by another writer, longer than a VACUUM of a large index
+takes). A failed VACUUM is recorded like a successful one, so it is not retried
+by every search until the cooldown has passed. The run is started after the search
+has closed its own connection, since a connection closing while the VACUUM
+holds the write lock waits on it to checkpoint. A lock file prevents concurrent
+searches from each starting one, and a marker file beside the index records the
+last run. Measured on that clone: a search during the VACUUM 166 ms, the
+triggering search 278 ms against a 150 ms baseline, searches afterwards 105–150
+ms.
+
 ## Query and ranking
 
 **Analysis.** Input is plain text. There is no executable FTS syntax, stopword
