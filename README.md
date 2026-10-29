@@ -21,11 +21,11 @@ The first time you run `chat-history` / `ch`, it quietly installs the bundled ag
 - `~/.claude/skills/history/SKILL.md` for Claude Code, typed as `/history`
 - `~/.agents/skills/history/SKILL.md` for Codex (typed as `$history`) and Cursor (`/history`); both read this shared location
 
-To use another name, run `chat-history install-skill --name <name>` (1-64 lowercase letters, digits and single hyphens; Claude Code's built-in command names such as `resume` or `export` are refused because a skill would silently replace them). The name is remembered in `~/.chat-history/skill-name`, so later upgrades keep it, and copies under the previous name are removed.
+To use another name, run `chat-history install-skill --name <name>` (1-64 lowercase letters, digits and single hyphens; Claude Code's built-in command names such as `resume` or `export` are refused because a skill would silently replace them). The name is saved in `~/.chat-history/skill-name` only once the skill is installed under it, so later upgrades keep it; copies under the previous name are removed where the new one replaced them. A skill of the same name that this tool did not install is left alone unless you pass `--force`.
 
-The skill was called `chat-history` up to 0.8. When an upgrade replaces an old copy, a `chat-history` stub takes its place so `/chat-history` (`$chat-history` in Codex) still works: it does what you asked through the skill under its current name, then says the old name is deprecated and offers to delete the stub. It only runs when typed, never on its own; new installs never get it, and once deleted it is not put back. Copies that 0.8 wrote to `~/.cursor/skills/chat-history` and `$CODEX_HOME/skills/chat-history` (Codex has deprecated that folder) are removed on upgrade.
+The skill was called `chat-history` up to 0.8. When an upgrade replaces an old copy, a `chat-history` stub takes its place so `/chat-history` (`$chat-history` in Codex) still works: it does what you asked through the skill under its current name, then says the old name is deprecated and offers to run `chat-history install-skill --remove-old-name`. That removes only the stub files this tool wrote and nobody edited, leaving anything else in those folders, and the old name is not put back. The stub only runs when typed, never on its own, and new installs never get it. An old copy is replaced only once the new skill is in place, and copies that 0.8 wrote to `~/.cursor/skills/chat-history` and `$CODEX_HOME/skills/chat-history` (Codex has deprecated that folder) are removed once `~/.agents/skills` has the new one. **The `chat-history` stub is removed in 1.0**: from then on only `/history` (or the name you chose) works.
 
-On Windows, the same paths are under `%USERPROFILE%`. Later CLI upgrades refresh **managed** copies automatically (those written by this CLI, tracked via a `.chat-history-managed` sidecar) and remove only managed copies nobody edited. User-edited skills are left alone. Skills installed by older versions without that sidecar are left alone by the quiet path — run `install-skill` once after upgrading to adopt them.
+On Windows, the same paths are under `%USERPROFILE%`. Later CLI upgrades refresh **managed** copies automatically (those written by this CLI, tracked via a `.chat-history-managed` sidecar) and remove only managed copies nobody edited. User-edited skills are left alone. Copies of this skill installed by older versions without that sidecar are left alone by the quiet path — run `install-skill` once after upgrading to adopt them.
 
 Optional explicit install / reinstall:
 
@@ -33,6 +33,7 @@ Optional explicit install / reinstall:
 chat-history install-skill                    # refresh managed + adopt legacy (pre-sidecar) installs
 chat-history install-skill --name past-chats  # install under another name
 chat-history install-skill --force            # overwrite even user-edited skills
+chat-history install-skill --remove-old-name  # remove the deprecated chat-history stub for good
 ```
 
 The skill is active immediately — no restart needed.

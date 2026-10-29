@@ -159,7 +159,11 @@ fn install_skill_adopts_legacy_without_sidecar() {
     let tmp = TempDir::new().unwrap();
     let dir = tmp.path().join(".claude/skills/chat-history");
     fs::create_dir_all(&dir).unwrap();
-    fs::write(dir.join("SKILL.md"), "legacy 0.2.x skill without sidecar").unwrap();
+    fs::write(
+        dir.join("SKILL.md"),
+        "legacy 0.2.x skill without sidecar: cargo install chat-history",
+    )
+    .unwrap();
 
     Command::cargo_bin("chat-history")
         .unwrap()
@@ -172,7 +176,10 @@ fn install_skill_adopts_legacy_without_sidecar() {
         .stdout(predicate::str::contains("refreshed"));
 
     let content = fs::read_to_string(dir.join("SKILL.md")).unwrap();
-    assert_ne!(content, "legacy 0.2.x skill without sidecar");
+    assert_ne!(
+        content,
+        "legacy 0.2.x skill without sidecar: cargo install chat-history"
+    );
     assert!(content.contains("chat-history"));
     assert!(dir.join(".chat-history-managed").exists());
 }

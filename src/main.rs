@@ -4,7 +4,7 @@ use chat_history::session::{
     self, ResumeAction, SessionLookup, filter_sessions, load_sessions, lookup_session,
     parse_session, session_copies,
 };
-use chat_history::skill_install::{ensure_skills, install_skill};
+use chat_history::skill_install::{self, ensure_skills, install_skill};
 use chat_history::{display, inspect, scoring, search};
 use clap::{Parser, Subcommand};
 
@@ -236,6 +236,10 @@ enum Commands {
         /// $NAME in Codex.
         #[arg(long, value_name = "NAME")]
         name: Option<String>,
+        /// Remove the deprecated chat-history stub (only files this tool
+        /// wrote and nobody edited) so it is not put back
+        #[arg(long, conflicts_with_all = ["force", "name"])]
+        remove_old_name: bool,
     },
     /// Generate shell completions (bash, zsh, fish, elvish, powershell)
     Completions {
@@ -443,8 +447,17 @@ fn main() {
         return;
     }
 
-    if let Some(Commands::InstallSkill { force, name }) = &cli.command {
-        install_skill(*force, name.as_deref());
+    if let Some(Commands::InstallSkill {
+        force,
+        name,
+        remove_old_name,
+    }) = &cli.command
+    {
+        if *remove_old_name {
+            skill_install::remove_old_name();
+        } else {
+            install_skill(*force, name.as_deref());
+        }
         return;
     }
 
