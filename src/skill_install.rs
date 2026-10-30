@@ -249,7 +249,8 @@ fn skill_content(name: &str) -> String {
     let mut renamed = false;
     for line in SKILL_CONTENT.split_inclusive('\n') {
         if !renamed && line.starts_with("name:") {
-            out.push_str(&format!("name: {name}\n"));
+            // Quoted so names like `123` or `true` stay strings in YAML.
+            out.push_str(&format!("name: \"{name}\"\n"));
             renamed = true;
         } else {
             out.push_str(line);
@@ -347,8 +348,16 @@ impl RootResult {
 
     /// The skill and its stub, if one is due, are in place: only then can
     /// what they replace go, since the stub points at the skill.
+    /// A stub the user edited may still point at the previous name, so it
+    /// counts only once it names this skill.
     fn ready(&self) -> bool {
-        self.placed() && self.stub.as_ref().is_none_or(|(_, a)| in_place(a))
+        let skill = skill_path(&self.skill.0.dir).display().to_string();
+        self.placed()
+            && self.stub.as_ref().is_none_or(|(stub, a)| {
+                in_place(a)
+                    && std::fs::read_to_string(skill_path(&stub.dir))
+                        .is_ok_and(|s| s.contains(&skill))
+            })
     }
 }
 
@@ -519,8 +528,11 @@ fn remove_stub_policy(dir: &Path) -> bool {
     true
 }
 
+/// Only the stub's folder ever had this tool's policy; elsewhere such a file
+/// is the user's.
 fn has_stub_policy(dir: &Path) -> bool {
-    std::fs::read_to_string(dir.join(STUB_POLICY_FILE)).is_ok_and(|y| y == STUB_OPENAI_YAML)
+    dir.file_name() == Some(LEGACY_NAME.as_ref())
+        && std::fs::read_to_string(dir.join(STUB_POLICY_FILE)).is_ok_and(|y| y == STUB_OPENAI_YAML)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -538,8 +550,10 @@ fn write_managed_skill(dir: &Path, content: &str, policy: bool) -> bool {
     }
     if policy {
         let path = dir.join(STUB_POLICY_FILE);
-        if std::fs::create_dir_all(path.parent().unwrap()).is_err()
-            || std::fs::write(&path, STUB_OPENAI_YAML).is_err()
+        // A policy file the user customised is theirs to keep.
+        if !path.exists()
+            && (std::fs::create_dir_all(path.parent().unwrap()).is_err()
+                || std::fs::write(&path, STUB_OPENAI_YAML).is_err())
         {
             return false;
         }

@@ -53,7 +53,7 @@ fn a_fresh_install_is_named_history_in_two_places_without_the_old_name() {
     cmd(h).arg("install-skill").assert().success();
     for root in [".claude/skills", ".agents/skills"] {
         let skill = read(h.join(root).join("history/SKILL.md"));
-        assert!(skill.contains("\nname: history\n"), "{root}: {skill}");
+        assert!(skill.contains("\nname: \"history\"\n"), "{root}: {skill}");
         assert!(!skill.contains("disable-model-invocation"));
         assert!(
             !h.join(root).join("chat-history").exists(),
@@ -88,7 +88,7 @@ fn an_upgrade_retires_old_managed_copies_and_leaves_edited_ones() {
     cmd(h).arg("--version").assert().success();
     refresh(h);
 
-    assert!(read(h.join(".claude/skills/history/SKILL.md")).contains("name: history"));
+    assert!(read(h.join(".claude/skills/history/SKILL.md")).contains("name: \"history\""));
     for root in [".claude/skills", ".agents/skills"] {
         let stub = read(h.join(root).join("chat-history/SKILL.md"));
         assert!(stub.contains("\nname: chat-history\n"), "{stub}");
@@ -129,7 +129,7 @@ fn the_user_can_choose_the_name_and_it_survives_upgrades() {
         .stdout(predicate::str::contains("$past-chats"));
     for root in [".claude/skills", ".agents/skills"] {
         let skill = read(h.join(root).join("past-chats/SKILL.md"));
-        assert!(skill.contains("\nname: past-chats\n"), "{skill}");
+        assert!(skill.contains("\nname: \"past-chats\"\n"), "{skill}");
         assert!(
             !h.join(root).join("history").exists(),
             "the previous name is retired"
@@ -151,7 +151,7 @@ fn choosing_chat_history_keeps_the_old_name_without_a_stub() {
         .assert()
         .success();
     let skill = read(h.join(".claude/skills/chat-history/SKILL.md"));
-    assert!(skill.contains("\nname: chat-history\n"));
+    assert!(skill.contains("\nname: \"chat-history\"\n"));
     assert!(
         !skill.contains("disable-model-invocation"),
         "the real skill, not the stub"
@@ -327,7 +327,7 @@ fn a_pre_sidecar_copy_of_ours_is_still_adopted() {
     )
     .unwrap();
     cmd(h).arg("install-skill").assert().success();
-    assert!(read(dir.join("SKILL.md")).contains("\nname: history\n"));
+    assert!(read(dir.join("SKILL.md")).contains("\nname: \"history\"\n"));
 }
 
 #[test]
@@ -582,4 +582,63 @@ fn a_current_skill_left_with_the_stub_policy_is_repaired() {
     fs::write(&yaml, "policy:\n  allow_implicit_invocation: false\n").unwrap();
     refresh(h);
     assert!(!yaml.exists());
+}
+
+#[test]
+fn an_edited_stub_keeps_the_skill_it_points_to() {
+    let home = TempDir::new().unwrap();
+    let h = home.path();
+    old_layout(h);
+    refresh(h);
+    let stub = h.join(".claude/skills/chat-history/SKILL.md");
+    fs::write(&stub, read(&stub) + "\nMy note.\n").unwrap();
+    cmd(h)
+        .args(["install-skill", "--name", "past-chats"])
+        .assert()
+        .success();
+    assert!(read(&stub).contains("My note."));
+    assert!(
+        h.join(".claude/skills/history/SKILL.md").exists(),
+        "the edited stub still points here"
+    );
+}
+
+#[test]
+fn codex_policy_files_the_user_wrote_are_left_alone() {
+    let home = TempDir::new().unwrap();
+    let h = home.path();
+    let policy = "policy:\n  allow_implicit_invocation: false\n";
+    // On the skill itself, which was never a stub.
+    cmd(h).arg("install-skill").assert().success();
+    let own = h.join(".agents/skills/history/agents/openai.yaml");
+    fs::create_dir_all(own.parent().unwrap()).unwrap();
+    fs::write(&own, policy).unwrap();
+    refresh(h);
+    assert_eq!(read(&own), policy);
+
+    // Customised beside the stub.
+    let home = TempDir::new().unwrap();
+    let h = home.path();
+    old_layout(h);
+    refresh(h);
+    let custom =
+        "interface:\n  display_name: My alias\npolicy:\n  allow_implicit_invocation: false\n";
+    let yaml = h.join(".agents/skills/chat-history/agents/openai.yaml");
+    fs::write(&yaml, custom).unwrap();
+    cmd(h)
+        .args(["install-skill", "--name", "past-chats"])
+        .assert()
+        .success();
+    assert_eq!(read(&yaml), custom);
+}
+
+#[test]
+fn a_name_yaml_would_read_as_a_number_or_keyword_stays_a_string() {
+    let home = TempDir::new().unwrap();
+    let h = home.path();
+    cmd(h)
+        .args(["install-skill", "--name", "123"])
+        .assert()
+        .success();
+    assert!(read(h.join(".claude/skills/123/SKILL.md")).contains("\nname: \"123\"\n"));
 }
