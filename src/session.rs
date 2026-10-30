@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -309,7 +309,13 @@ pub fn resume_command(session: &Session) -> Option<ResumeAction> {
     match session.source.as_str() {
         "codex" => Some(ResumeAction::Exec {
             bin: "codex".into(),
-            args: vec!["resume".into(), session.id.clone()],
+            // Codex knows a continuation page by its thread.
+            args: vec![
+                "resume".into(),
+                codex_page(&session.file)
+                    .filter(|(_, page)| *page == session.id)
+                    .map_or_else(|| session.id.clone(), |(thread, _)| thread),
+            ],
             workdir: existing_absolute_dir(&session.project),
         }),
         "claude" => Some(ResumeAction::Exec {
@@ -1002,9 +1008,36 @@ fn codex_payload(entry: &Value) -> &Value {
     entry.get("payload").unwrap_or(entry)
 }
 
+/// The desktop app's paginated history continues a thread in a further file,
+/// `rollout-<time>-<thread>_<page>.jsonl`, whose header still carries the
+/// thread id but which holds only what came after the page it continues.
+/// Returns (thread, page) for such a file name.
+fn codex_page(file: &str) -> Option<(String, String)> {
+    let name = Path::new(file).file_name()?.to_str()?;
+    let stem = name
+        .strip_suffix(".zst")
+        .unwrap_or(name)
+        .strip_suffix(".jsonl")?;
+    let (head, page) = stem.rsplit_once('_')?;
+    let thread = head.get(head.len().checked_sub(36)?..)?;
+    let uuid = |s: &str| s.len() == 36 && s.chars().all(|c| c.is_ascii_hexdigit() || c == '-');
+    (uuid(thread) && uuid(page)).then(|| (thread.to_owned(), page.to_owned()))
+}
+
+/// Codex compresses finished rollouts to `.jsonl.zst`; reads either form.
+fn open_rollout(path: &Path) -> Option<Box<dyn Read>> {
+    let file = BufReader::new(fs::File::open(path).ok()?);
+    if path.extension().is_some_and(|e| e == "zst") {
+        Some(Box::new(
+            ruzstd::decoding::StreamingDecoder::new(file).ok()?,
+        ))
+    } else {
+        Some(Box::new(file))
+    }
+}
+
 fn read_codex_meta(path: &Path) -> Option<CodexMeta> {
-    let file = fs::File::open(path).ok()?;
-    let reader = BufReader::new(file);
+    let reader = BufReader::new(open_rollout(path)?);
     let line = reader.lines().next()?.ok()?;
     let entry: Value = serde_json::from_str(line.trim()).ok()?;
     let payload = codex_payload(&entry);
@@ -1073,9 +1106,8 @@ fn extract_codex_user_text(content: &Value) -> String {
 }
 
 fn codex_first_prompt(path: &Path) -> String {
-    let file = match fs::File::open(path) {
-        Ok(f) => f,
-        Err(_) => return String::new(),
+    let Some(file) = open_rollout(path) else {
+        return String::new();
     };
     let reader = BufReader::new(file);
     for line in reader.lines().take(100) {
@@ -1119,11 +1151,16 @@ pub fn load_codex_sessions() -> Vec<Session> {
         return Vec::new();
     }
     let mut sessions = Vec::new();
-    for path in glob::glob(&format!("{}/**/rollout-*.jsonl", base.display()))
+    let pattern = |ext: &str| format!("{}/**/rollout-*.{ext}", base.display());
+    let rollouts = glob::glob(&pattern("jsonl"))
         .into_iter()
+        .chain(glob::glob(&pattern("jsonl.zst")))
         .flatten()
         .flatten()
-    {
+        // A rollout caught mid-compression exists in both forms; the plain
+        // one is current.
+        .filter(|p| p.extension().is_none_or(|e| e != "zst") || !p.with_extension("").exists());
+    for path in rollouts {
         let Some((meta, first)) =
             crate::catalog::read("codex", TRANSCRIPT_KIND, &path, false, || {
                 let meta = read_codex_meta(&path)?;
@@ -1146,9 +1183,14 @@ pub fn load_codex_sessions() -> Vec<Session> {
             .get(..10)
             .map(str::to_string)
             .unwrap_or_else(|| mtime_date(&path).unwrap_or_default());
+        // A continuation page gets its own id, so each file opens on its own.
+        let id = match codex_page(&path.to_string_lossy()) {
+            Some((thread, page)) if thread == meta.id => page,
+            _ => meta.id,
+        };
         sessions.push(Session {
             source: "codex".into(),
-            id: meta.id,
+            id,
             summary: String::new(),
             first_prompt: first,
             created: meta.created,
@@ -1698,9 +1740,11 @@ pub fn parse_codex_jsonl(filepath: &str) -> Vec<Message> {
     // Whole-file read + lossy decode: an unreadable path fails once up front
     // (io::Lines can yield Err forever), and an invalid UTF-8 line only
     // corrupts itself instead of truncating the rest of the transcript.
-    let Ok(bytes) = fs::read(filepath) else {
+    let mut bytes = Vec::new();
+    let read = open_rollout(Path::new(filepath)).map(|mut r| r.read_to_end(&mut bytes));
+    if !matches!(read, Some(Ok(_))) {
         return Vec::new();
-    };
+    }
     let entries: Vec<Value> = String::from_utf8_lossy(&bytes)
         .lines()
         .filter_map(|l| serde_json::from_str(l.trim()).ok())
@@ -2370,6 +2414,30 @@ mod tests {
                 bin: "codex".into(),
                 args: vec!["resume".into(), "x1".into()],
                 workdir: existing_absolute_dir(&codex.project),
+            })
+        );
+    }
+
+    #[test]
+    fn resume_command_for_a_codex_continuation_page_names_its_thread() {
+        let mut page = make_session(
+            "01a181ee-9fd1-7b62-a9bc-2140a4c8b116",
+            "2026-10-28",
+            "codex",
+            "/p",
+            "",
+            "",
+        );
+        page.file = "/s/rollout-2026-10-28T15-24-21-01a181ea-eb4d-7b32-b28d-a34666d8653d_01a181ee-9fd1-7b62-a9bc-2140a4c8b116.jsonl".into();
+        assert_eq!(
+            resume_command(&page),
+            Some(ResumeAction::Exec {
+                bin: "codex".into(),
+                args: vec![
+                    "resume".into(),
+                    "01a181ea-eb4d-7b32-b28d-a34666d8653d".into()
+                ],
+                workdir: existing_absolute_dir(&page.project),
             })
         );
     }
