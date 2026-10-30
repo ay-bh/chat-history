@@ -1211,15 +1211,17 @@ fn codex_first_prompt(path: &Path) -> String {
 }
 
 pub fn load_codex_sessions() -> Vec<Session> {
-    let base = codex_sessions_dir();
-    if !base.exists() {
-        return Vec::new();
-    }
     let mut sessions = Vec::new();
-    let pattern = |ext: &str| format!("{}/**/rollout-*.{ext}", base.display());
-    let rollouts = glob::glob(&pattern("jsonl"))
-        .into_iter()
-        .chain(glob::glob(&pattern("jsonl.zst")))
+    // Archiving a thread only hides it from Codex's sidebar; it is still history.
+    let bases = [codex_sessions_dir(), codex_home().join("archived_sessions")];
+    let rollouts = bases
+        .iter()
+        .filter(|base| base.exists())
+        .flat_map(|base| {
+            ["jsonl", "jsonl.zst"]
+                .map(|ext| glob::glob(&format!("{}/**/rollout-*.{ext}", base.display())))
+        })
+        .flatten()
         .flatten()
         .flatten()
         // A rollout caught mid-compression exists in both forms; the plain

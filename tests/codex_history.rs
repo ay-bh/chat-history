@@ -353,3 +353,34 @@ fn a_compressed_rollout_counts_only_on_the_day_it_started() {
         .success()
         .stdout(predicate::str::contains("narwhal"));
 }
+
+#[test]
+fn archived_codex_threads_are_still_history() {
+    let home = TempDir::new().unwrap();
+    let h = home.path();
+    let id = "01a158b9-0c85-7ce0-94eb-879fa19bacbc";
+    let dir = h.join(".codex/archived_sessions");
+    fs::create_dir_all(&dir).unwrap();
+    write_compressed(
+        &dir.join(format!("rollout-2026-10-20T15-21-26-{id}.jsonl.zst")),
+        &rollout(
+            id,
+            "2026-10-20T09:51:26.000Z",
+            &[(
+                "2026-10-20T09:51:30.000Z",
+                "the archived okapi plan",
+                "Archived.",
+            )],
+        ),
+    );
+    cmd(h)
+        .args(["--source", "codex"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("the archived okapi plan"));
+    cmd(h)
+        .args(["view", id, "--plain"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Archived."));
+}
