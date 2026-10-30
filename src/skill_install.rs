@@ -387,18 +387,33 @@ fn placed_roots(results: &[(Copy, EnsureAction)]) -> Vec<PathBuf> {
         .collect()
 }
 
+/// Roots where the skill and its stub, if one is due, are both in place: only
+/// there can what they replace go, since the stub points at the skill.
+fn ready_roots(results: &[(Copy, EnsureAction)]) -> Vec<PathBuf> {
+    placed_roots(results)
+        .into_iter()
+        .filter(|root| {
+            results
+                .iter()
+                .filter(|(c, _)| c.dir.parent() == Some(root.as_path()))
+                .all(|(_, a)| in_place(a))
+        })
+        .collect()
+}
+
 /// After an install: retire copies under earlier names where the current one
-/// is in place; retire the old locations once the shared copy and stub that
-/// replace them are in place; and record the upgrade as done once the skill
-/// and every due stub are in place everywhere.
+/// and its stub are in place; retire the old locations once the shared copy
+/// and stub that replace them are in place; and record the upgrade as done
+/// once the skill and every due stub are in place everywhere.
 fn finish_upgrade(results: &[(Copy, EnsureAction)], name: &str, report: bool) {
     let placed = placed_roots(results);
+    let ready = ready_roots(results);
     let all_roots = roots();
 
     let mut pending = old_names();
     pending.retain(|old| old != name && old != LEGACY_NAME);
     for old in &pending {
-        for root in &placed {
+        for root in &ready {
             let dir = root.join(old);
             report_retired(&dir, retire(&dir), report);
         }
@@ -410,14 +425,9 @@ fn finish_upgrade(results: &[(Copy, EnsureAction)], name: &str, report: bool) {
 
     // $chat-history must keep working from ~/.agents/skills before the old
     // Codex and Cursor copies go.
-    let shared_ready = all_roots.iter().any(|(root, label)| {
-        *label != "Claude Code"
-            && placed.contains(root)
-            && results
-                .iter()
-                .filter(|(c, _)| c.dir.parent() == Some(root.as_path()))
-                .all(|(_, a)| in_place(a))
-    });
+    let shared_ready = all_roots
+        .iter()
+        .any(|(root, label)| *label != "Claude Code" && ready.contains(root));
     if shared_ready {
         for dir in old_locations() {
             report_retired(&dir, retire(&dir), report);
@@ -475,7 +485,7 @@ fn retire(dir: &Path) -> Retired {
         return Retired::Failed(e.to_string());
     }
     let _ = std::fs::remove_file(sidecar_path(dir));
-    remove_stub_policy(dir);
+    let _ = remove_stub_policy(dir);
     let _ = std::fs::remove_dir(dir);
     Retired::Removed
 }
@@ -493,12 +503,20 @@ fn removable(dir: &Path) -> bool {
 }
 
 /// Remove the stub's Codex policy if it is still the one this tool wrote.
-fn remove_stub_policy(dir: &Path) {
-    let yaml = dir.join("agents/openai.yaml");
-    if std::fs::read_to_string(&yaml).is_ok_and(|y| y == STUB_OPENAI_YAML) {
-        let _ = std::fs::remove_file(&yaml);
-        let _ = std::fs::remove_dir(dir.join("agents"));
+/// False only if the policy is there and could not be deleted.
+fn remove_stub_policy(dir: &Path) -> bool {
+    if !has_stub_policy(dir) {
+        return true;
     }
+    if std::fs::remove_file(dir.join("agents/openai.yaml")).is_err() {
+        return false;
+    }
+    let _ = std::fs::remove_dir(dir.join("agents"));
+    true
+}
+
+fn has_stub_policy(dir: &Path) -> bool {
+    std::fs::read_to_string(dir.join("agents/openai.yaml")).is_ok_and(|y| y == STUB_OPENAI_YAML)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -526,7 +544,11 @@ fn write_managed_skill(dir: &Path, content: &str, extra: Option<(&str, &str)>) -
             }
         }
         // The real skill replacing a stub must not keep its no-implicit-use policy.
-        None => remove_stub_policy(dir),
+        None => {
+            if !remove_stub_policy(dir) {
+                return false;
+            }
+        }
     }
     std::fs::write(skill_path(dir), content).is_ok()
         && std::fs::write(sidecar_path(dir), content_hash(content)).is_ok()
@@ -584,8 +606,11 @@ fn ensure_one(copy: &Copy, mode: Mode) -> EnsureAction {
                 Ok(managed) => {
                     let managed = managed.trim();
                     if managed == on_disk_hash {
-                        // Still our copy. Refresh if embedded skill changed.
-                        if on_disk_hash == embedded_hash {
+                        // Still our copy. Refresh if embedded skill changed,
+                        // or if the real skill still has a stub's policy (its
+                        // removal failed earlier).
+                        let stale_policy = copy.extra.is_none() && has_stub_policy(dir);
+                        if on_disk_hash == embedded_hash && !stale_policy {
                             EnsureAction::AlreadyCurrent
                         } else if write() {
                             EnsureAction::Refreshed

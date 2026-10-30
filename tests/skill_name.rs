@@ -497,3 +497,86 @@ fn a_rename_retried_after_a_blocked_folder_retires_the_previous_name_there() {
         "no duplicate skill once the new name is in place"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn a_rename_keeps_the_skill_the_stub_points_to_until_the_stub_is_updated() {
+    let home = TempDir::new().unwrap();
+    let h = home.path();
+    old_layout(h);
+    cmd(h).args(["--from", "today"]).assert().success();
+    let roots = [h.join(".claude/skills"), h.join(".agents/skills")];
+    for root in &roots {
+        set_mode(&root.join("chat-history/SKILL.md"), 0o444);
+    }
+    let out = cmd(h)
+        .args(["install-skill", "--name", "past-chats"])
+        .output()
+        .unwrap();
+    for root in &roots {
+        set_mode(&root.join("chat-history/SKILL.md"), 0o644);
+    }
+    assert!(out.status.success());
+    for root in &roots {
+        assert!(read(root.join("chat-history/SKILL.md")).contains("/history"));
+        assert!(
+            root.join("history/SKILL.md").exists(),
+            "{}: the stub still points here",
+            root.display()
+        );
+    }
+
+    cmd(h).args(["--from", "today"]).assert().success();
+    for root in &roots {
+        assert!(read(root.join("chat-history/SKILL.md")).contains("/past-chats"));
+        assert!(!root.join("history").exists(), "{}", root.display());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_stub_policy_that_could_not_be_removed_is_removed_on_a_later_run() {
+    let home = TempDir::new().unwrap();
+    let h = home.path();
+    old_layout(h);
+    cmd(h).args(["--from", "today"]).assert().success();
+    let agents = h.join(".agents/skills/chat-history/agents");
+    set_mode(&agents, 0o500);
+    let out = cmd(h)
+        .args(["install-skill", "--name", "chat-history"])
+        .output()
+        .unwrap();
+    set_mode(&agents, 0o700);
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("could not write"),
+        "the failure is reported: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        h.join(".agents/skills/history/SKILL.md").exists(),
+        "Codex keeps a skill it can pick on its own"
+    );
+
+    cmd(h).args(["--from", "today"]).assert().success();
+    assert!(!agents.join("openai.yaml").exists());
+    assert!(
+        !read(h.join(".agents/skills/chat-history/SKILL.md")).contains("disable-model-invocation")
+    );
+    assert!(!h.join(".agents/skills/history").exists());
+}
+
+#[test]
+fn a_current_skill_left_with_the_stub_policy_is_repaired() {
+    let home = TempDir::new().unwrap();
+    let h = home.path();
+    cmd(h)
+        .args(["install-skill", "--name", "chat-history"])
+        .assert()
+        .success();
+    // As left by a policy removal that failed after the skill was written.
+    let yaml = h.join(".agents/skills/chat-history/agents/openai.yaml");
+    fs::create_dir_all(yaml.parent().unwrap()).unwrap();
+    fs::write(&yaml, "policy:\n  allow_implicit_invocation: false\n").unwrap();
+    cmd(h).args(["--from", "today"]).assert().success();
+    assert!(!yaml.exists());
+}
