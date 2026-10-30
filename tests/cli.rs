@@ -103,26 +103,15 @@ fn install_skill_creates_files() {
         .assert()
         .success()
         .stdout(predicate::str::contains("installed"));
-    assert!(
-        tmp.path()
-            .join(".claude/skills/chat-history/SKILL.md")
-            .exists()
-    );
-    assert!(
-        tmp.path()
-            .join(".claude/skills/chat-history/.chat-history-managed")
-            .exists()
-    );
-    assert!(
-        tmp.path()
-            .join(".cursor/skills/chat-history/SKILL.md")
-            .exists()
-    );
-    assert!(
-        tmp.path()
-            .join(".codex/skills/chat-history/SKILL.md")
-            .exists()
-    );
+    for root in [".claude/skills", ".agents/skills"] {
+        assert!(tmp.path().join(root).join("history/SKILL.md").exists());
+        assert!(
+            tmp.path()
+                .join(root)
+                .join("history/.chat-history-managed")
+                .exists()
+        );
+    }
 }
 
 #[test]
@@ -135,14 +124,10 @@ fn ensure_skills_runs_on_normal_invocation() {
         .env_remove("CODEX_HOME")
         .assert()
         .success();
+    assert!(tmp.path().join(".claude/skills/history/SKILL.md").exists());
     assert!(
         tmp.path()
-            .join(".claude/skills/chat-history/SKILL.md")
-            .exists()
-    );
-    assert!(
-        tmp.path()
-            .join(".claude/skills/chat-history/.chat-history-managed")
+            .join(".claude/skills/history/.chat-history-managed")
             .exists()
     );
 }
@@ -174,7 +159,11 @@ fn install_skill_adopts_legacy_without_sidecar() {
     let tmp = TempDir::new().unwrap();
     let dir = tmp.path().join(".claude/skills/chat-history");
     fs::create_dir_all(&dir).unwrap();
-    fs::write(dir.join("SKILL.md"), "legacy 0.2.x skill without sidecar").unwrap();
+    fs::write(
+        dir.join("SKILL.md"),
+        "legacy 0.2.x skill without sidecar: cargo install chat-history",
+    )
+    .unwrap();
 
     Command::cargo_bin("chat-history")
         .unwrap()
@@ -187,7 +176,10 @@ fn install_skill_adopts_legacy_without_sidecar() {
         .stdout(predicate::str::contains("refreshed"));
 
     let content = fs::read_to_string(dir.join("SKILL.md")).unwrap();
-    assert_ne!(content, "legacy 0.2.x skill without sidecar");
+    assert_ne!(
+        content,
+        "legacy 0.2.x skill without sidecar: cargo install chat-history"
+    );
     assert!(content.contains("chat-history"));
     assert!(dir.join(".chat-history-managed").exists());
 }
@@ -251,11 +243,7 @@ fn skill_targets_honor_userprofile_without_home() {
         .assert()
         .success()
         .stdout(predicate::str::contains("installed"));
-    assert!(
-        tmp.path()
-            .join(".claude/skills/chat-history/SKILL.md")
-            .exists()
-    );
+    assert!(tmp.path().join(".claude/skills/history/SKILL.md").exists());
 }
 
 #[test]
@@ -438,12 +426,9 @@ fn empty_codex_home_is_treated_as_unset() {
         .env("CODEX_HOME", "")
         .assert()
         .success();
-    // Falls back to ~/.codex instead of a cwd-relative skills/ directory.
-    assert!(
-        tmp.path()
-            .join(".codex/skills/chat-history/SKILL.md")
-            .exists()
-    );
+    // Codex reads ~/.agents/skills; an empty CODEX_HOME never makes a
+    // cwd-relative skills/ directory.
+    assert!(tmp.path().join(".agents/skills/history/SKILL.md").exists());
     assert!(!cwd.path().join("skills").exists());
 }
 
