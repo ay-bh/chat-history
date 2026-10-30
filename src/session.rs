@@ -315,7 +315,8 @@ pub fn resume_command(session: &Session) -> Option<ResumeAction> {
         }),
         "claude" => Some(ResumeAction::Exec {
             bin: "claude".into(),
-            args: vec!["--resume".into(), session.id.clone()],
+            // A subagent reopens as the session that ran it.
+            args: vec!["--resume".into(), thread_id(session)],
             workdir: existing_absolute_dir(&session.project),
         }),
         // A cursor-ide row can still be a CLI chat the IDE indexes (or a
@@ -647,6 +648,10 @@ pub fn load_claude_sessions() -> Vec<Session> {
             if let Ok(files) = fs::read_dir(&dir) {
                 for f in files.flatten() {
                     let path = f.path();
+                    if path.is_dir() {
+                        push_claude_subagents(&path.join("subagents"), &mut sessions);
+                        continue;
+                    }
                     if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
                         continue;
                     }
@@ -698,6 +703,53 @@ pub fn load_claude_sessions() -> Vec<Session> {
         }
     }
     sessions
+}
+
+/// Claude Code writes each subagent's transcript beside its session, as
+/// `<project>/<session>/subagents/agent-<id>.jsonl` with a `.meta.json` whose
+/// `description` is the task it was given. Listed only with `--sidechains`.
+fn push_claude_subagents(dir: &Path, sessions: &mut Vec<Session>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let (cwd, branch, summary, first) =
+            crate::catalog::read("claude", TRANSCRIPT_KIND, &path, false, || {
+                fs::File::open(&path).ok()?;
+                let (cwd, branch) = read_cwd_branch_from_jsonl(&path);
+                let description = fs::read_to_string(path.with_extension("meta.json"))
+                    .ok()
+                    .and_then(|m| serde_json::from_str::<Value>(&m).ok())
+                    .and_then(|m| m.get("description")?.as_str().map(str::to_owned))
+                    .unwrap_or_default();
+                Some((cwd, branch, description, claude_first_prompt(&path)))
+            })
+            .unwrap_or_default();
+        let iso = mtime_iso(&path).unwrap_or_default();
+        sessions.push(Session {
+            source: "claude".into(),
+            id: path
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string(),
+            summary,
+            first_prompt: first,
+            created: iso.clone(),
+            modified: iso,
+            date: mtime_date(&path).unwrap_or_default(),
+            messages: 0,
+            branch: branch.unwrap_or_default(),
+            project: cwd.unwrap_or_default(),
+            file: path.to_string_lossy().to_string(),
+            is_sidechain: true,
+            also_ide: false,
+        });
+    }
 }
 
 /// Cursor stores each workspace as `~/.cursor/projects/<slug>/` where `<slug>`
@@ -1020,8 +1072,17 @@ fn codex_page(file: &str) -> Option<(String, String)> {
 }
 
 /// The conversation a session belongs to as its agent knows it: the thread
-/// for a Codex continuation page, else the session's own id.
+/// for a Codex continuation page, the parent session for a Claude subagent,
+/// else the session's own id.
 pub fn thread_id(session: &Session) -> String {
+    if session.source == "claude" && session.is_sidechain {
+        let parent = Path::new(&session.file).parent();
+        if let Some(parent) = parent.filter(|p| p.ends_with("subagents"))
+            && let Some(id) = parent.parent().and_then(Path::file_name)
+        {
+            return id.to_string_lossy().into_owned();
+        }
+    }
     match codex_page(&session.file) {
         Some((thread, page)) if session.source == "codex" && page == session.id => thread,
         _ => session.id.clone(),
@@ -2487,6 +2548,26 @@ mod tests {
                     "01a181ea-eb4d-7b32-b28d-a34666d8653d".into()
                 ],
                 workdir: existing_absolute_dir(&page.project),
+            })
+        );
+    }
+
+    #[test]
+    fn resume_command_for_a_claude_subagent_reopens_its_session() {
+        let mut agent = make_session("agent-aef1e734", "2026-10-30", "claude", "/p", "", "");
+        agent.is_sidechain = true;
+        agent.file =
+            "/c/projects/-p/d3752d92-9fae-432f-9f9f-10e4066cc131/subagents/agent-aef1e734.jsonl"
+                .into();
+        assert_eq!(
+            resume_command(&agent),
+            Some(ResumeAction::Exec {
+                bin: "claude".into(),
+                args: vec![
+                    "--resume".into(),
+                    "d3752d92-9fae-432f-9f9f-10e4066cc131".into()
+                ],
+                workdir: existing_absolute_dir(&agent.project),
             })
         );
     }
