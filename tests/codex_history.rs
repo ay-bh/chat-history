@@ -245,7 +245,8 @@ fn displayed_ids_are_long_enough_to_reopen_their_session() {
 }
 
 #[test]
-fn a_conversation_resumed_on_a_later_day_lists_on_every_day_it_was_active() {
+fn a_conversation_resumed_on_a_later_day_lists_on_the_day_it_started_and_the_day_it_was_last_active()
+ {
     let home = TempDir::new().unwrap();
     let h = home.path();
     let id = "01a17cd4-0000-7000-8000-000000000001";
@@ -279,18 +280,76 @@ fn a_conversation_resumed_on_a_later_day_lists_on_every_day_it_was_active() {
         .set_modified(resumed)
         .unwrap();
 
-    for day in ["2026-10-28", "2026-10-29", "2026-10-30"] {
+    for (from, to) in [
+        ("2026-10-28", "2026-10-28"),
+        ("2026-10-30", "2026-10-30"),
+        ("2026-10-27", "2026-10-29"),
+        ("2026-10-29", "2026-10-31"),
+    ] {
         cmd(h)
-            .args(["--source", "codex", "--from", day, "--to", day])
+            .args(["--source", "codex", "--from", from, "--to", to])
             .assert()
             .success()
             .stdout(predicate::str::contains("walrus report"));
     }
-    for (from, to) in [("2026-10-26", "2026-10-27"), ("2026-10-31", "2026-11-01")] {
+    // Nothing happened on the 29th.
+    for (from, to) in [
+        ("2026-10-29", "2026-10-29"),
+        ("2026-10-26", "2026-10-27"),
+        ("2026-10-31", "2026-11-01"),
+    ] {
         cmd(h)
             .args(["--source", "codex", "--from", from, "--to", to])
             .assert()
             .success()
             .stdout(predicate::str::contains("walrus report").not());
     }
+}
+
+#[test]
+fn a_compressed_rollout_counts_only_on_the_day_it_started() {
+    let home = TempDir::new().unwrap();
+    let h = home.path();
+    let id = "01a00000-0000-7000-8000-000000000009";
+    let file = day_dir(h, "2026-09-01").join(format!("rollout-2026-09-01T10-00-00-{id}.jsonl.zst"));
+    write_compressed(
+        &file,
+        &rollout(
+            id,
+            "2026-09-01T10:00:00.000Z",
+            &[("2026-09-01T10:00:05.000Z", "the september narwhal", "Done.")],
+        ),
+    );
+    // Compressed weeks later: the file time says nothing about activity.
+    let compressed = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_793_350_800); // 2026-10-30
+    fs::File::options()
+        .write(true)
+        .open(&file)
+        .unwrap()
+        .set_modified(compressed)
+        .unwrap();
+    cmd(h)
+        .args([
+            "--source",
+            "codex",
+            "--from",
+            "2026-10-30",
+            "--to",
+            "2026-10-30",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("narwhal").not());
+    cmd(h)
+        .args([
+            "--source",
+            "codex",
+            "--from",
+            "2026-09-01",
+            "--to",
+            "2026-09-01",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("narwhal"));
 }

@@ -2208,25 +2208,25 @@ pub fn filter_sessions(
         .filter(|s| {
             // Only require a parseable date when a date filter is in play;
             // a session with a missing date must still list otherwise.
-            // A session is in the range if it was active in it: started by
-            // the range's end and last written on or after its start, so a
-            // conversation resumed on a later day lists on that day too.
+            // A session is in the range if the day it started or the day it
+            // was last written falls in it, so a conversation resumed on a
+            // later day lists on that day too. Days in between are not
+            // counted: nothing records whether anything happened on them.
             if from_date.is_some() || to_date.is_some() {
                 let day = |d: &str| NaiveDate::parse_from_str(d, "%Y-%m-%d").ok();
                 let Some(start) = day(&s.date) else {
                     return false;
                 };
-                let end = day(&iso_date(&s.modified))
-                    .filter(|e| *e > start)
-                    .unwrap_or(start);
-                if let Some(fd) = from_date
-                    && end < fd
-                {
-                    return false;
-                }
-                if let Some(td) = to_date
-                    && start > td
-                {
+                let in_range = |d: NaiveDate| {
+                    from_date.is_none_or(|fd| d >= fd) && to_date.is_none_or(|td| d <= td)
+                };
+                // A compressed Codex rollout is finished: its file time is
+                // when Codex compressed it, not activity.
+                let last = (!s.file.ends_with(".zst"))
+                    .then(|| day(&iso_date(&s.modified)))
+                    .flatten()
+                    .filter(|l| *l > start);
+                if !in_range(start) && !last.is_some_and(in_range) {
                     return false;
                 }
             }
