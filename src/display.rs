@@ -560,7 +560,7 @@ pub fn print_inspect_brief(info: &InspectInfo) {
     println!(
         "{tag}  {}{}{}  {}  {cwd}  {}min  {} msgs",
         c!("bold"),
-        tty(&short),
+        tty(short),
         c!("reset"),
         tty(&info.date),
         info.duration_minutes,
