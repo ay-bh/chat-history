@@ -84,7 +84,8 @@ pub fn keep_whole_tool_output() {
 }
 
 fn clip_tool_output(s: &str) -> String {
-    if WHOLE_TOOL_OUTPUT.load(std::sync::atomic::Ordering::Relaxed) {
+    // Blank output stays blank, so callers still skip it.
+    if WHOLE_TOOL_OUTPUT.load(std::sync::atomic::Ordering::Relaxed) || s.trim().is_empty() {
         s.to_owned()
     } else {
         truncate_for_search(s, 16 * 1024)
@@ -1224,6 +1225,8 @@ mod tests {
         let long = "x".repeat(40 * 1024);
         // The kept start and end, joined by a visible " […] " marker.
         assert!(tool_output_text(&json!(long)).len() <= 16 * 1024 + " […] ".len());
+        let blank = " \n".repeat(20 * 1024);
+        assert!(tool_output_text(&json!(blank)).trim().is_empty());
     }
 
     #[test]

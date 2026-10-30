@@ -271,7 +271,21 @@ fn normalize_for_project_match(s: &str) -> String {
 pub fn copy_session_to_dir(session: &Session, target_dir: &Path) -> std::io::Result<()> {
     fs::create_dir_all(target_dir)?;
 
-    let src = Path::new(&session.file);
+    // A Claude subagent resumes as the session that ran it: copy that
+    // session's transcript, whose folder holds the subagent.
+    let thread = thread_id(session);
+    let parent_file = (thread != session.id)
+        .then(|| {
+            let project = Path::new(&session.file).parent()?.parent()?.parent()?;
+            Some(project.join(format!("{thread}.jsonl")))
+        })
+        .flatten();
+    let src = parent_file.as_deref().unwrap_or(Path::new(&session.file));
+    let id = if parent_file.is_some() {
+        &thread
+    } else {
+        &session.id
+    };
     let filename = src.file_name().ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -281,9 +295,9 @@ pub fn copy_session_to_dir(session: &Session, target_dir: &Path) -> std::io::Res
     fs::copy(src, target_dir.join(filename))?;
 
     if let Some(parent) = src.parent() {
-        let companion = parent.join(&session.id);
+        let companion = parent.join(id);
         if companion.is_dir() {
-            copy_dir_recursive(&companion, &target_dir.join(&session.id))?;
+            copy_dir_recursive(&companion, &target_dir.join(id))?;
         }
     }
     Ok(())
@@ -3838,6 +3852,36 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(target.join("test.jsonl")).unwrap(),
             "test data"
+        );
+    }
+
+    #[test]
+    fn copy_session_to_dir_copies_the_session_a_subagent_resumes_as() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project = tmp.path().join("-gone-proj");
+        let parent = "d3752d92-9fae-432f-9f9f-10e4066cc131";
+        let subagents = project.join(parent).join("subagents");
+        std::fs::create_dir_all(&subagents).unwrap();
+        std::fs::write(project.join(format!("{parent}.jsonl")), "parent").unwrap();
+        std::fs::write(subagents.join("agent-a1.jsonl"), "subagent").unwrap();
+        let mut agent = make_session("agent-a1", "2026-10-30", "claude", "/gone", "", "");
+        agent.is_sidechain = true;
+        agent.file = subagents
+            .join("agent-a1.jsonl")
+            .to_string_lossy()
+            .into_owned();
+
+        let target = tmp.path().join("target-dir");
+        copy_session_to_dir(&agent, &target).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(target.join(format!("{parent}.jsonl"))).unwrap(),
+            "parent"
+        );
+        assert!(
+            target
+                .join(parent)
+                .join("subagents/agent-a1.jsonl")
+                .exists()
         );
     }
 
