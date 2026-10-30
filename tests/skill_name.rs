@@ -421,3 +421,79 @@ fn removing_the_old_name_reports_a_stub_it_could_not_delete() {
     assert!(!h.join(".claude/skills/chat-history/SKILL.md").exists());
     assert!(shared.join("SKILL.md").exists());
 }
+
+#[test]
+fn removing_the_old_name_keeps_it_where_an_unrelated_skill_holds_the_new_name() {
+    let home = TempDir::new().unwrap();
+    let h = home.path();
+    old_layout(h);
+    let theirs = "---\nname: history\ndescription: shell history helper\n---\nsomeone else's\n";
+    fs::create_dir_all(h.join(".claude/skills/history")).unwrap();
+    fs::write(h.join(".claude/skills/history/SKILL.md"), theirs).unwrap();
+    let before = read(h.join(".claude/skills/chat-history/SKILL.md"));
+    cmd(h).arg("install-skill").assert().success();
+    assert_eq!(
+        read(h.join(".claude/skills/chat-history/SKILL.md")),
+        before,
+        "the 0.8 skill is the only working copy in Claude Code"
+    );
+    cmd(h)
+        .args(["install-skill", "--remove-old-name"])
+        .assert()
+        .success();
+    assert_eq!(
+        read(h.join(".claude/skills/chat-history/SKILL.md")),
+        before,
+        "not a stub, so not removed"
+    );
+    assert_eq!(read(h.join(".claude/skills/history/SKILL.md")), theirs);
+    assert!(!h.join(".agents/skills/chat-history").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn old_copies_wait_for_the_shared_stub_that_replaces_them() {
+    let home = TempDir::new().unwrap();
+    let h = home.path();
+    old_layout(h);
+    // Something in the way of the shared stub, but not of the skill.
+    let stub = h.join(".agents/skills/chat-history");
+    fs::create_dir_all(&stub).unwrap();
+    set_mode(&stub, 0o500);
+    let out = cmd(h).args(["--from", "today"]).output().unwrap();
+    set_mode(&stub, 0o700);
+    assert!(out.status.success());
+    assert!(h.join(".agents/skills/history/SKILL.md").exists());
+    assert!(
+        h.join(".codex/skills/chat-history/SKILL.md").exists(),
+        "kept until $chat-history works from ~/.agents/skills"
+    );
+
+    cmd(h).args(["--from", "today"]).assert().success();
+    assert!(read(stub.join("SKILL.md")).contains("deprecated"));
+    assert!(!h.join(".codex/skills/chat-history").exists());
+    assert!(!h.join(".cursor/skills/chat-history").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_rename_retried_after_a_blocked_folder_retires_the_previous_name_there() {
+    let home = TempDir::new().unwrap();
+    let h = home.path();
+    cmd(h).arg("install-skill").assert().success();
+    set_mode(&h.join(".agents/skills"), 0o500);
+    let out = cmd(h)
+        .args(["install-skill", "--name", "past-chats"])
+        .output()
+        .unwrap();
+    set_mode(&h.join(".agents/skills"), 0o700);
+    assert!(out.status.success());
+    assert!(h.join(".agents/skills/history/SKILL.md").exists());
+
+    cmd(h).args(["--from", "today"]).assert().success();
+    assert!(h.join(".agents/skills/past-chats/SKILL.md").exists());
+    assert!(
+        !h.join(".agents/skills/history").exists(),
+        "no duplicate skill once the new name is in place"
+    );
+}

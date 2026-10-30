@@ -43,6 +43,10 @@ const NAME_FILE: &str = "skill-name";
 /// put its stubs in place (or had none to make), or once the user removed the
 /// old name. From then on stubs are only refreshed where they exist.
 const MIGRATED_FILE: &str = "skill-migrated";
+/// Names the skill was installed under before a `--name` change, one per
+/// line, whose unedited copies are still to be removed (a folder may have
+/// been blocked when the name changed).
+const OLD_NAMES_FILE: &str = "skill-old-names";
 /// Text every SKILL.md this tool has shipped contains; a copy without a
 /// sidecar is adopted by `install-skill` only if it has it.
 const OWN_SKILL_MARK: &str = "cargo install chat-history";
@@ -232,6 +236,24 @@ fn record_name(name: &str) -> std::io::Result<()> {
     std::fs::write(file, format!("{name}\n"))
 }
 
+fn old_names() -> Vec<String> {
+    state_file(OLD_NAMES_FILE)
+        .and_then(|f| std::fs::read_to_string(f).ok())
+        .map(|s| s.lines().map(str::to_owned).collect())
+        .unwrap_or_default()
+}
+
+fn set_old_names(names: &[String]) {
+    let Some(file) = state_file(OLD_NAMES_FILE) else {
+        return;
+    };
+    if names.is_empty() {
+        let _ = std::fs::remove_file(file);
+    } else {
+        let _ = std::fs::write(file, names.join("\n") + "\n");
+    }
+}
+
 /// The bundled skill with its frontmatter `name` set to `name`.
 fn skill_content(name: &str) -> String {
     let mut out = String::with_capacity(SKILL_CONTENT.len());
@@ -365,16 +387,38 @@ fn placed_roots(results: &[(Copy, EnsureAction)]) -> Vec<PathBuf> {
         .collect()
 }
 
-/// After an install: retire the old locations once the shared copy that
-/// replaces them is in place, and record the upgrade as done once the skill
+/// After an install: retire copies under earlier names where the current one
+/// is in place; retire the old locations once the shared copy and stub that
+/// replace them are in place; and record the upgrade as done once the skill
 /// and every due stub are in place everywhere.
-fn finish_upgrade(results: &[(Copy, EnsureAction)], report: bool) {
+fn finish_upgrade(results: &[(Copy, EnsureAction)], name: &str, report: bool) {
     let placed = placed_roots(results);
     let all_roots = roots();
-    let shared_placed = all_roots
-        .iter()
-        .any(|(root, label)| *label != "Claude Code" && placed.contains(root));
-    if shared_placed {
+
+    let mut pending = old_names();
+    pending.retain(|old| old != name && old != LEGACY_NAME);
+    for old in &pending {
+        for root in &placed {
+            let dir = root.join(old);
+            report_retired(&dir, retire(&dir), report);
+        }
+    }
+    // Kept while a copy nobody edited remains, e.g. in a folder that was
+    // blocked; edited copies are the user's.
+    pending.retain(|old| all_roots.iter().any(|(r, _)| removable(&r.join(old))));
+    set_old_names(&pending);
+
+    // $chat-history must keep working from ~/.agents/skills before the old
+    // Codex and Cursor copies go.
+    let shared_ready = all_roots.iter().any(|(root, label)| {
+        *label != "Claude Code"
+            && placed.contains(root)
+            && results
+                .iter()
+                .filter(|(c, _)| c.dir.parent() == Some(root.as_path()))
+                .all(|(_, a)| in_place(a))
+    });
+    if shared_ready {
         for dir in old_locations() {
             report_retired(&dir, retire(&dir), report);
         }
@@ -419,18 +463,12 @@ fn old_locations() -> Vec<PathBuf> {
 /// SKILL.md still has the hash recorded in the sidecar. Removes only the
 /// files this tool writes, then the directories if they are left empty.
 fn retire(dir: &Path) -> Retired {
-    let (Ok(on_disk), Ok(managed)) = (
-        std::fs::read_to_string(skill_path(dir)),
-        std::fs::read_to_string(sidecar_path(dir)),
-    ) else {
+    if !removable(dir) {
         return if skill_path(dir).exists() {
             Retired::LeftAlone
         } else {
             Retired::Absent
         };
-    };
-    if content_hash(&on_disk) != managed.trim() {
-        return Retired::LeftAlone;
     }
     // SKILL.md is what makes it a skill; the rest is cleanup.
     if let Err(e) = std::fs::remove_file(skill_path(dir)) {
@@ -440,6 +478,18 @@ fn retire(dir: &Path) -> Retired {
     remove_stub_policy(dir);
     let _ = std::fs::remove_dir(dir);
     Retired::Removed
+}
+
+/// This tool wrote the copy's SKILL.md and nobody edited it since: it still
+/// has the hash recorded in the sidecar.
+fn removable(dir: &Path) -> bool {
+    match (
+        std::fs::read_to_string(skill_path(dir)),
+        std::fs::read_to_string(sidecar_path(dir)),
+    ) {
+        (Ok(on_disk), Ok(managed)) => content_hash(&on_disk) == managed.trim(),
+        _ => false,
+    }
 }
 
 /// Remove the stub's Codex policy if it is still the one this tool wrote.
@@ -577,8 +627,9 @@ fn ensure_one(copy: &Copy, mode: Mode) -> EnsureAction {
 /// prints; never overwrites user-edited or ambiguous legacy skills. Safe to
 /// call on every CLI invocation.
 pub fn ensure_skills() {
-    let results = install_copies(&chosen_name(), Mode::Quiet);
-    finish_upgrade(&results, false);
+    let name = chosen_name();
+    let results = install_copies(&name, Mode::Quiet);
+    finish_upgrade(&results, &name, false);
 }
 
 /// Explicit install used by `chat-history install-skill [--name NAME]`.
@@ -641,14 +692,14 @@ pub fn install_skill(force: bool, name: Option<&str>) {
             eprintln!("Could not save the skill name ({e}); the skill under {previous} was kept.");
             std::process::exit(1);
         }
-        if previous != LEGACY_NAME {
-            for root in &placed {
-                let dir = root.join(&previous);
-                report_retired(&dir, retire(&dir), true);
-            }
-        }
+        // finish_upgrade retires it where the new name is in place, now or on
+        // a later run once a blocked folder is writable.
+        let mut pending = old_names();
+        pending.retain(|old| *old != name && *old != previous);
+        pending.push(previous.clone());
+        set_old_names(&pending);
     }
-    finish_upgrade(&results, true);
+    finish_upgrade(&results, &name, true);
     println!(
         "\nDone. Use /{name} in Claude Code and Cursor, ${name} in Codex. The skill is active immediately — no restart needed."
     );
@@ -677,9 +728,23 @@ pub fn remove_old_name() {
         if !skill_path(&dir).exists() {
             continue;
         }
-        if !skill_path(&root.join(&name)).exists() {
+        // Only a stub goes, and only where this tool's skill replaces it: a
+        // full 0.8 copy may be the only working one, e.g. when another skill
+        // already holds the new name.
+        let is_stub = std::fs::read_to_string(skill_path(&dir))
+            .is_ok_and(|s| s.contains(&format!("# /{LEGACY_NAME} is deprecated")));
+        let replaced =
+            skill_path(&root.join(&name)).exists() && sidecar_path(&root.join(&name)).exists();
+        if !replaced {
             println!(
-                "  left alone → {} (the skill is not installed as {name} here yet)",
+                "  left alone → {} (the skill is not installed as {name} here, so this is still the working copy)",
+                skill_path(&dir).display()
+            );
+            continue;
+        }
+        if !is_stub {
+            println!(
+                "  left alone → {} (not the deprecated stub; delete it yourself if you no longer want it)",
                 skill_path(&dir).display()
             );
             continue;
