@@ -4,6 +4,7 @@
 //! when invoked by name and points to the new one.
 
 use assert_cmd::Command;
+use chat_history::skill_install::{MANAGED_SIDECAR, content_hash};
 use predicates::prelude::*;
 use std::{fs, path::Path};
 use tempfile::TempDir;
@@ -19,26 +20,29 @@ fn cmd(home: &Path) -> Command {
     c
 }
 
+/// An ordinary command, which refreshes the skills quietly.
+fn refresh(h: &Path) {
+    cmd(h).args(["--from", "today"]).assert().success();
+}
+
 fn read(path: impl AsRef<Path>) -> String {
     fs::read_to_string(path).unwrap()
 }
+
+/// Stands in for the skill text 0.8 installed.
+const OLD_SKILL: &str = "---\nname: chat-history\ndescription: old\n---\nold skill\n";
 
 /// A copy written by 0.8: the skill text plus the sidecar holding its hash.
 fn managed_old_copy(dir: &Path, text: &str) {
     fs::create_dir_all(dir).unwrap();
     fs::write(dir.join("SKILL.md"), text).unwrap();
-    fs::write(
-        dir.join(".chat-history-managed"),
-        chat_history::skill_install::content_hash(text),
-    )
-    .unwrap();
+    fs::write(dir.join(MANAGED_SIDECAR), content_hash(text)).unwrap();
 }
 
 /// What 0.8 installed: the same managed copy in three places.
 fn old_layout(h: &Path) {
-    let old = "---\nname: chat-history\ndescription: old\n---\nold skill\n";
     for root in [".claude/skills", ".cursor/skills", ".codex/skills"] {
-        managed_old_copy(&h.join(root).join("chat-history"), old);
+        managed_old_copy(&h.join(root).join("chat-history"), OLD_SKILL);
     }
 }
 
@@ -70,11 +74,10 @@ fn a_fresh_install_is_named_history_in_two_places_without_the_old_name() {
 fn an_upgrade_retires_old_managed_copies_and_leaves_edited_ones() {
     let home = TempDir::new().unwrap();
     let h = home.path();
-    let old = "---\nname: chat-history\ndescription: old\n---\nold skill\n";
-    managed_old_copy(&h.join(".claude/skills/chat-history"), old);
-    managed_old_copy(&h.join(".codex/skills/chat-history"), old);
+    managed_old_copy(&h.join(".claude/skills/chat-history"), OLD_SKILL);
+    managed_old_copy(&h.join(".codex/skills/chat-history"), OLD_SKILL);
     // Edited by the user after we installed it: the sidecar no longer matches.
-    managed_old_copy(&h.join(".cursor/skills/chat-history"), old);
+    managed_old_copy(&h.join(".cursor/skills/chat-history"), OLD_SKILL);
     fs::write(
         h.join(".cursor/skills/chat-history/SKILL.md"),
         "my own notes",
@@ -83,7 +86,7 @@ fn an_upgrade_retires_old_managed_copies_and_leaves_edited_ones() {
 
     // Any ordinary command refreshes the skills quietly.
     cmd(h).arg("--version").assert().success();
-    cmd(h).args(["--from", "today"]).assert().success();
+    refresh(h);
 
     assert!(read(h.join(".claude/skills/history/SKILL.md")).contains("name: history"));
     for root in [".claude/skills", ".agents/skills"] {
@@ -134,7 +137,7 @@ fn the_user_can_choose_the_name_and_it_survives_upgrades() {
         assert!(read(h.join(root).join("chat-history/SKILL.md")).contains("/past-chats"));
     }
     // A later run, as after an upgrade, keeps the chosen name.
-    cmd(h).args(["--from", "today"]).assert().success();
+    refresh(h);
     assert!(h.join(".claude/skills/past-chats/SKILL.md").exists());
     assert!(!h.join(".claude/skills/history").exists());
 }
@@ -184,7 +187,7 @@ fn a_deleted_stub_stays_deleted() {
     let home = TempDir::new().unwrap();
     let h = home.path();
     old_layout(h);
-    cmd(h).args(["--from", "today"]).assert().success();
+    refresh(h);
     assert!(
         h.join(".claude/skills/chat-history/SKILL.md").exists(),
         "stub installed"
@@ -192,7 +195,7 @@ fn a_deleted_stub_stays_deleted() {
     // What the stub offers to do when the user agrees.
     fs::remove_dir_all(h.join(".claude/skills/chat-history")).unwrap();
     fs::remove_dir_all(h.join(".agents/skills/chat-history")).unwrap();
-    cmd(h).args(["--from", "today"]).assert().success();
+    refresh(h);
     cmd(h).arg("install-skill").assert().success();
     assert!(
         !h.join(".claude/skills/chat-history").exists(),
@@ -236,7 +239,7 @@ fn a_rename_that_cannot_be_installed_keeps_the_working_skill_and_its_name() {
             root.display()
         );
     }
-    cmd(h).args(["--from", "today"]).assert().success();
+    refresh(h);
     assert!(
         !h.join(".claude/skills/past-chats").exists(),
         "the failed name was not remembered"
@@ -286,7 +289,7 @@ fn old_copies_keep_working_until_their_replacement_is_installed() {
     assert!(h.join(".cursor/skills/chat-history/SKILL.md").exists());
     assert!(h.join(".codex/skills/chat-history/SKILL.md").exists());
 
-    cmd(h).args(["--from", "today"]).assert().success();
+    refresh(h);
     assert!(read(h.join(".claude/skills/chat-history/SKILL.md")).contains("deprecated"));
     assert!(h.join(".agents/skills/history/SKILL.md").exists());
     assert!(!h.join(".cursor/skills/chat-history").exists());
@@ -332,7 +335,7 @@ fn the_stub_removes_the_old_name_with_a_command_that_keeps_other_files() {
     let home = TempDir::new().unwrap();
     let h = home.path();
     old_layout(h);
-    cmd(h).args(["--from", "today"]).assert().success();
+    refresh(h);
     let stub = read(h.join(".claude/skills/chat-history/SKILL.md"));
     assert!(
         stub.contains("chat-history install-skill --remove-old-name"),
@@ -351,7 +354,7 @@ fn the_stub_removes_the_old_name_with_a_command_that_keeps_other_files() {
     for root in [".claude/skills", ".agents/skills"] {
         assert!(h.join(root).join("history/SKILL.md").exists());
     }
-    cmd(h).args(["--from", "today"]).assert().success();
+    refresh(h);
     cmd(h).arg("install-skill").assert().success();
     assert!(!h.join(".claude/skills/chat-history/SKILL.md").exists());
     assert!(!h.join(".agents/skills/chat-history").exists());
@@ -362,7 +365,7 @@ fn going_back_to_chat_history_lets_codex_pick_the_skill_again() {
     let home = TempDir::new().unwrap();
     let h = home.path();
     old_layout(h);
-    cmd(h).args(["--from", "today"]).assert().success();
+    refresh(h);
     assert!(
         h.join(".agents/skills/chat-history/agents/openai.yaml")
             .exists()
@@ -385,11 +388,11 @@ fn deleted_stubs_stay_deleted_while_an_edited_old_copy_remains() {
     let h = home.path();
     old_layout(h);
     fs::write(h.join(".cursor/skills/chat-history/SKILL.md"), "my edits").unwrap();
-    cmd(h).args(["--from", "today"]).assert().success();
+    refresh(h);
     assert!(h.join(".agents/skills/chat-history/SKILL.md").exists());
     fs::remove_dir_all(h.join(".claude/skills/chat-history")).unwrap();
     fs::remove_dir_all(h.join(".agents/skills/chat-history")).unwrap();
-    cmd(h).args(["--from", "today"]).assert().success();
+    refresh(h);
     cmd(h).arg("install-skill").assert().success();
     assert!(!h.join(".claude/skills/chat-history").exists());
     assert!(!h.join(".agents/skills/chat-history").exists());
@@ -405,7 +408,7 @@ fn removing_the_old_name_reports_a_stub_it_could_not_delete() {
     let home = TempDir::new().unwrap();
     let h = home.path();
     old_layout(h);
-    cmd(h).args(["--from", "today"]).assert().success();
+    refresh(h);
     // As in Codex's sandbox, which keeps ~/.agents read-only.
     let shared = h.join(".agents/skills/chat-history");
     set_mode(&shared, 0o500);
@@ -469,7 +472,7 @@ fn old_copies_wait_for_the_shared_stub_that_replaces_them() {
         "kept until $chat-history works from ~/.agents/skills"
     );
 
-    cmd(h).args(["--from", "today"]).assert().success();
+    refresh(h);
     assert!(read(stub.join("SKILL.md")).contains("deprecated"));
     assert!(!h.join(".codex/skills/chat-history").exists());
     assert!(!h.join(".cursor/skills/chat-history").exists());
@@ -490,7 +493,7 @@ fn a_rename_retried_after_a_blocked_folder_retires_the_previous_name_there() {
     assert!(out.status.success());
     assert!(h.join(".agents/skills/history/SKILL.md").exists());
 
-    cmd(h).args(["--from", "today"]).assert().success();
+    refresh(h);
     assert!(h.join(".agents/skills/past-chats/SKILL.md").exists());
     assert!(
         !h.join(".agents/skills/history").exists(),
@@ -504,7 +507,7 @@ fn a_rename_keeps_the_skill_the_stub_points_to_until_the_stub_is_updated() {
     let home = TempDir::new().unwrap();
     let h = home.path();
     old_layout(h);
-    cmd(h).args(["--from", "today"]).assert().success();
+    refresh(h);
     let roots = [h.join(".claude/skills"), h.join(".agents/skills")];
     for root in &roots {
         set_mode(&root.join("chat-history/SKILL.md"), 0o444);
@@ -526,7 +529,7 @@ fn a_rename_keeps_the_skill_the_stub_points_to_until_the_stub_is_updated() {
         );
     }
 
-    cmd(h).args(["--from", "today"]).assert().success();
+    refresh(h);
     for root in &roots {
         assert!(read(root.join("chat-history/SKILL.md")).contains("/past-chats"));
         assert!(!root.join("history").exists(), "{}", root.display());
@@ -539,7 +542,7 @@ fn a_stub_policy_that_could_not_be_removed_is_removed_on_a_later_run() {
     let home = TempDir::new().unwrap();
     let h = home.path();
     old_layout(h);
-    cmd(h).args(["--from", "today"]).assert().success();
+    refresh(h);
     let agents = h.join(".agents/skills/chat-history/agents");
     set_mode(&agents, 0o500);
     let out = cmd(h)
@@ -557,7 +560,7 @@ fn a_stub_policy_that_could_not_be_removed_is_removed_on_a_later_run() {
         "Codex keeps a skill it can pick on its own"
     );
 
-    cmd(h).args(["--from", "today"]).assert().success();
+    refresh(h);
     assert!(!agents.join("openai.yaml").exists());
     assert!(
         !read(h.join(".agents/skills/chat-history/SKILL.md")).contains("disable-model-invocation")
@@ -577,6 +580,6 @@ fn a_current_skill_left_with_the_stub_policy_is_repaired() {
     let yaml = h.join(".agents/skills/chat-history/agents/openai.yaml");
     fs::create_dir_all(yaml.parent().unwrap()).unwrap();
     fs::write(&yaml, "policy:\n  allow_implicit_invocation: false\n").unwrap();
-    cmd(h).args(["--from", "today"]).assert().success();
+    refresh(h);
     assert!(!yaml.exists());
 }
