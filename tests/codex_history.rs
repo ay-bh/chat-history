@@ -185,3 +185,53 @@ fn a_continuation_page_of_a_codex_thread_opens_under_its_own_id() {
     assert_eq!(id, page);
     cmd(h).args(["inspect", &id, "--brief"]).assert().success();
 }
+
+/// Codex ids are time-ordered (UUIDv7): sessions started within about a
+/// minute share their first eight characters.
+#[test]
+fn displayed_ids_are_long_enough_to_reopen_their_session() {
+    let home = TempDir::new().unwrap();
+    let h = home.path();
+    let dir = day_dir(h, "2026-10-30");
+    for (id, word) in [
+        ("01a18bda-48db-73b1-91f0-fb1383b4a17d", "aardvark"),
+        ("01a18bda-e676-73a3-95be-6e386f8a68f1", "bandicoot"),
+    ] {
+        fs::write(
+            dir.join(format!("rollout-2026-10-30T13-40-00-{id}.jsonl")),
+            rollout(
+                id,
+                "2026-10-30T08:10:00.000Z",
+                &[(
+                    "2026-10-30T08:10:05.000Z",
+                    &format!("ask about the {word}"),
+                    "Answered.",
+                )],
+            ),
+        )
+        .unwrap();
+    }
+    let list = cmd(h).args(["--source", "codex"]).output().unwrap();
+    let list = String::from_utf8(list.stdout).unwrap();
+    assert!(
+        list.contains("01a18bda-4") && list.contains("01a18bda-e"),
+        "{list}"
+    );
+    let compact = cmd(h)
+        .args(["search", "aardvark", "--compact"])
+        .output()
+        .unwrap();
+    let shown = String::from_utf8(compact.stdout).unwrap();
+    let short = shown.split_whitespace().next().unwrap().to_owned();
+    assert_eq!(short, "01a18bda-4", "{shown}");
+    cmd(h)
+        .args(["view", &short, "--plain"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("aardvark"));
+    cmd(h)
+        .args(["inspect", &short, "--brief"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("01a18bda-4"));
+}

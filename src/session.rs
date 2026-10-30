@@ -1226,7 +1226,46 @@ pub fn load_sessions(source: Option<&str>) -> Vec<Session> {
         Some(s) => vec![s],
         None => vec!["claude", "cursor", "cursor-ide", "codex"],
     };
-    crate::catalog::with_catalog(&sources, || load_selected_sources(src.as_deref()))
+    let sessions = crate::catalog::with_catalog(&sources, || load_selected_sources(src.as_deref()));
+    record_short_ids(&sessions);
+    sessions
+}
+
+/// Ids whose displayed prefix needs more than eight characters to be
+/// unambiguous, with the length it needs. Codex ids are time-ordered
+/// (UUIDv7), so sessions started within about a minute share their first
+/// eight characters.
+static LONG_SHORT_IDS: std::sync::RwLock<Option<HashMap<String, usize>>> =
+    std::sync::RwLock::new(None);
+
+fn record_short_ids(sessions: &[Session]) {
+    let mut ids: Vec<&str> = sessions.iter().map(|s| s.id.as_str()).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    let common = |a: &str, b: &str| a.bytes().zip(b.bytes()).take_while(|(x, y)| x == y).count();
+    let mut long = HashMap::new();
+    for (i, id) in ids.iter().enumerate() {
+        let before = i.checked_sub(1).map_or(0, |j| common(ids[j], id));
+        let after = ids.get(i + 1).map_or(0, |next| common(id, next));
+        let need = (before.max(after) + 1).min(id.len());
+        if need > 8 {
+            long.insert((*id).to_owned(), need);
+        }
+    }
+    if let Ok(mut table) = LONG_SHORT_IDS.write() {
+        *table = Some(long);
+    }
+}
+
+/// The id as shown in listings: its first eight characters, or more when
+/// another loaded session shares them.
+pub fn short_id(id: &str) -> &str {
+    let len = LONG_SHORT_IDS
+        .read()
+        .ok()
+        .and_then(|t| t.as_ref()?.get(id).copied())
+        .unwrap_or(8);
+    id.get(..len).unwrap_or(id)
 }
 
 fn load_selected_sources(source: Option<&str>) -> Vec<Session> {
