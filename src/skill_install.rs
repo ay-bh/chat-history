@@ -229,7 +229,12 @@ pub fn chosen_name() -> String {
 fn old_names() -> Vec<String> {
     state_file(OLD_NAMES_FILE)
         .and_then(|f| std::fs::read_to_string(f).ok())
-        .map(|s| s.lines().map(str::to_owned).collect())
+        .map(|s| {
+            s.lines()
+                .filter(|n| validate_name(n).is_ok())
+                .map(str::to_owned)
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -349,14 +354,15 @@ impl RootResult {
     /// The skill and its stub, if one is due, are in place: only then can
     /// what they replace go, since the stub points at the skill.
     /// A stub the user edited may still point at the previous name, so it
-    /// counts only once it names this skill.
+    /// counts only once it names this skill. A copy there that is not a stub
+    /// (an edited 0.8 skill, someone else's) points at nothing of ours.
     fn ready(&self) -> bool {
         let skill = skill_path(&self.skill.0.dir).display().to_string();
         self.placed()
             && self.stub.as_ref().is_none_or(|(stub, a)| {
-                in_place(a)
+                *a != EnsureAction::Failed
                     && std::fs::read_to_string(skill_path(&stub.dir))
-                        .is_ok_and(|s| s.contains(&skill))
+                        .is_ok_and(|s| !s.contains(STUB_HEADING) || s.contains(&skill))
             })
     }
 }
@@ -475,15 +481,23 @@ fn report_retired(dir: &Path, retired: &Retired, left_alone: &str) -> bool {
 
 /// Copies this tool installed before 0.9 at locations it no longer uses: the
 /// Cursor-only folder (Cursor reads `~/.agents/skills`) and Codex's deprecated
-/// `$CODEX_HOME/skills`.
+/// `$CODEX_HOME/skills`. Never one of the current roots (CODEX_HOME may
+/// point at `~/.agents`).
 fn old_locations() -> Vec<PathBuf> {
     let Some(home) = user_home() else {
         return Vec::new();
     };
+    let current: Vec<PathBuf> = roots()
+        .into_iter()
+        .map(|r| r.dir.join(LEGACY_NAME))
+        .collect();
     vec![
         home.join(".cursor/skills").join(LEGACY_NAME),
         session::codex_home().join("skills").join(LEGACY_NAME),
     ]
+    .into_iter()
+    .filter(|d| !current.contains(d))
+    .collect()
 }
 
 /// Remove a copy only if this tool wrote it and nobody edited it since: its
@@ -562,22 +576,23 @@ fn write_managed_skill(dir: &Path, content: &str, policy: bool) -> bool {
     if std::fs::create_dir_all(dir).is_err() {
         return false;
     }
-    if policy {
-        let path = dir.join(STUB_POLICY_FILE);
-        // A policy file the user customised is theirs to keep.
-        if !path.exists()
-            && (std::fs::create_dir_all(path.parent().unwrap()).is_err()
-                || std::fs::write(&path, STUB_OPENAI_YAML).is_err())
-        {
-            return false;
-        }
-    } else if is_stub(dir) && !remove_stub_policy(dir) {
+    if !policy && is_stub(dir) && !remove_stub_policy(dir) {
         // The real skill replacing a stub must not keep its no-implicit-use
         // policy. Failing here leaves the stub, so the next run retries.
         return false;
     }
-    std::fs::write(skill_path(dir), content).is_ok()
-        && std::fs::write(sidecar_path(dir), content_hash(content)).is_ok()
+    if !(std::fs::write(skill_path(dir), content).is_ok()
+        && std::fs::write(sidecar_path(dir), content_hash(content)).is_ok())
+    {
+        return false;
+    }
+    // After SKILL.md, so a failed write never leaves the policy beside the
+    // real skill. A policy file the user customised is theirs to keep.
+    let path = dir.join(STUB_POLICY_FILE);
+    !policy
+        || path.exists()
+        || (std::fs::create_dir_all(path.parent().unwrap()).is_ok()
+            && std::fs::write(&path, STUB_OPENAI_YAML).is_ok())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -636,9 +651,13 @@ fn ensure_one(target: &Target, mode: Mode) -> EnsureAction {
         }
         // Explicit install-skill: adopt pre-sidecar installs so upgrades that
         // re-run install-skill get the new skill (matches 0.2.x "re-run
-        // install-skill after upgrades"). Only recognisably ours: another
-        // skill may use the name.
-        Err(_) if mode == Mode::Explicit && on_disk.contains(OWN_SKILL_MARK) => {
+        // install-skill after upgrades"). Only recognisably ours, and only in
+        // the folder old versions wrote: another skill may use the name.
+        Err(_)
+            if mode == Mode::Explicit
+                && dir.file_name() == Some(LEGACY_NAME.as_ref())
+                && on_disk.contains(OWN_SKILL_MARK) =>
+        {
             write(EnsureAction::Refreshed)
         }
         // Quiet path, or not recognisably ours: don't guess — leave alone.

@@ -324,18 +324,58 @@ fn an_unrelated_skill_with_the_same_name_is_not_overwritten_without_force() {
 }
 
 #[test]
-fn a_pre_sidecar_copy_of_ours_is_still_adopted() {
+fn a_pre_sidecar_copy_of_ours_is_adopted_only_where_old_versions_wrote_it() {
     let home = TempDir::new().unwrap();
     let h = home.path();
-    let dir = h.join(".claude/skills/history");
-    fs::create_dir_all(&dir).unwrap();
-    fs::write(
-        dir.join("SKILL.md"),
-        "---\nname: chat-history\n---\nIf the command is not found: `cargo install chat-history`.\n",
-    )
-    .unwrap();
+    let ours = "---\nname: chat-history\n---\nIf the command is not found: `cargo install chat-history`.\n";
+    // Where 0.2 installed it, without a sidecar: replaced by the stub.
+    let old = h.join(".claude/skills/chat-history");
+    fs::create_dir_all(&old).unwrap();
+    fs::write(old.join("SKILL.md"), ours).unwrap();
+    // A copy the user made by hand under the new name: left alone.
+    let copied = h.join(".agents/skills/history");
+    fs::create_dir_all(&copied).unwrap();
+    fs::write(copied.join("SKILL.md"), ours).unwrap();
     cmd(h).arg("install-skill").assert().success();
-    assert!(read(dir.join("SKILL.md")).contains("\nname: \"history\"\n"));
+    assert!(read(old.join("SKILL.md")).contains("deprecated"));
+    assert_eq!(read(copied.join("SKILL.md")), ours);
+}
+
+#[test]
+fn an_edited_0_8_copy_does_not_keep_a_previous_name_installed() {
+    let home = TempDir::new().unwrap();
+    let h = home.path();
+    old_layout(h);
+    fs::write(h.join(".claude/skills/chat-history/SKILL.md"), "my edits").unwrap();
+    refresh(h);
+    cmd(h)
+        .args(["install-skill", "--name", "past-chats"])
+        .assert()
+        .success();
+    assert_eq!(
+        read(h.join(".claude/skills/chat-history/SKILL.md")),
+        "my edits"
+    );
+    assert!(h.join(".claude/skills/past-chats/SKILL.md").exists());
+    assert!(
+        !h.join(".claude/skills/history").exists(),
+        "an edited full copy does not point at history"
+    );
+}
+
+#[test]
+fn a_codex_home_inside_agents_is_not_treated_as_an_old_location() {
+    let home = TempDir::new().unwrap();
+    let h = home.path();
+    old_layout(h);
+    for _ in 0..2 {
+        cmd(h)
+            .env("CODEX_HOME", h.join(".agents"))
+            .args(["--from", "today"])
+            .assert()
+            .success();
+        assert!(read(h.join(".agents/skills/chat-history/SKILL.md")).contains("deprecated"));
+    }
 }
 
 #[test]
