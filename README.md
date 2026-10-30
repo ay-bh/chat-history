@@ -176,7 +176,7 @@ Human-readable results include an 8-char UUID prefix, longer when another sessio
 | Cursor IDE | `.../Cursor/User/globalStorage/state.vscdb` (`CURSOR_USER_DIR`; `--source cursor-ide`) |
 | Cursor subagents | `.../agent-transcripts/*/subagents/*.jsonl` |
 
-Cursor Agent chats found in both transcript and IDE data are shown once as `cursor-ide`. Noise is filtered automatically. Transcripts are read to the end; each tool output keeps its first 12 KiB and last 4 KiB.
+Cursor Agent chats found in both transcript and IDE data are shown once as `cursor-ide`. Noise is filtered automatically. Transcripts are read to the end. The search index keeps the first 12 KiB and last 4 KiB of each tool output, marking the gap `[…]`; `view` and `export` show tool output whole.
 
 ### Keeping Claude Code history
 
