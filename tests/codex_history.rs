@@ -184,6 +184,14 @@ fn a_continuation_page_of_a_codex_thread_opens_under_its_own_id() {
         .to_owned();
     assert_eq!(id, page);
     cmd(h).args(["inspect", &id, "--brief"]).assert().success();
+
+    // Searching from inside that thread leaves out all of its pages.
+    cmd(h)
+        .env("CODEX_THREAD_ID", thread)
+        .args(["search", "second page question", "--compact"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("01a181e").not());
 }
 
 /// Codex ids are time-ordered (UUIDv7): sessions started within about a

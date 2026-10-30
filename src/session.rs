@@ -310,12 +310,7 @@ pub fn resume_command(session: &Session) -> Option<ResumeAction> {
         "codex" => Some(ResumeAction::Exec {
             bin: "codex".into(),
             // Codex knows a continuation page by its thread.
-            args: vec![
-                "resume".into(),
-                codex_page(&session.file)
-                    .filter(|(_, page)| *page == session.id)
-                    .map_or_else(|| session.id.clone(), |(thread, _)| thread),
-            ],
+            args: vec!["resume".into(), thread_id(session)],
             workdir: existing_absolute_dir(&session.project),
         }),
         "claude" => Some(ResumeAction::Exec {
@@ -1022,6 +1017,15 @@ fn codex_page(file: &str) -> Option<(String, String)> {
     let thread = head.get(head.len().checked_sub(36)?..)?;
     let uuid = |s: &str| s.len() == 36 && s.chars().all(|c| c.is_ascii_hexdigit() || c == '-');
     (uuid(thread) && uuid(page)).then(|| (thread.to_owned(), page.to_owned()))
+}
+
+/// The conversation a session belongs to as its agent knows it: the thread
+/// for a Codex continuation page, else the session's own id.
+pub fn thread_id(session: &Session) -> String {
+    match codex_page(&session.file) {
+        Some((thread, page)) if session.source == "codex" && page == session.id => thread,
+        _ => session.id.clone(),
+    }
 }
 
 /// Codex compresses finished rollouts to `.jsonl.zst`; reads either form.
