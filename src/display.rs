@@ -147,7 +147,7 @@ fn print_title_line(title: &str, session: &Session) {
 /// inspect/view/export/find for all sources, and via resume for everything
 /// except `cursor-ide` rows (those print a sidebar hint instead).
 fn id_chip(session: &Session) -> String {
-    let short: String = session.id.chars().take(8).collect();
+    let short = crate::session::short_id(&session.id);
     format!("{}{:8}{}", c!("dim"), short, c!("reset"))
 }
 
@@ -367,7 +367,7 @@ pub fn print_search_results_compact(results: &[SearchResult], query: &str) {
 }
 
 fn compact_row(session: &Session, ordinal: Option<usize>, title: &str) -> String {
-    let short: String = session.id.chars().take(8).collect();
+    let short = crate::session::short_id(&session.id);
     let dir = if session.project.is_empty() {
         "-".to_string()
     } else {
@@ -382,7 +382,7 @@ fn compact_row(session: &Session, ordinal: Option<usize>, title: &str) -> String
     };
     format!(
         "{}  {}  {}  {dir}  {ordinal}  {title}{availability}",
-        tty(&short),
+        tty(short),
         tty(&session.date),
         src_label(&session.source, session.also_ide)
     )
@@ -551,7 +551,7 @@ pub fn print_search_results_json(results: &[SearchResult], query: &str) {
 /// files it read or edited.
 pub fn print_inspect_brief(info: &InspectInfo) {
     let tag = src_tag(&info.source, info.also_ide);
-    let short: String = info.session_id.chars().take(8).collect();
+    let short = crate::session::short_id(&info.session_id);
     let cwd = if info.project.is_empty() {
         "-".to_string()
     } else {
@@ -560,7 +560,7 @@ pub fn print_inspect_brief(info: &InspectInfo) {
     println!(
         "{tag}  {}{}{}  {}  {cwd}  {}min  {} msgs",
         c!("bold"),
-        tty(&short),
+        tty(short),
         c!("reset"),
         tty(&info.date),
         info.duration_minutes,

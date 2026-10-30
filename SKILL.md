@@ -27,7 +27,7 @@ Search, inspect, and export Claude Code, Cursor, and Codex conversation history.
 **Temporal question** ("what did I work on yesterday?") — list, don't search:
 
 1. `chat-history --from yesterday --to yesterday` — every row shows a short session ID; `-s` groups by day for multi-day overviews.
-   - `--from X` alone means **X through today**. Always pair with `--to` when the user means a specific day.
+   - `--from X` alone means **X through today**. Always pair with `--to` when the user means a specific day. A session counts on the day it started and the day it was last active, so a conversation resumed today lists under today (a compressed Codex session, which is finished, counts only on the day it started).
    - Short IDs work everywhere a session ID is accepted (`inspect`, `view`, `export`, `find`); `-v` adds full IDs and file paths. `resume` works for `claude` / `codex` rows and for Cursor Agent CLI chats; Cursor rows whose id has no `~/.cursor/chats` store (whatever their tag) print the **title** and `DIR:` — tell the user to open that folder in Cursor and pick the chat in the sidebar.
 2. `chat-history inspect <id>…` for accomplishments (how each turn ended), tools, files touched; `--brief` to compare several sessions.
 

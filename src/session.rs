@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -309,7 +309,8 @@ pub fn resume_command(session: &Session) -> Option<ResumeAction> {
     match session.source.as_str() {
         "codex" => Some(ResumeAction::Exec {
             bin: "codex".into(),
-            args: vec!["resume".into(), session.id.clone()],
+            // Codex knows a continuation page by its thread.
+            args: vec!["resume".into(), thread_id(session)],
             workdir: existing_absolute_dir(&session.project),
         }),
         "claude" => Some(ResumeAction::Exec {
@@ -1002,9 +1003,45 @@ fn codex_payload(entry: &Value) -> &Value {
     entry.get("payload").unwrap_or(entry)
 }
 
+/// The desktop app's paginated history continues a thread in a further file,
+/// `rollout-<time>-<thread>_<page>.jsonl`, whose header still carries the
+/// thread id but which holds only what came after the page it continues.
+/// Returns (thread, page) for such a file name.
+fn codex_page(file: &str) -> Option<(String, String)> {
+    let name = Path::new(file).file_name()?.to_str()?;
+    let stem = name
+        .strip_suffix(".zst")
+        .unwrap_or(name)
+        .strip_suffix(".jsonl")?;
+    let (head, page) = stem.rsplit_once('_')?;
+    let thread = head.get(head.len().checked_sub(36)?..)?;
+    let uuid = |s: &str| s.len() == 36 && s.chars().all(|c| c.is_ascii_hexdigit() || c == '-');
+    (uuid(thread) && uuid(page)).then(|| (thread.to_owned(), page.to_owned()))
+}
+
+/// The conversation a session belongs to as its agent knows it: the thread
+/// for a Codex continuation page, else the session's own id.
+pub fn thread_id(session: &Session) -> String {
+    match codex_page(&session.file) {
+        Some((thread, page)) if session.source == "codex" && page == session.id => thread,
+        _ => session.id.clone(),
+    }
+}
+
+/// Codex compresses finished rollouts to `.jsonl.zst`; reads either form.
+fn open_rollout(path: &Path) -> Option<Box<dyn Read>> {
+    let file = BufReader::new(fs::File::open(path).ok()?);
+    if path.extension().is_some_and(|e| e == "zst") {
+        Some(Box::new(
+            ruzstd::decoding::StreamingDecoder::new(file).ok()?,
+        ))
+    } else {
+        Some(Box::new(file))
+    }
+}
+
 fn read_codex_meta(path: &Path) -> Option<CodexMeta> {
-    let file = fs::File::open(path).ok()?;
-    let reader = BufReader::new(file);
+    let reader = BufReader::new(open_rollout(path)?);
     let line = reader.lines().next()?.ok()?;
     let entry: Value = serde_json::from_str(line.trim()).ok()?;
     let payload = codex_payload(&entry);
@@ -1073,9 +1110,8 @@ fn extract_codex_user_text(content: &Value) -> String {
 }
 
 fn codex_first_prompt(path: &Path) -> String {
-    let file = match fs::File::open(path) {
-        Ok(f) => f,
-        Err(_) => return String::new(),
+    let Some(file) = open_rollout(path) else {
+        return String::new();
     };
     let reader = BufReader::new(file);
     for line in reader.lines().take(100) {
@@ -1119,11 +1155,16 @@ pub fn load_codex_sessions() -> Vec<Session> {
         return Vec::new();
     }
     let mut sessions = Vec::new();
-    for path in glob::glob(&format!("{}/**/rollout-*.jsonl", base.display()))
+    let pattern = |ext: &str| format!("{}/**/rollout-*.{ext}", base.display());
+    let rollouts = glob::glob(&pattern("jsonl"))
         .into_iter()
+        .chain(glob::glob(&pattern("jsonl.zst")))
         .flatten()
         .flatten()
-    {
+        // A rollout caught mid-compression exists in both forms; the plain
+        // one is current.
+        .filter(|p| p.extension().is_none_or(|e| e != "zst") || !p.with_extension("").exists());
+    for path in rollouts {
         let Some((meta, first)) =
             crate::catalog::read("codex", TRANSCRIPT_KIND, &path, false, || {
                 let meta = read_codex_meta(&path)?;
@@ -1146,9 +1187,14 @@ pub fn load_codex_sessions() -> Vec<Session> {
             .get(..10)
             .map(str::to_string)
             .unwrap_or_else(|| mtime_date(&path).unwrap_or_default());
+        // A continuation page gets its own id, so each file opens on its own.
+        let id = match codex_page(&path.to_string_lossy()) {
+            Some((thread, page)) if thread == meta.id => page,
+            _ => meta.id,
+        };
         sessions.push(Session {
             source: "codex".into(),
-            id: meta.id,
+            id,
             summary: String::new(),
             first_prompt: first,
             created: meta.created,
@@ -1184,7 +1230,46 @@ pub fn load_sessions(source: Option<&str>) -> Vec<Session> {
         Some(s) => vec![s],
         None => vec!["claude", "cursor", "cursor-ide", "codex"],
     };
-    crate::catalog::with_catalog(&sources, || load_selected_sources(src.as_deref()))
+    let sessions = crate::catalog::with_catalog(&sources, || load_selected_sources(src.as_deref()));
+    record_short_ids(&sessions);
+    sessions
+}
+
+/// Ids whose displayed prefix needs more than eight characters to be
+/// unambiguous, with the length it needs. Codex ids are time-ordered
+/// (UUIDv7), so sessions started within about a minute share their first
+/// eight characters.
+static LONG_SHORT_IDS: std::sync::RwLock<Option<HashMap<String, usize>>> =
+    std::sync::RwLock::new(None);
+
+fn record_short_ids(sessions: &[Session]) {
+    let mut ids: Vec<&str> = sessions.iter().map(|s| s.id.as_str()).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    let common = |a: &str, b: &str| a.bytes().zip(b.bytes()).take_while(|(x, y)| x == y).count();
+    let mut long = HashMap::new();
+    for (i, id) in ids.iter().enumerate() {
+        let before = i.checked_sub(1).map_or(0, |j| common(ids[j], id));
+        let after = ids.get(i + 1).map_or(0, |next| common(id, next));
+        let need = (before.max(after) + 1).min(id.len());
+        if need > 8 {
+            long.insert((*id).to_owned(), need);
+        }
+    }
+    if let Ok(mut table) = LONG_SHORT_IDS.write() {
+        *table = Some(long);
+    }
+}
+
+/// The id as shown in listings: its first eight characters, or more when
+/// another loaded session shares them.
+pub fn short_id(id: &str) -> &str {
+    let len = LONG_SHORT_IDS
+        .read()
+        .ok()
+        .and_then(|t| t.as_ref()?.get(id).copied())
+        .unwrap_or(8);
+    id.get(..len).unwrap_or(id)
 }
 
 fn load_selected_sources(source: Option<&str>) -> Vec<Session> {
@@ -1698,9 +1783,11 @@ pub fn parse_codex_jsonl(filepath: &str) -> Vec<Message> {
     // Whole-file read + lossy decode: an unreadable path fails once up front
     // (io::Lines can yield Err forever), and an invalid UTF-8 line only
     // corrupts itself instead of truncating the rest of the transcript.
-    let Ok(bytes) = fs::read(filepath) else {
+    let mut bytes = Vec::new();
+    let read = open_rollout(Path::new(filepath)).map(|mut r| r.read_to_end(&mut bytes));
+    if !matches!(read, Some(Ok(_))) {
         return Vec::new();
-    };
+    }
     let entries: Vec<Value> = String::from_utf8_lossy(&bytes)
         .lines()
         .filter_map(|l| serde_json::from_str(l.trim()).ok())
@@ -2121,19 +2208,25 @@ pub fn filter_sessions(
         .filter(|s| {
             // Only require a parseable date when a date filter is in play;
             // a session with a missing date must still list otherwise.
+            // A session is in the range if the day it started or the day it
+            // was last written falls in it, so a conversation resumed on a
+            // later day lists on that day too. Days in between are not
+            // counted: nothing records whether anything happened on them.
             if from_date.is_some() || to_date.is_some() {
-                let d = match NaiveDate::parse_from_str(&s.date, "%Y-%m-%d") {
-                    Ok(d) => d,
-                    Err(_) => return false,
-                };
-                if let Some(fd) = from_date
-                    && d < fd
-                {
+                let day = |d: &str| NaiveDate::parse_from_str(d, "%Y-%m-%d").ok();
+                let Some(start) = day(&s.date) else {
                     return false;
-                }
-                if let Some(td) = to_date
-                    && d > td
-                {
+                };
+                let in_range = |d: NaiveDate| {
+                    from_date.is_none_or(|fd| d >= fd) && to_date.is_none_or(|td| d <= td)
+                };
+                // A compressed Codex rollout is finished: its file time is
+                // when Codex compressed it, not activity.
+                let last = (!s.file.ends_with(".zst"))
+                    .then(|| day(&iso_date(&s.modified)))
+                    .flatten()
+                    .filter(|l| *l > start);
+                if !in_range(start) && !last.is_some_and(in_range) {
                     return false;
                 }
             }
@@ -2370,6 +2463,30 @@ mod tests {
                 bin: "codex".into(),
                 args: vec!["resume".into(), "x1".into()],
                 workdir: existing_absolute_dir(&codex.project),
+            })
+        );
+    }
+
+    #[test]
+    fn resume_command_for_a_codex_continuation_page_names_its_thread() {
+        let mut page = make_session(
+            "01a181ee-9fd1-7b62-a9bc-2140a4c8b116",
+            "2026-10-28",
+            "codex",
+            "/p",
+            "",
+            "",
+        );
+        page.file = "/s/rollout-2026-10-28T15-24-21-01a181ea-eb4d-7b32-b28d-a34666d8653d_01a181ee-9fd1-7b62-a9bc-2140a4c8b116.jsonl".into();
+        assert_eq!(
+            resume_command(&page),
+            Some(ResumeAction::Exec {
+                bin: "codex".into(),
+                args: vec![
+                    "resume".into(),
+                    "01a181ea-eb4d-7b32-b28d-a34666d8653d".into()
+                ],
+                workdir: existing_absolute_dir(&page.project),
             })
         );
     }

@@ -557,9 +557,12 @@ fn main() {
             // for and would rank first; asking for it by id still finds it.
             if !scoring::is_uuid(&query) {
                 let calling = session::calling_sessions();
+                // Every page of a Codex thread is part of the calling conversation.
                 pre.retain(|s| {
                     !calling.iter().any(|(source, id)| {
-                        s.source.starts_with(source) && s.id.eq_ignore_ascii_case(id)
+                        s.source.starts_with(source)
+                            && (s.id.eq_ignore_ascii_case(id)
+                                || session::thread_id(s).eq_ignore_ascii_case(id))
                     })
                 });
             }

@@ -146,7 +146,7 @@ Scopes: `all` (default), `errors`, `similar`, `tools`, `files`. Use `--timeframe
 
 `--timeframe` excludes untimestamped messages and first-prompt previews; Cursor recovers missing message times from IDE data when possible. Titles use session activity timestamps.
 
-Human-readable results include an 8-char UUID prefix. Pass it to `find` for any row; `inspect`, `view`, and `export` require a transcript. `resume` works for Claude, Codex, and Cursor chats with a store under `~/.cursor/chats`; other Cursor rows print the chat's **title** and `DIR:` so you can open it in the sidebar.
+Human-readable results include an 8-char UUID prefix, longer when another session shares those characters (Codex ids are time-ordered, so sessions started within a minute often do). Pass it to `find` for any row; `inspect`, `view`, and `export` require a transcript. `resume` works for Claude, Codex, and Cursor chats with a store under `~/.cursor/chats`; other Cursor rows print the chat's **title** and `DIR:` so you can open it in the sidebar.
 
 `--json` still includes `session_id`. For IDE Agent chats the JSON `source` is `cursor` (the jsonl store) even though the human tag is `cursor-ide`; those items carry `"also_ide": true`; `resume` launches the Agent CLI when a `~/.cursor/chats` store exists for the id and prints the sidebar hint otherwise.
 
