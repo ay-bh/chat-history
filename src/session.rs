@@ -2204,18 +2204,24 @@ pub fn filter_sessions(
         .filter(|s| {
             // Only require a parseable date when a date filter is in play;
             // a session with a missing date must still list otherwise.
+            // A session is in the range if it was active in it: started by
+            // the range's end and last written on or after its start, so a
+            // conversation resumed on a later day lists on that day too.
             if from_date.is_some() || to_date.is_some() {
-                let d = match NaiveDate::parse_from_str(&s.date, "%Y-%m-%d") {
-                    Ok(d) => d,
-                    Err(_) => return false,
+                let day = |d: &str| NaiveDate::parse_from_str(d, "%Y-%m-%d").ok();
+                let Some(start) = day(&s.date) else {
+                    return false;
                 };
+                let end = day(&iso_date(&s.modified))
+                    .filter(|e| *e > start)
+                    .unwrap_or(start);
                 if let Some(fd) = from_date
-                    && d < fd
+                    && end < fd
                 {
                     return false;
                 }
                 if let Some(td) = to_date
-                    && d > td
+                    && start > td
                 {
                     return false;
                 }

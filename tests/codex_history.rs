@@ -235,3 +235,54 @@ fn displayed_ids_are_long_enough_to_reopen_their_session() {
         .success()
         .stdout(predicate::str::contains("01a18bda-4"));
 }
+
+#[test]
+fn a_conversation_resumed_on_a_later_day_lists_on_every_day_it_was_active() {
+    let home = TempDir::new().unwrap();
+    let h = home.path();
+    let id = "01a17cd4-0000-7000-8000-000000000001";
+    let file = day_dir(h, "2026-10-28").join(format!("rollout-2026-10-28T10-00-00-{id}.jsonl"));
+    fs::write(
+        &file,
+        rollout(
+            id,
+            "2026-10-28T10:00:00.000Z",
+            &[
+                (
+                    "2026-10-28T10:00:05.000Z",
+                    "start the walrus report",
+                    "Started.",
+                ),
+                (
+                    "2026-10-30T09:00:00.000Z",
+                    "finish the walrus report",
+                    "Finished.",
+                ),
+            ],
+        ),
+    )
+    .unwrap();
+    // The file was last written when the conversation was resumed.
+    let resumed = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_793_350_800); // 2026-10-30T09:00:00Z
+    fs::File::options()
+        .write(true)
+        .open(&file)
+        .unwrap()
+        .set_modified(resumed)
+        .unwrap();
+
+    for day in ["2026-10-28", "2026-10-29", "2026-10-30"] {
+        cmd(h)
+            .args(["--source", "codex", "--from", day, "--to", day])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("walrus report"));
+    }
+    for (from, to) in [("2026-10-26", "2026-10-27"), ("2026-10-31", "2026-11-01")] {
+        cmd(h)
+            .args(["--source", "codex", "--from", from, "--to", to])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("walrus report").not());
+    }
+}
