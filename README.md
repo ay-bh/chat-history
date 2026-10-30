@@ -160,7 +160,8 @@ Human-readable results include an 8-char UUID prefix, longer when another sessio
 - `★ N.N` = relevance (higher is better)
 - `inspect` → duration, messages, model, tokens, tools, files, accomplishments (the first informative sentence of the reply that ended each turn), key decisions. It takes several ids; `--brief` prints each as a header, what was asked, its latest substantive result (the last reply with an informative sentence, so a closing "All set" does not hide it), and up to five files it read or edited, the project's first (agent config and scratch files left out). Files come from tool calls, so a listed file was not necessarily changed
 - Claude Code titles come from `ai-title` / `custom-title` JSONL when available
-- Subagent/sidechain sessions are omitted unless `--sidechains`; this includes Cursor transcripts under `agent-transcripts/*/subagents/` (tagged `[subagent]`)
+- Subagent/sidechain sessions are omitted unless `--sidechains`; this includes Claude Code transcripts under `<session>/subagents/` (titled by their task) and Cursor transcripts under `agent-transcripts/*/subagents/` (tagged `[subagent]`)
+- Codex rows are titled by the thread name Codex shows, from `~/.codex/state_*.sqlite`
 - Codex commentary-phase messages are hidden once a turn has a final answer; interrupted turns keep commentary
 
 ## Data sources
@@ -168,13 +169,18 @@ Human-readable results include an 8-char UUID prefix, longer when another sessio
 | Source | Path |
 |---|---|
 | Claude Code | `~/.claude/projects/*/*.jsonl` (+ optional legacy `sessions-index.json`) |
-| Codex | `$CODEX_HOME/sessions/YYYY/MM/DD/rollout-*.jsonl` (default `~/.codex`) |
+| Claude Code subagents | `~/.claude/projects/*/<session>/subagents/agent-*.jsonl` (`--sidechains`) |
+| Codex | `$CODEX_HOME/sessions/YYYY/MM/DD/rollout-*.jsonl` and compressed `rollout-*.jsonl.zst`, plus `$CODEX_HOME/archived_sessions/` (default `~/.codex`) |
 | Cursor Agent | `~/.cursor/projects/*/agent-transcripts/` (`--source cursor`, alias `cursor-agent`) |
 | Cursor CLI metadata | `~/.cursor/chats/*/*/{meta.json,store.db}` (same source; discovers CLI-only sessions) |
 | Cursor IDE | `.../Cursor/User/globalStorage/state.vscdb` (`CURSOR_USER_DIR`; `--source cursor-ide`) |
 | Cursor subagents | `.../agent-transcripts/*/subagents/*.jsonl` |
 
 Cursor Agent chats found in both transcript and IDE data are shown once as `cursor-ide`. Noise is filtered automatically. Transcripts are read to the end; each tool output keeps its first 12 KiB and last 4 KiB.
+
+### Keeping Claude Code history
+
+chat-history reads the transcripts the agents keep; it does not archive them. **Claude Code deletes CLI session transcripts 30 days after their last activity by default**, and they then disappear from chat-history too. To keep them, raise the limit in `~/.claude/settings.json`, for example `"cleanupPeriodDays": 3650`. Codex and Cursor keep their history until you delete it (Codex compresses older sessions, which chat-history reads).
 
 ### Metadata cache
 
