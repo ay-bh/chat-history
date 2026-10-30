@@ -72,7 +72,23 @@ fn truncate_for_search(s: &str, max: usize) -> String {
     }
     let head_end = s.floor_char_boundary(max * 3 / 4);
     let tail_start = s.ceil_char_boundary(s.len().saturating_sub(max / 4));
-    format!("{} {}", &s[..head_end], &s[tail_start..])
+    format!("{} […] {}", &s[..head_end], &s[tail_start..])
+}
+
+/// Set by `view` and `export`, which show tool output whole; otherwise (the
+/// search index, inspect) a long output keeps its first 12 KiB and last 4.
+static WHOLE_TOOL_OUTPUT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn keep_whole_tool_output() {
+    WHOLE_TOOL_OUTPUT.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn clip_tool_output(s: &str) -> String {
+    if WHOLE_TOOL_OUTPUT.load(std::sync::atomic::Ordering::Relaxed) {
+        s.to_owned()
+    } else {
+        truncate_for_search(s, 16 * 1024)
+    }
 }
 
 /// Words that run the word after them as the command.
@@ -602,7 +618,7 @@ pub fn tool_output_text(output: &Value) -> String {
             .join("\n"),
         _ => String::new(),
     };
-    truncate_for_search(&text, 16 * 1024)
+    clip_tool_output(&text)
 }
 
 pub fn extract_text(content: &Value) -> String {
@@ -642,13 +658,13 @@ pub fn extract_text(content: &Value) -> String {
                     }
                     "tool_result" => match block.get("content") {
                         Some(Value::String(inner)) => {
-                            let truncated = truncate_for_search(inner, 16 * 1024);
+                            let truncated = clip_tool_output(inner);
                             parts.push(format!("[Tool Result] {truncated}"));
                         }
                         Some(Value::Array(arr)) => {
                             for item in arr {
                                 if let Some(t) = item.get("text").and_then(Value::as_str) {
-                                    let truncated = truncate_for_search(t, 16 * 1024);
+                                    let truncated = clip_tool_output(t);
                                     parts.push(format!("[Tool Result] {truncated}"));
                                 }
                             }
@@ -1206,7 +1222,8 @@ mod tests {
             "one\ntwo"
         );
         let long = "x".repeat(40 * 1024);
-        assert!(tool_output_text(&json!(long)).len() <= 16 * 1024 + 1);
+        // The kept start and end, joined by a visible " […] " marker.
+        assert!(tool_output_text(&json!(long)).len() <= 16 * 1024 + " […] ".len());
     }
 
     #[test]

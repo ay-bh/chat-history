@@ -124,3 +124,43 @@ fn a_search_from_inside_a_session_leaves_out_its_subagents() {
         .success()
         .stdout(predicate::str::contains("agent-ae").not());
 }
+
+#[test]
+fn view_and_export_show_a_long_claude_tool_result_whole() {
+    let home = TempDir::new().unwrap();
+    let h = home.path();
+    let proj = h.join(".claude/projects/-work-proj");
+    fs::create_dir_all(&proj).unwrap();
+    let long = format!(
+        "{}MIDDLE-OF-THE-LOG{}",
+        "a".repeat(20_000),
+        "z".repeat(20_000)
+    );
+    let result = serde_json::json!({
+        "type": "user", "sessionId": SESSION, "cwd": "/work/proj",
+        "timestamp": "2026-10-30T08:00:02.000Z", "uuid": "u-result",
+        "message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t1", "content": long}
+        ]}
+    });
+    fs::write(
+        proj.join(format!("{SESSION}.jsonl")),
+        [
+            line("user", "run the build", false, None),
+            line("assistant", "Running it.", false, None),
+            result.to_string(),
+        ]
+        .join("\n"),
+    )
+    .unwrap();
+    cmd(h)
+        .args(["view", SESSION, "--plain"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("MIDDLE-OF-THE-LOG"));
+    cmd(h)
+        .args(["export", SESSION])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("MIDDLE-OF-THE-LOG"));
+}

@@ -36,7 +36,7 @@ const RECLAIMED_SIZE: u64 = 64 * 1024;
 const RECLAIM_TIMEOUT: Duration = Duration::from_millis(250);
 // Bump for parser, timestamp, chunking or tokenization changes that require
 // re-extracting unchanged sources without changing the relational schema.
-const EXTRACTION_VERSION: u32 = 3;
+const EXTRACTION_VERSION: u32 = 4;
 const MAX_ANALYZER_TOKENS: usize = 128;
 const MAX_PHRASE_TOKENS: usize = 32;
 const MAX_PASSAGE_CHARS: usize = 1600;

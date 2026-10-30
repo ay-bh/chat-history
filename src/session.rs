@@ -1870,6 +1870,118 @@ fn codex_commentary_to_skip(entries: &[Value]) -> HashSet<usize> {
     skip
 }
 
+/// What a Codex tool call did, recorded as the Claude parser records a tool
+/// use: the tools it ran, a `[Tool: name] detail` line per action, and the
+/// files it patched. Current Codex runs tools from JavaScript `exec` cells
+/// (`tools.exec_command({cmd:"…"})`, `tools.apply_patch("*** Begin Patch…")`);
+/// older versions sent `shell` / `exec_command` / `apply_patch` calls.
+#[derive(Default)]
+struct CodexToolUse {
+    tools: Vec<String>,
+    lines: Vec<String>,
+    files: Vec<String>,
+}
+
+impl CodexToolUse {
+    fn add(&mut self, mut other: CodexToolUse) {
+        self.tools.append(&mut other.tools);
+        self.lines.append(&mut other.lines);
+        self.files.append(&mut other.files);
+    }
+
+    /// Append to an assistant message, as Claude's tool_use blocks are.
+    fn attach(self, message: &mut Message) {
+        message.tool_uses.extend(self.tools);
+        for line in self.lines {
+            message.content.push('\n');
+            message.content.push_str(&line);
+        }
+        message.files_referenced.extend(self.files);
+    }
+}
+
+fn codex_tool_use(name: &str, call: &str) -> CodexToolUse {
+    use std::sync::LazyLock;
+    static INNER: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"tools\.([A-Za-z_][A-Za-z0-9_]*)\(").unwrap());
+    static CMD: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r#"\bcmd\s*:\s*(?:"((?:[^"\\]|\\.)*)"|'((?:[^'\\]|\\.)*)'|`([^`]*)`)"#)
+            .unwrap()
+    });
+    // A patch's file headers, on their own lines or after an escaped `\n`
+    // inside a JavaScript string.
+    static PATCHED: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r#"\*\*\* (?:Add File|Update File|Delete File|Move to): ([^\n\\"]+)"#)
+            .unwrap()
+    });
+    let clip = |s: &str| s.trim().chars().take(200).collect::<String>();
+    let mut out = CodexToolUse::default();
+    let mut commands = Vec::new();
+    if name == "exec" {
+        for m in INNER.captures_iter(call) {
+            if !out.tools.contains(&m[1].to_owned()) {
+                out.tools.push(m[1].to_owned());
+            }
+        }
+        if out.tools.is_empty() {
+            out.tools.push(name.to_owned());
+        }
+        for m in CMD.captures_iter(call) {
+            let raw = m
+                .get(1)
+                .or(m.get(2))
+                .or(m.get(3))
+                .map_or("", |g| g.as_str());
+            commands.push(
+                raw.replace("\\\"", "\"")
+                    .replace("\\n", " ")
+                    .replace("\\\\", "\\"),
+            );
+        }
+    } else {
+        out.tools.push(name.to_owned());
+        if let Ok(Value::Object(args)) = serde_json::from_str::<Value>(call) {
+            for key in ["cmd", "command"] {
+                match args.get(key) {
+                    Some(Value::String(c)) => commands.push(c.clone()),
+                    Some(Value::Array(parts)) => commands.push(
+                        parts
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .collect::<Vec<_>>()
+                            .join(" "),
+                    ),
+                    _ => {}
+                }
+            }
+            for key in ["title", "path", "file_path", "query"] {
+                if let Some(Value::String(v)) = args.get(key) {
+                    out.lines.push(format!("[Tool: {name}] {}", clip(v)));
+                }
+            }
+        }
+    }
+    let command_tool = if name == "exec" { "exec_command" } else { name };
+    for c in commands {
+        out.lines
+            .push(format!("[Tool: {command_tool}] {}", clip(&c)));
+    }
+    for m in PATCHED.captures_iter(call) {
+        let file = m[1].trim().to_owned();
+        if !out.files.contains(&file) {
+            out.files.push(file);
+        }
+    }
+    if !out.files.is_empty() {
+        out.lines
+            .push(format!("[Tool: apply_patch] {}", out.files.join(" ")));
+    }
+    if out.lines.is_empty() {
+        out.lines.push(format!("[Tool: {}]", out.tools.join(", ")));
+    }
+    out
+}
+
 pub fn parse_codex_jsonl(filepath: &str) -> Vec<Message> {
     // Whole-file read + lossy decode: an unreadable path fails once up front
     // (io::Lines can yield Err forever), and an invalid UTF-8 line only
@@ -1890,7 +2002,7 @@ pub fn parse_codex_jsonl(filepath: &str) -> Vec<Message> {
     let mut project_path = String::new();
     // Tool calls made before the assistant says anything; attached to the
     // next assistant message so they aren't lost.
-    let mut pending_tools: Vec<String> = Vec::new();
+    let mut pending_tools = CodexToolUse::default();
     // Set while a skipped commentary message is the turn's latest assistant
     // output: tool calls must wait for the turn's final answer instead of
     // attaching to the previous turn's message.
@@ -1944,25 +2056,25 @@ pub fn parse_codex_jsonl(filepath: &str) -> Vec<Message> {
                     continue;
                 }
                 let ctx = crate::parser::extract_context(&content_raw);
-                let mut tool_uses = ctx.tools;
-                if role == "assistant" {
-                    tool_uses.append(&mut pending_tools);
-                    route_tools_forward = false;
-                }
-                messages.push(Message {
+                let mut message = Message {
                     uuid: String::new(),
                     timestamp,
                     role: role.to_string(),
                     content: text,
                     session_id: session_id.clone(),
                     project_path: project_path.clone(),
-                    tool_uses,
+                    tool_uses: ctx.tools,
                     files_referenced: ctx.files,
                     error_patterns: ctx.errors,
                     relevance_score: 0.0,
                     final_score: 0.0,
                     history_output: false,
-                });
+                };
+                if role == "assistant" {
+                    std::mem::take(&mut pending_tools).attach(&mut message);
+                    route_tools_forward = false;
+                }
+                messages.push(message);
             }
             // Tool calls are separate records in Codex rollouts; attach the
             // tool name to the assistant message that initiated it, or hold
@@ -1982,11 +2094,12 @@ pub fn parse_codex_jsonl(filepath: &str) -> Vec<Message> {
                     history_calls.insert(id.to_owned());
                 }
                 if let Some(name) = payload.get("name").and_then(Value::as_str) {
+                    let used = codex_tool_use(name, call);
                     match messages.iter_mut().rev().find(|m| m.role != "tool") {
                         Some(last) if last.role == "assistant" && !route_tools_forward => {
-                            last.tool_uses.push(name.to_string());
+                            used.attach(last);
                         }
-                        _ => pending_tools.push(name.to_string()),
+                        _ => pending_tools.add(used),
                     }
                 }
             }
@@ -3965,8 +4078,9 @@ mod tests {
             .expect("turn 1 final answer present");
         let task_b = messages
             .iter()
-            .find(|m| m.content == "Task B is done.")
+            .find(|m| m.content.starts_with("Task B is done."))
             .expect("turn 2 final answer present");
+        assert_eq!(task_b.content, "Task B is done.\n[Tool: shell] ls");
         assert!(
             task_a.tool_uses.is_empty(),
             "turn 2's tool call must not attach to turn 1's answer, got {:?}",

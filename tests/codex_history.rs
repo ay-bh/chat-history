@@ -419,3 +419,105 @@ fn codex_thread_titles_are_shown_and_searched() {
         .success()
         .stdout(predicate::str::contains("01a17e42"));
 }
+
+/// A rollout with the tool calls current Codex writes: `exec` cells that
+/// call `tools.exec_command` / `tools.apply_patch` from JavaScript, and the
+/// older separate `exec_command` / `apply_patch` calls.
+fn rollout_with_tools(id: &str, long_output: &str) -> String {
+    let meta = format!(
+        r#"{{"timestamp":"2026-10-20T09:00:00.000Z","type":"session_meta","payload":{{"id":"{id}","timestamp":"2026-10-20T09:00:00.000Z","cwd":"/work/proj"}}}}"#
+    );
+    let user = r#"{"timestamp":"2026-10-20T09:00:01.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"fix the column sorting"}]}}"#;
+    let answer = r#"{"timestamp":"2026-10-20T09:00:02.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Patching the sort."}]}}"#;
+    let exec_cell = serde_json::json!({
+        "timestamp": "2026-10-20T09:00:03.000Z", "type": "response_item",
+        "payload": {"type": "custom_tool_call", "name": "exec", "call_id": "c1",
+            "input": "text(await tools.exec_command({cmd:\"cargo test --test wombat_sort\",max_output_tokens:2000}))\nawait tools.apply_patch(\"*** Begin Patch\\n*** Update File: /work/proj/src/columnUtils.ts\\n@@\\n-a\\n+b\\n*** End Patch\")"}
+    });
+    let output = serde_json::json!({
+        "timestamp": "2026-10-20T09:00:04.000Z", "type": "response_item",
+        "payload": {"type": "custom_tool_call_output", "call_id": "c1", "output": long_output}
+    });
+    let legacy_patch = serde_json::json!({
+        "timestamp": "2026-10-20T09:00:05.000Z", "type": "response_item",
+        "payload": {"type": "custom_tool_call", "name": "apply_patch", "call_id": "c2",
+            "input": "*** Begin Patch\n*** Add File: docs/sorting.md\n+notes\n*** End Patch"}
+    });
+    let legacy_shell = serde_json::json!({
+        "timestamp": "2026-10-20T09:00:06.000Z", "type": "response_item",
+        "payload": {"type": "function_call", "name": "shell", "call_id": "c3",
+            "arguments": "{\"command\":[\"bash\",\"-lc\",\"rg quokkasort src\"]}"}
+    });
+    [
+        meta,
+        user.to_owned(),
+        answer.to_owned(),
+        exec_cell.to_string(),
+        output.to_string(),
+        legacy_patch.to_string(),
+        legacy_shell.to_string(),
+    ]
+    .join("\n")
+        + "\n"
+}
+
+#[test]
+fn codex_commands_and_patched_files_are_searchable_and_shown() {
+    let home = TempDir::new().unwrap();
+    let h = home.path();
+    let id = "01a158b7-0000-7000-8000-000000000007";
+    fs::write(
+        day_dir(h, "2026-10-20").join(format!("rollout-2026-10-20T14-30-00-{id}.jsonl")),
+        rollout_with_tools(id, "tests passed"),
+    )
+    .unwrap();
+    for (query, scope) in [
+        ("columnUtils.ts", "files"),
+        ("sorting.md", "files"),
+        ("wombat_sort", "all"),
+        ("quokkasort", "all"),
+    ] {
+        cmd(h)
+            .args(["search", query, "--scope", scope, "--compact"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("01a158b7"));
+    }
+    cmd(h)
+        .args(["view", id, "--plain"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "[Tool: exec_command] cargo test --test wombat_sort",
+        ))
+        .stdout(predicate::str::contains(
+            "[Tool: apply_patch] /work/proj/src/columnUtils.ts",
+        ));
+}
+
+#[test]
+fn view_and_export_show_long_tool_output_whole() {
+    let home = TempDir::new().unwrap();
+    let h = home.path();
+    let id = "01a14b17-0000-7000-8000-000000000017";
+    let long = format!(
+        "{}MIDDLE-OF-THE-LOG{}",
+        "a".repeat(20_000),
+        "z".repeat(20_000)
+    );
+    fs::write(
+        day_dir(h, "2026-10-17").join(format!("rollout-2026-10-17T10-00-00-{id}.jsonl")),
+        rollout_with_tools(id, &long),
+    )
+    .unwrap();
+    cmd(h)
+        .args(["view", id, "--plain"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("MIDDLE-OF-THE-LOG"));
+    cmd(h)
+        .args(["export", id])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("MIDDLE-OF-THE-LOG"));
+}

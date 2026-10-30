@@ -461,7 +461,9 @@ fn codex_tool_output_is_indexed_as_tool() {
         "You: check the cormorant service\n\n\
          Tool: cormorantline degraded: 3 of 5 replicas ready\n\n\
          Tool: grebewing results from another session\n\n\
-         Claude: Two replicas are not ready.\n\n"
+         Claude: Two replicas are not ready.\n\
+         [Tool: exec_command] curl -s localhost:8080/health\n\
+         [Tool: exec_command] chat-history search 'cormorant' --json\n\n"
     );
 }
 
