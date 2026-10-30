@@ -353,3 +353,171 @@ fn a_compressed_rollout_counts_only_on_the_day_it_started() {
         .success()
         .stdout(predicate::str::contains("narwhal"));
 }
+
+#[test]
+fn archived_codex_threads_are_still_history() {
+    let home = TempDir::new().unwrap();
+    let h = home.path();
+    let id = "01a158b9-0c85-7ce0-94eb-879fa19bacbc";
+    let dir = h.join(".codex/archived_sessions");
+    fs::create_dir_all(&dir).unwrap();
+    write_compressed(
+        &dir.join(format!("rollout-2026-10-20T15-21-26-{id}.jsonl.zst")),
+        &rollout(
+            id,
+            "2026-10-20T09:51:26.000Z",
+            &[(
+                "2026-10-20T09:51:30.000Z",
+                "the archived okapi plan",
+                "Archived.",
+            )],
+        ),
+    );
+    cmd(h)
+        .args(["--source", "codex"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("the archived okapi plan"));
+    cmd(h)
+        .args(["view", id, "--plain"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Archived."));
+}
+
+/// Codex names its threads (the names its sidebar shows) in its state
+/// database.
+#[test]
+fn codex_thread_titles_are_shown_and_searched() {
+    let home = TempDir::new().unwrap();
+    let h = home.path();
+    let id = "01a17e42-0000-7000-8000-000000000042";
+    fs::write(
+        day_dir(h, "2026-10-27").join(format!("rollout-2026-10-27T10-00-00-{id}.jsonl")),
+        rollout(
+            id,
+            "2026-10-27T04:30:00.000Z",
+            &[("2026-10-27T04:30:05.000Z", "please look at this", "Looked.")],
+        ),
+    )
+    .unwrap();
+    let db = rusqlite::Connection::open(h.join(".codex/state_5.sqlite")).unwrap();
+    db.execute_batch(&format!(
+        "CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, title TEXT, archived INTEGER);
+         INSERT INTO threads VALUES ('{id}', '', 'Quokka pipeline review', 0);"
+    ))
+    .unwrap();
+    drop(db);
+    cmd(h)
+        .args(["--source", "codex"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Quokka pipeline review"));
+    cmd(h)
+        .args(["search", "quokka", "--compact"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("01a17e42"));
+}
+
+/// A rollout with the tool calls current Codex writes: `exec` cells that
+/// call `tools.exec_command` / `tools.apply_patch` from JavaScript, and the
+/// older separate `exec_command` / `apply_patch` calls.
+fn rollout_with_tools(id: &str, long_output: &str) -> String {
+    let meta = format!(
+        r#"{{"timestamp":"2026-10-20T09:00:00.000Z","type":"session_meta","payload":{{"id":"{id}","timestamp":"2026-10-20T09:00:00.000Z","cwd":"/work/proj"}}}}"#
+    );
+    let user = r#"{"timestamp":"2026-10-20T09:00:01.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"fix the column sorting"}]}}"#;
+    let answer = r#"{"timestamp":"2026-10-20T09:00:02.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Patching the sort."}]}}"#;
+    let exec_cell = serde_json::json!({
+        "timestamp": "2026-10-20T09:00:03.000Z", "type": "response_item",
+        "payload": {"type": "custom_tool_call", "name": "exec", "call_id": "c1",
+            "input": "text(await tools.exec_command({cmd:\"cargo test --test wombat_sort\",max_output_tokens:2000}))\nawait tools.apply_patch(\"*** Begin Patch\\n*** Update File: /work/proj/src/columnUtils.ts\\n@@\\n-a\\n+b\\n*** End Patch\")"}
+    });
+    let output = serde_json::json!({
+        "timestamp": "2026-10-20T09:00:04.000Z", "type": "response_item",
+        "payload": {"type": "custom_tool_call_output", "call_id": "c1", "output": long_output}
+    });
+    let legacy_patch = serde_json::json!({
+        "timestamp": "2026-10-20T09:00:05.000Z", "type": "response_item",
+        "payload": {"type": "custom_tool_call", "name": "apply_patch", "call_id": "c2",
+            "input": "*** Begin Patch\n*** Add File: docs/sorting.md\n+notes\n*** End Patch"}
+    });
+    let legacy_shell = serde_json::json!({
+        "timestamp": "2026-10-20T09:00:06.000Z", "type": "response_item",
+        "payload": {"type": "function_call", "name": "shell", "call_id": "c3",
+            "arguments": "{\"command\":[\"bash\",\"-lc\",\"rg quokkasort src\"]}"}
+    });
+    [
+        meta,
+        user.to_owned(),
+        answer.to_owned(),
+        exec_cell.to_string(),
+        output.to_string(),
+        legacy_patch.to_string(),
+        legacy_shell.to_string(),
+    ]
+    .join("\n")
+        + "\n"
+}
+
+#[test]
+fn codex_commands_and_patched_files_are_searchable_and_shown() {
+    let home = TempDir::new().unwrap();
+    let h = home.path();
+    let id = "01a158b7-0000-7000-8000-000000000007";
+    fs::write(
+        day_dir(h, "2026-10-20").join(format!("rollout-2026-10-20T14-30-00-{id}.jsonl")),
+        rollout_with_tools(id, "tests passed"),
+    )
+    .unwrap();
+    for (query, scope) in [
+        ("columnUtils.ts", "files"),
+        ("sorting.md", "files"),
+        ("wombat_sort", "all"),
+        ("quokkasort", "all"),
+    ] {
+        cmd(h)
+            .args(["search", query, "--scope", scope, "--compact"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("01a158b7"));
+    }
+    cmd(h)
+        .args(["view", id, "--plain"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "[Tool: exec_command] cargo test --test wombat_sort",
+        ))
+        .stdout(predicate::str::contains(
+            "[Tool: apply_patch] /work/proj/src/columnUtils.ts",
+        ));
+}
+
+#[test]
+fn view_and_export_show_long_tool_output_whole() {
+    let home = TempDir::new().unwrap();
+    let h = home.path();
+    let id = "01a14b17-0000-7000-8000-000000000017";
+    let long = format!(
+        "{}MIDDLE-OF-THE-LOG{}",
+        "a".repeat(20_000),
+        "z".repeat(20_000)
+    );
+    fs::write(
+        day_dir(h, "2026-10-17").join(format!("rollout-2026-10-17T10-00-00-{id}.jsonl")),
+        rollout_with_tools(id, &long),
+    )
+    .unwrap();
+    cmd(h)
+        .args(["view", id, "--plain"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("MIDDLE-OF-THE-LOG"));
+    cmd(h)
+        .args(["export", id])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("MIDDLE-OF-THE-LOG"));
+}

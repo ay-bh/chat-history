@@ -677,6 +677,7 @@ fn main() {
             role,
         }) => {
             let session = transcript_or_exit(&sessions, &filtered, session_id.as_deref(), last);
+            chat_history::parser::keep_whole_tool_output();
             let (messages, _) = parse_session(session, false);
             let opts = display::ViewOptions {
                 around,
@@ -716,6 +717,7 @@ fn main() {
         }
         Some(Commands::Export { session_id, output }) => {
             let session = transcript_or_exit(&sessions, &filtered, Some(&session_id), false);
+            chat_history::parser::keep_whole_tool_output();
             let (messages, _) = parse_session(session, false);
             if !display::export_transcript(&messages, session, output.as_deref()) {
                 std::process::exit(1);

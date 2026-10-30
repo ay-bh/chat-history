@@ -78,7 +78,8 @@ and re-verified session by session on the next sync (`cache_dir.rs`).
 Messages are indexed whole: no per-session size cap. Tool output (Claude
 `tool_result` blocks, Codex `function_call_output` and `custom_tool_call_output`
 records) is a `tool` message whose passages fill the `tool` column instead of
-`content`; each tool output keeps its first 12 KiB and last 4 KiB. A tool
+`content`; the index keeps each tool output's first 12 KiB and last 4 KiB, joined by a
+`[…]` marker (`view` and `export` read the transcript and show it whole). A tool
 result whose call ran `chat-history` or `ch` (the first word of a simple
 command, so `cd ~/src/chat-history` does not count) is kept for `view` but not
 indexed: it repeats other sessions and made them match twice.

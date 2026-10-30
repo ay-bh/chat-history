@@ -271,7 +271,21 @@ fn normalize_for_project_match(s: &str) -> String {
 pub fn copy_session_to_dir(session: &Session, target_dir: &Path) -> std::io::Result<()> {
     fs::create_dir_all(target_dir)?;
 
-    let src = Path::new(&session.file);
+    // A Claude subagent resumes as the session that ran it: copy that
+    // session's transcript, whose folder holds the subagent.
+    let thread = thread_id(session);
+    let parent_file = (thread != session.id)
+        .then(|| {
+            let project = Path::new(&session.file).parent()?.parent()?.parent()?;
+            Some(project.join(format!("{thread}.jsonl")))
+        })
+        .flatten();
+    let src = parent_file.as_deref().unwrap_or(Path::new(&session.file));
+    let id = if parent_file.is_some() {
+        &thread
+    } else {
+        &session.id
+    };
     let filename = src.file_name().ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -281,9 +295,9 @@ pub fn copy_session_to_dir(session: &Session, target_dir: &Path) -> std::io::Res
     fs::copy(src, target_dir.join(filename))?;
 
     if let Some(parent) = src.parent() {
-        let companion = parent.join(&session.id);
+        let companion = parent.join(id);
         if companion.is_dir() {
-            copy_dir_recursive(&companion, &target_dir.join(&session.id))?;
+            copy_dir_recursive(&companion, &target_dir.join(id))?;
         }
     }
     Ok(())
@@ -315,7 +329,8 @@ pub fn resume_command(session: &Session) -> Option<ResumeAction> {
         }),
         "claude" => Some(ResumeAction::Exec {
             bin: "claude".into(),
-            args: vec!["--resume".into(), session.id.clone()],
+            // A subagent reopens as the session that ran it.
+            args: vec!["--resume".into(), thread_id(session)],
             workdir: existing_absolute_dir(&session.project),
         }),
         // A cursor-ide row can still be a CLI chat the IDE indexes (or a
@@ -647,6 +662,10 @@ pub fn load_claude_sessions() -> Vec<Session> {
             if let Ok(files) = fs::read_dir(&dir) {
                 for f in files.flatten() {
                     let path = f.path();
+                    if path.is_dir() {
+                        push_claude_subagents(&path.join("subagents"), &mut sessions);
+                        continue;
+                    }
                     if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
                         continue;
                     }
@@ -698,6 +717,53 @@ pub fn load_claude_sessions() -> Vec<Session> {
         }
     }
     sessions
+}
+
+/// Claude Code writes each subagent's transcript beside its session, as
+/// `<project>/<session>/subagents/agent-<id>.jsonl` with a `.meta.json` whose
+/// `description` is the task it was given. Listed only with `--sidechains`.
+fn push_claude_subagents(dir: &Path, sessions: &mut Vec<Session>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let (cwd, branch, summary, first) =
+            crate::catalog::read("claude", TRANSCRIPT_KIND, &path, false, || {
+                fs::File::open(&path).ok()?;
+                let (cwd, branch) = read_cwd_branch_from_jsonl(&path);
+                let description = fs::read_to_string(path.with_extension("meta.json"))
+                    .ok()
+                    .and_then(|m| serde_json::from_str::<Value>(&m).ok())
+                    .and_then(|m| m.get("description")?.as_str().map(str::to_owned))
+                    .unwrap_or_default();
+                Some((cwd, branch, description, claude_first_prompt(&path)))
+            })
+            .unwrap_or_default();
+        let iso = mtime_iso(&path).unwrap_or_default();
+        sessions.push(Session {
+            source: "claude".into(),
+            id: path
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string(),
+            summary,
+            first_prompt: first,
+            created: iso.clone(),
+            modified: iso,
+            date: mtime_date(&path).unwrap_or_default(),
+            messages: 0,
+            branch: branch.unwrap_or_default(),
+            project: cwd.unwrap_or_default(),
+            file: path.to_string_lossy().to_string(),
+            is_sidechain: true,
+            also_ide: false,
+        });
+    }
 }
 
 /// Cursor stores each workspace as `~/.cursor/projects/<slug>/` where `<slug>`
@@ -1019,9 +1085,43 @@ fn codex_page(file: &str) -> Option<(String, String)> {
     (uuid(thread) && uuid(page)).then(|| (thread.to_owned(), page.to_owned()))
 }
 
+/// Thread names Codex shows in its sidebar, from its state database
+/// (`state_<version>.sqlite`, newest version). Empty if it can't be read.
+fn codex_titles() -> HashMap<String, String> {
+    let newest = glob::glob(&format!("{}/state_*.sqlite", codex_home().display()))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .max_by_key(|p| {
+            p.file_stem()
+                .and_then(|s| s.to_str()?.strip_prefix("state_")?.parse::<u32>().ok())
+                .unwrap_or(0)
+        });
+    let read = |path: &Path| -> rusqlite::Result<HashMap<String, String>> {
+        let conn = rusqlite::Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        let mut stmt =
+            conn.prepare("SELECT id, title FROM threads WHERE title IS NOT NULL AND title != ''")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        Ok(rows.flatten().collect())
+    };
+    newest.and_then(|p| read(&p).ok()).unwrap_or_default()
+}
+
 /// The conversation a session belongs to as its agent knows it: the thread
-/// for a Codex continuation page, else the session's own id.
+/// for a Codex continuation page, the parent session for a Claude subagent,
+/// else the session's own id.
 pub fn thread_id(session: &Session) -> String {
+    if session.source == "claude" && session.is_sidechain {
+        let parent = Path::new(&session.file).parent();
+        if let Some(parent) = parent.filter(|p| p.ends_with("subagents"))
+            && let Some(id) = parent.parent().and_then(Path::file_name)
+        {
+            return id.to_string_lossy().into_owned();
+        }
+    }
     match codex_page(&session.file) {
         Some((thread, page)) if session.source == "codex" && page == session.id => thread,
         _ => session.id.clone(),
@@ -1150,15 +1250,18 @@ fn codex_first_prompt(path: &Path) -> String {
 }
 
 pub fn load_codex_sessions() -> Vec<Session> {
-    let base = codex_sessions_dir();
-    if !base.exists() {
-        return Vec::new();
-    }
     let mut sessions = Vec::new();
-    let pattern = |ext: &str| format!("{}/**/rollout-*.{ext}", base.display());
-    let rollouts = glob::glob(&pattern("jsonl"))
-        .into_iter()
-        .chain(glob::glob(&pattern("jsonl.zst")))
+    let titles = codex_titles();
+    // Archiving a thread only hides it from Codex's sidebar; it is still history.
+    let bases = [codex_sessions_dir(), codex_home().join("archived_sessions")];
+    let rollouts = bases
+        .iter()
+        .filter(|base| base.exists())
+        .flat_map(|base| {
+            ["jsonl", "jsonl.zst"]
+                .map(|ext| glob::glob(&format!("{}/**/rollout-*.{ext}", base.display())))
+        })
+        .flatten()
         .flatten()
         .flatten()
         // A rollout caught mid-compression exists in both forms; the plain
@@ -1187,6 +1290,8 @@ pub fn load_codex_sessions() -> Vec<Session> {
             .get(..10)
             .map(str::to_string)
             .unwrap_or_else(|| mtime_date(&path).unwrap_or_default());
+        // The thread's name, which every page of it shares.
+        let summary = titles.get(&meta.id).cloned().unwrap_or_default();
         // A continuation page gets its own id, so each file opens on its own.
         let id = match codex_page(&path.to_string_lossy()) {
             Some((thread, page)) if thread == meta.id => page,
@@ -1195,7 +1300,7 @@ pub fn load_codex_sessions() -> Vec<Session> {
         sessions.push(Session {
             source: "codex".into(),
             id,
-            summary: String::new(),
+            summary,
             first_prompt: first,
             created: meta.created,
             modified,
@@ -1779,6 +1884,118 @@ fn codex_commentary_to_skip(entries: &[Value]) -> HashSet<usize> {
     skip
 }
 
+/// What a Codex tool call did, recorded as the Claude parser records a tool
+/// use: the tools it ran, a `[Tool: name] detail` line per action, and the
+/// files it patched. Current Codex runs tools from JavaScript `exec` cells
+/// (`tools.exec_command({cmd:"…"})`, `tools.apply_patch("*** Begin Patch…")`);
+/// older versions sent `shell` / `exec_command` / `apply_patch` calls.
+#[derive(Default)]
+struct CodexToolUse {
+    tools: Vec<String>,
+    lines: Vec<String>,
+    files: Vec<String>,
+}
+
+impl CodexToolUse {
+    fn add(&mut self, mut other: CodexToolUse) {
+        self.tools.append(&mut other.tools);
+        self.lines.append(&mut other.lines);
+        self.files.append(&mut other.files);
+    }
+
+    /// Append to an assistant message, as Claude's tool_use blocks are.
+    fn attach(self, message: &mut Message) {
+        message.tool_uses.extend(self.tools);
+        for line in self.lines {
+            message.content.push('\n');
+            message.content.push_str(&line);
+        }
+        message.files_referenced.extend(self.files);
+    }
+}
+
+fn codex_tool_use(name: &str, call: &str) -> CodexToolUse {
+    use std::sync::LazyLock;
+    static INNER: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"tools\.([A-Za-z_][A-Za-z0-9_]*)\(").unwrap());
+    static CMD: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r#"\bcmd\s*:\s*(?:"((?:[^"\\]|\\.)*)"|'((?:[^'\\]|\\.)*)'|`([^`]*)`)"#)
+            .unwrap()
+    });
+    // A patch's file headers, on their own lines or after an escaped `\n`
+    // inside a JavaScript string.
+    static PATCHED: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r#"\*\*\* (?:Add File|Update File|Delete File|Move to): ([^\n\\"]+)"#)
+            .unwrap()
+    });
+    let clip = |s: &str| s.trim().chars().take(200).collect::<String>();
+    let mut out = CodexToolUse::default();
+    let mut commands = Vec::new();
+    if name == "exec" {
+        for m in INNER.captures_iter(call) {
+            if !out.tools.contains(&m[1].to_owned()) {
+                out.tools.push(m[1].to_owned());
+            }
+        }
+        if out.tools.is_empty() {
+            out.tools.push(name.to_owned());
+        }
+        for m in CMD.captures_iter(call) {
+            let raw = m
+                .get(1)
+                .or(m.get(2))
+                .or(m.get(3))
+                .map_or("", |g| g.as_str());
+            commands.push(
+                raw.replace("\\\"", "\"")
+                    .replace("\\n", " ")
+                    .replace("\\\\", "\\"),
+            );
+        }
+    } else {
+        out.tools.push(name.to_owned());
+        if let Ok(Value::Object(args)) = serde_json::from_str::<Value>(call) {
+            for key in ["cmd", "command"] {
+                match args.get(key) {
+                    Some(Value::String(c)) => commands.push(c.clone()),
+                    Some(Value::Array(parts)) => commands.push(
+                        parts
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .collect::<Vec<_>>()
+                            .join(" "),
+                    ),
+                    _ => {}
+                }
+            }
+            for key in ["title", "path", "file_path", "query"] {
+                if let Some(Value::String(v)) = args.get(key) {
+                    out.lines.push(format!("[Tool: {name}] {}", clip(v)));
+                }
+            }
+        }
+    }
+    let command_tool = if name == "exec" { "exec_command" } else { name };
+    for c in commands {
+        out.lines
+            .push(format!("[Tool: {command_tool}] {}", clip(&c)));
+    }
+    for m in PATCHED.captures_iter(call) {
+        let file = m[1].trim().to_owned();
+        if !out.files.contains(&file) {
+            out.files.push(file);
+        }
+    }
+    if !out.files.is_empty() {
+        out.lines
+            .push(format!("[Tool: apply_patch] {}", out.files.join(" ")));
+    }
+    if out.lines.is_empty() {
+        out.lines.push(format!("[Tool: {}]", out.tools.join(", ")));
+    }
+    out
+}
+
 pub fn parse_codex_jsonl(filepath: &str) -> Vec<Message> {
     // Whole-file read + lossy decode: an unreadable path fails once up front
     // (io::Lines can yield Err forever), and an invalid UTF-8 line only
@@ -1799,7 +2016,7 @@ pub fn parse_codex_jsonl(filepath: &str) -> Vec<Message> {
     let mut project_path = String::new();
     // Tool calls made before the assistant says anything; attached to the
     // next assistant message so they aren't lost.
-    let mut pending_tools: Vec<String> = Vec::new();
+    let mut pending_tools = CodexToolUse::default();
     // Set while a skipped commentary message is the turn's latest assistant
     // output: tool calls must wait for the turn's final answer instead of
     // attaching to the previous turn's message.
@@ -1853,25 +2070,25 @@ pub fn parse_codex_jsonl(filepath: &str) -> Vec<Message> {
                     continue;
                 }
                 let ctx = crate::parser::extract_context(&content_raw);
-                let mut tool_uses = ctx.tools;
-                if role == "assistant" {
-                    tool_uses.append(&mut pending_tools);
-                    route_tools_forward = false;
-                }
-                messages.push(Message {
+                let mut message = Message {
                     uuid: String::new(),
                     timestamp,
                     role: role.to_string(),
                     content: text,
                     session_id: session_id.clone(),
                     project_path: project_path.clone(),
-                    tool_uses,
+                    tool_uses: ctx.tools,
                     files_referenced: ctx.files,
                     error_patterns: ctx.errors,
                     relevance_score: 0.0,
                     final_score: 0.0,
                     history_output: false,
-                });
+                };
+                if role == "assistant" {
+                    std::mem::take(&mut pending_tools).attach(&mut message);
+                    route_tools_forward = false;
+                }
+                messages.push(message);
             }
             // Tool calls are separate records in Codex rollouts; attach the
             // tool name to the assistant message that initiated it, or hold
@@ -1891,11 +2108,12 @@ pub fn parse_codex_jsonl(filepath: &str) -> Vec<Message> {
                     history_calls.insert(id.to_owned());
                 }
                 if let Some(name) = payload.get("name").and_then(Value::as_str) {
+                    let used = codex_tool_use(name, call);
                     match messages.iter_mut().rev().find(|m| m.role != "tool") {
                         Some(last) if last.role == "assistant" && !route_tools_forward => {
-                            last.tool_uses.push(name.to_string());
+                            used.attach(last);
                         }
-                        _ => pending_tools.push(name.to_string()),
+                        _ => pending_tools.add(used),
                     }
                 }
             }
@@ -2487,6 +2705,26 @@ mod tests {
                     "01a181ea-eb4d-7b32-b28d-a34666d8653d".into()
                 ],
                 workdir: existing_absolute_dir(&page.project),
+            })
+        );
+    }
+
+    #[test]
+    fn resume_command_for_a_claude_subagent_reopens_its_session() {
+        let mut agent = make_session("agent-aef1e734", "2026-10-30", "claude", "/p", "", "");
+        agent.is_sidechain = true;
+        agent.file =
+            "/c/projects/-p/d3752d92-9fae-432f-9f9f-10e4066cc131/subagents/agent-aef1e734.jsonl"
+                .into();
+        assert_eq!(
+            resume_command(&agent),
+            Some(ResumeAction::Exec {
+                bin: "claude".into(),
+                args: vec![
+                    "--resume".into(),
+                    "d3752d92-9fae-432f-9f9f-10e4066cc131".into()
+                ],
+                workdir: existing_absolute_dir(&agent.project),
             })
         );
     }
@@ -3618,6 +3856,36 @@ mod tests {
     }
 
     #[test]
+    fn copy_session_to_dir_copies_the_session_a_subagent_resumes_as() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project = tmp.path().join("-gone-proj");
+        let parent = "d3752d92-9fae-432f-9f9f-10e4066cc131";
+        let subagents = project.join(parent).join("subagents");
+        std::fs::create_dir_all(&subagents).unwrap();
+        std::fs::write(project.join(format!("{parent}.jsonl")), "parent").unwrap();
+        std::fs::write(subagents.join("agent-a1.jsonl"), "subagent").unwrap();
+        let mut agent = make_session("agent-a1", "2026-10-30", "claude", "/gone", "", "");
+        agent.is_sidechain = true;
+        agent.file = subagents
+            .join("agent-a1.jsonl")
+            .to_string_lossy()
+            .into_owned();
+
+        let target = tmp.path().join("target-dir");
+        copy_session_to_dir(&agent, &target).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(target.join(format!("{parent}.jsonl"))).unwrap(),
+            "parent"
+        );
+        assert!(
+            target
+                .join(parent)
+                .join("subagents/agent-a1.jsonl")
+                .exists()
+        );
+    }
+
+    #[test]
     fn read_cwd_branch_from_jsonl_extracts_cwd_and_branch() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let data = r#"{"type":"user","cwd":"/Users/test/project","gitBranch":"feature-x","message":{"content":"hello"}}"#;
@@ -3854,8 +4122,9 @@ mod tests {
             .expect("turn 1 final answer present");
         let task_b = messages
             .iter()
-            .find(|m| m.content == "Task B is done.")
+            .find(|m| m.content.starts_with("Task B is done."))
             .expect("turn 2 final answer present");
+        assert_eq!(task_b.content, "Task B is done.\n[Tool: shell] ls");
         assert!(
             task_a.tool_uses.is_empty(),
             "turn 2's tool call must not attach to turn 1's answer, got {:?}",
