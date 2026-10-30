@@ -1071,6 +1071,31 @@ fn codex_page(file: &str) -> Option<(String, String)> {
     (uuid(thread) && uuid(page)).then(|| (thread.to_owned(), page.to_owned()))
 }
 
+/// Thread names Codex shows in its sidebar, from its state database
+/// (`state_<version>.sqlite`, newest version). Empty if it can't be read.
+fn codex_titles() -> HashMap<String, String> {
+    let newest = glob::glob(&format!("{}/state_*.sqlite", codex_home().display()))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .max_by_key(|p| {
+            p.file_stem()
+                .and_then(|s| s.to_str()?.strip_prefix("state_")?.parse::<u32>().ok())
+                .unwrap_or(0)
+        });
+    let read = |path: &Path| -> rusqlite::Result<HashMap<String, String>> {
+        let conn = rusqlite::Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        let mut stmt =
+            conn.prepare("SELECT id, title FROM threads WHERE title IS NOT NULL AND title != ''")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        Ok(rows.flatten().collect())
+    };
+    newest.and_then(|p| read(&p).ok()).unwrap_or_default()
+}
+
 /// The conversation a session belongs to as its agent knows it: the thread
 /// for a Codex continuation page, the parent session for a Claude subagent,
 /// else the session's own id.
@@ -1212,6 +1237,7 @@ fn codex_first_prompt(path: &Path) -> String {
 
 pub fn load_codex_sessions() -> Vec<Session> {
     let mut sessions = Vec::new();
+    let titles = codex_titles();
     // Archiving a thread only hides it from Codex's sidebar; it is still history.
     let bases = [codex_sessions_dir(), codex_home().join("archived_sessions")];
     let rollouts = bases
@@ -1250,6 +1276,8 @@ pub fn load_codex_sessions() -> Vec<Session> {
             .get(..10)
             .map(str::to_string)
             .unwrap_or_else(|| mtime_date(&path).unwrap_or_default());
+        // The thread's name, which every page of it shares.
+        let summary = titles.get(&meta.id).cloned().unwrap_or_default();
         // A continuation page gets its own id, so each file opens on its own.
         let id = match codex_page(&path.to_string_lossy()) {
             Some((thread, page)) if thread == meta.id => page,
@@ -1258,7 +1286,7 @@ pub fn load_codex_sessions() -> Vec<Session> {
         sessions.push(Session {
             source: "codex".into(),
             id,
-            summary: String::new(),
+            summary,
             first_prompt: first,
             created: meta.created,
             modified,

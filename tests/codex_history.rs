@@ -384,3 +384,38 @@ fn archived_codex_threads_are_still_history() {
         .success()
         .stdout(predicate::str::contains("Archived."));
 }
+
+/// Codex names its threads (the names its sidebar shows) in its state
+/// database.
+#[test]
+fn codex_thread_titles_are_shown_and_searched() {
+    let home = TempDir::new().unwrap();
+    let h = home.path();
+    let id = "01a17e42-0000-7000-8000-000000000042";
+    fs::write(
+        day_dir(h, "2026-10-27").join(format!("rollout-2026-10-27T10-00-00-{id}.jsonl")),
+        rollout(
+            id,
+            "2026-10-27T04:30:00.000Z",
+            &[("2026-10-27T04:30:05.000Z", "please look at this", "Looked.")],
+        ),
+    )
+    .unwrap();
+    let db = rusqlite::Connection::open(h.join(".codex/state_5.sqlite")).unwrap();
+    db.execute_batch(&format!(
+        "CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, title TEXT, archived INTEGER);
+         INSERT INTO threads VALUES ('{id}', '', 'Quokka pipeline review', 0);"
+    ))
+    .unwrap();
+    drop(db);
+    cmd(h)
+        .args(["--source", "codex"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Quokka pipeline review"));
+    cmd(h)
+        .args(["search", "quokka", "--compact"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("01a17e42"));
+}
