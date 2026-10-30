@@ -108,6 +108,10 @@ fn an_upgrade_retires_old_managed_copies_and_leaves_edited_ones() {
         !h.join(".codex/skills/chat-history").exists(),
         "our unedited copy at the deprecated Codex location is gone"
     );
+    assert!(
+        !h.join(".codex/skills").exists(),
+        "and the folder it leaves empty"
+    );
     assert_eq!(
         read(h.join(".cursor/skills/chat-history/SKILL.md")),
         "my own notes",
@@ -308,7 +312,11 @@ fn an_unrelated_skill_with_the_same_name_is_not_overwritten_without_force() {
         .arg("install-skill")
         .assert()
         .success()
-        .stdout(predicate::str::contains("not managed; use --force"));
+        .stdout(predicate::str::contains("not managed; use --force"))
+        .stdout(predicate::str::contains(
+            "another skill already uses the name history",
+        ))
+        .stdout(predicate::str::contains("Claude Code and Cursor, $history").not());
     assert_eq!(read(dir.join("SKILL.md")), theirs);
     assert!(h.join(".agents/skills/history/SKILL.md").exists());
     cmd(h).args(["install-skill", "--force"]).assert().success();
@@ -569,19 +577,40 @@ fn a_stub_policy_that_could_not_be_removed_is_removed_on_a_later_run() {
 }
 
 #[test]
-fn a_current_skill_left_with_the_stub_policy_is_repaired() {
+fn a_policy_the_user_adds_to_the_real_chat_history_skill_is_kept() {
     let home = TempDir::new().unwrap();
     let h = home.path();
     cmd(h)
         .args(["install-skill", "--name", "chat-history"])
         .assert()
         .success();
-    // As left by a policy removal that failed after the skill was written.
+    // Same text as the stub's policy, but the user wrote it: there was no stub.
+    let policy = "policy:\n  allow_implicit_invocation: false\n";
     let yaml = h.join(".agents/skills/chat-history/agents/openai.yaml");
     fs::create_dir_all(yaml.parent().unwrap()).unwrap();
-    fs::write(&yaml, "policy:\n  allow_implicit_invocation: false\n").unwrap();
+    fs::write(&yaml, policy).unwrap();
     refresh(h);
-    assert!(!yaml.exists());
+    cmd(h).arg("install-skill").assert().success();
+    assert_eq!(read(&yaml), policy);
+}
+
+#[test]
+fn removing_the_old_name_right_after_upgrading_works_before_any_other_command() {
+    let home = TempDir::new().unwrap();
+    let h = home.path();
+    old_layout(h);
+    cmd(h)
+        .args(["install-skill", "--remove-old-name"])
+        .assert()
+        .success();
+    refresh(h);
+    for root in [".claude/skills", ".agents/skills"] {
+        assert!(h.join(root).join("history/SKILL.md").exists(), "{root}");
+        assert!(
+            !h.join(root).join("chat-history/SKILL.md").exists(),
+            "{root}: removed, not put back"
+        );
+    }
 }
 
 #[test]

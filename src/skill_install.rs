@@ -270,7 +270,7 @@ fn stub_content(name: &str, skill: &Path) -> String {
     format!(
         "---\n\
          name: {LEGACY_NAME}\n\
-         description: Deprecated name of the {name} skill (search past Claude Code, Cursor and Codex conversations). Use /{name} instead.\n\
+         description: Deprecated name of the {name} skill (search past Claude Code, Cursor and Codex conversations). Use /{name} (in Codex, ${name}) instead.\n\
          disable-model-invocation: true\n\
          ---\n\
          \n\
@@ -442,6 +442,10 @@ fn finish_upgrade(results: &[RootResult], name: &str) -> Vec<(PathBuf, Retired)>
     if results.iter().any(|r| r.root.shared && r.ready()) {
         for dir in old_locations() {
             let outcome = retire(&dir);
+            if outcome == Retired::Removed {
+                // 0.8 made these folders just for the skill; kept if not empty.
+                let _ = dir.parent().map(std::fs::remove_dir);
+            }
             retired.push((dir, outcome));
         }
     }
@@ -493,14 +497,22 @@ fn retire(dir: &Path) -> Retired {
             Retired::Absent
         };
     }
+    let stub = is_stub(dir);
     // SKILL.md is what makes it a skill; the rest is cleanup.
     if let Err(e) = std::fs::remove_file(skill_path(dir)) {
         return Retired::Failed(e.to_string());
     }
     let _ = std::fs::remove_file(sidecar_path(dir));
-    let _ = remove_stub_policy(dir);
+    if stub {
+        let _ = remove_stub_policy(dir);
+    }
     let _ = std::fs::remove_dir(dir);
     Retired::Removed
+}
+
+/// The folder holds the deprecated stub (recognised by its heading).
+fn is_stub(dir: &Path) -> bool {
+    std::fs::read_to_string(skill_path(dir)).is_ok_and(|s| s.contains(STUB_HEADING))
 }
 
 /// This tool wrote the copy's SKILL.md and nobody edited it since: it still
@@ -516,7 +528,9 @@ fn removable(dir: &Path) -> bool {
 }
 
 /// Remove the stub's Codex policy if it is still the one this tool wrote.
-/// False only if the policy is there and could not be deleted.
+/// Callers check the folder holds a stub: beside a real skill, even the same
+/// text is the user's. False only if the policy is there and could not be
+/// deleted.
 fn remove_stub_policy(dir: &Path) -> bool {
     if !has_stub_policy(dir) {
         return true;
@@ -557,8 +571,9 @@ fn write_managed_skill(dir: &Path, content: &str, policy: bool) -> bool {
         {
             return false;
         }
-    } else if !remove_stub_policy(dir) {
-        // The real skill replacing a stub must not keep its no-implicit-use policy.
+    } else if is_stub(dir) && !remove_stub_policy(dir) {
+        // The real skill replacing a stub must not keep its no-implicit-use
+        // policy. Failing here leaves the stub, so the next run retries.
         return false;
     }
     std::fs::write(skill_path(dir), content).is_ok()
@@ -611,17 +626,9 @@ fn ensure_one(target: &Target, mode: Mode) -> EnsureAction {
     match std::fs::read_to_string(sidecar_path(dir)) {
         // Sidecar present but content changed → user-edited.
         Ok(managed) if managed.trim() != on_disk_hash => EnsureAction::LeftUserEdited,
-        Ok(_) => {
-            // Still our copy. Refresh if embedded skill changed, or if the
-            // real skill still has a stub's policy (its removal failed
-            // earlier).
-            let stale_policy = !target.policy && has_stub_policy(dir);
-            if on_disk_hash == embedded_hash && !stale_policy {
-                EnsureAction::AlreadyCurrent
-            } else {
-                write(EnsureAction::Refreshed)
-            }
-        }
+        // Still our copy. Refresh if embedded skill changed.
+        Ok(_) if on_disk_hash == embedded_hash => EnsureAction::AlreadyCurrent,
+        Ok(_) => write(EnsureAction::Refreshed),
         // Legacy install (no sidecar).
         Err(_) if on_disk_hash == embedded_hash => {
             let _ = std::fs::write(sidecar_path(dir), &embedded_hash);
@@ -723,9 +730,21 @@ pub fn install_skill(force: bool, name: Option<&str>) {
             "edited or not ours; remove it if you no longer want it",
         );
     }
-    println!(
-        "\nDone. Use /{name} in Claude Code and Cursor, ${name} in Codex. The skill is active immediately — no restart needed."
-    );
+    let taken: Vec<&str> = results
+        .iter()
+        .filter(|r| r.skill.1 == EnsureAction::LeftLegacy)
+        .map(|r| r.root.label)
+        .collect();
+    if taken.is_empty() {
+        println!(
+            "\nDone. Use /{name} in Claude Code and Cursor, ${name} in Codex. The skill is active immediately — no restart needed."
+        );
+    } else {
+        println!(
+            "\nIn {}, another skill already uses the name {name}, so /{name} there is that skill. Pick another name with chat-history install-skill --name <name>, or replace it with --force.",
+            taken.join(" and ")
+        );
+    }
 }
 
 /// `chat-history install-skill --remove-old-name`, which the stub offers:
@@ -735,6 +754,9 @@ pub fn install_skill(force: bool, name: Option<&str>) {
 /// gone so it is not put back.
 pub fn remove_old_name() {
     require_home();
+    // The upgrade may not have run yet (install-skill skips it): do it first,
+    // so the stub exists to remove and is not created afterwards.
+    ensure_skills();
     let name = chosen_name();
     if name == LEGACY_NAME {
         eprintln!(
@@ -760,7 +782,7 @@ pub fn remove_old_name() {
             );
             continue;
         }
-        if !std::fs::read_to_string(&skill).is_ok_and(|s| s.contains(STUB_HEADING)) {
+        if !is_stub(&dir) {
             println!(
                 "  left alone → {} (not the deprecated stub; delete it yourself if you no longer want it)",
                 skill.display()
