@@ -595,11 +595,17 @@ struct IdeListing {
 }
 
 fn load_cursor_ide_sessions_from(db: &Path) -> Vec<Session> {
-    crate::catalog::read_with("cursor-ide", "listing", db, true, |previous| {
+    let mut sessions = crate::catalog::read_with("cursor-ide", "listing", db, true, |previous| {
         read_cursor_ide_sessions_from(db, previous)
     })
     .map(|listing| listing.sessions)
-    .unwrap_or_default()
+    .unwrap_or_default();
+    // A cached row keeps the day of the run that built it, which may have
+    // been in another time zone (or an older build that used UTC days).
+    for session in &mut sessions {
+        session.date = iso_date(&session.modified);
+    }
+    sessions
 }
 
 fn read_cursor_ide_sessions_from(db: &Path, previous: Option<IdeListing>) -> Option<IdeListing> {
