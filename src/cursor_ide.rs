@@ -448,13 +448,24 @@ fn try_composer_header_order(
 ) -> rusqlite::Result<Option<Vec<Value>>> {
     // Avoid deserializing the large context/tool payload just to read the
     // active conversation order. The bundled SQLite supports JSON extraction.
-    let raw: Option<Option<String>> = conn
+    let raw: Option<Option<String>> = match conn
         .prepare_cached(
             "SELECT json_extract(value, '$.fullConversationHeadersOnly')
          FROM cursorDiskKV WHERE key = ?1",
         )?
         .query_row([format!("composerData:{composer_id}")], |row| row.get(0))
-        .optional()?;
+        .optional()
+    {
+        Ok(raw) => raw,
+        // A composerData blob that is not JSON has no usable order; the
+        // bubbles are still read by key. Lock and I/O errors still fail.
+        Err(rusqlite::Error::SqliteFailure(_, Some(message)))
+            if message.contains("malformed JSON") =>
+        {
+            None
+        }
+        Err(e) => return Err(e),
+    };
     Ok(raw
         .flatten()
         .and_then(|raw| serde_json::from_str::<Vec<Value>>(&raw).ok())
@@ -881,6 +892,47 @@ pub(crate) fn try_parse_cursor_ide(session: &Session) -> Option<Vec<Message>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn malformed_composer_data_falls_back_to_bubble_rows() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = tmp.path().join("state.vscdb");
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE composerHeaders (composerId TEXT PRIMARY KEY, value TEXT);
+             CREATE TABLE cursorDiskKV (key TEXT PRIMARY KEY, value BLOB);",
+        )
+        .unwrap();
+        let session = |id: &str| Session {
+            source: "cursor-ide".into(),
+            id: id.into(),
+            file: db.to_string_lossy().into(),
+            ..Session::default()
+        };
+        // composerData that is not JSON, as text and as a binary blob: the
+        // header order is unusable, the bubbles are not.
+        for (id, data) in [
+            ("aaaa1111-bbbb-cccc-dddd-eeeeeeeeeee1", "'{not json'"),
+            ("aaaa1111-bbbb-cccc-dddd-eeeeeeeeeee2", "x'00ff10'"),
+        ] {
+            conn.execute(
+                &format!("INSERT INTO cursorDiskKV VALUES (?1, {data})"),
+                [format!("composerData:{id}")],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO cursorDiskKV VALUES (?1, ?2)",
+                [
+                    format!("bubbleId:{id}:1"),
+                    r#"{"type":1,"text":"readable bubble"}"#.to_string(),
+                ],
+            )
+            .unwrap();
+            let messages = try_parse_cursor_ide(&session(id)).expect("readable database");
+            assert_eq!(messages.len(), 1, "{data}");
+            assert_eq!(messages[0].content, "readable bubble");
+        }
+    }
 
     #[test]
     fn bubble_counts_in_shapes_match_sqlite_grouping_including_odd_keys() {
