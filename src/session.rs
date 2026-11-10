@@ -255,6 +255,33 @@ pub fn encode_path_for_claude(path: &Path) -> String {
         .collect()
 }
 
+/// The folder under `~/.claude/projects` that holds a Claude transcript (a
+/// subagent's too): Claude Code's encoding of the workspace it was written
+/// from.
+fn claude_project_folder(session: &Session) -> Option<String> {
+    let relative = Path::new(&session.file)
+        .strip_prefix(claude_projects_dir())
+        .ok()?;
+    Some(
+        relative
+            .components()
+            .next()?
+            .as_os_str()
+            .to_string_lossy()
+            .into_owned(),
+    )
+}
+
+/// The project folder names Claude Code could have given `cwd`: as spelled
+/// and as the system resolves it.
+fn claude_project_folders(cwd: &Path) -> Vec<String> {
+    let mut folders = vec![encode_path_for_claude(cwd)];
+    if let Ok(real) = fs::canonicalize(cwd) {
+        folders.push(encode_path_for_claude(&real));
+    }
+    folders
+}
+
 fn normalize_for_project_match(s: &str) -> String {
     s.chars()
         .map(|c| {
@@ -2593,33 +2620,6 @@ fn project_matches_cwd(cwd: &Path, project: &str) -> bool {
     let project = PathBuf::from(project);
     let project = fs::canonicalize(&project).unwrap_or(project);
     project == cwd || cwd.starts_with(&project) || project.starts_with(&cwd)
-}
-
-/// The folder under `~/.claude/projects` that holds a Claude transcript (a
-/// subagent's too): Claude Code's encoding of the workspace it was written
-/// from.
-fn claude_project_folder(session: &Session) -> Option<String> {
-    let relative = Path::new(&session.file)
-        .strip_prefix(claude_projects_dir())
-        .ok()?;
-    Some(
-        relative
-            .components()
-            .next()?
-            .as_os_str()
-            .to_string_lossy()
-            .into_owned(),
-    )
-}
-
-/// The project folder names Claude Code could have given `cwd`: as spelled
-/// and as the system resolves it.
-fn claude_project_folders(cwd: &Path) -> Vec<String> {
-    let mut folders = vec![encode_path_for_claude(cwd)];
-    if let Ok(real) = fs::canonicalize(cwd) {
-        folders.push(encode_path_for_claude(&real));
-    }
-    folders
 }
 
 /// Prefer the copy whose workspace matches cwd; otherwise the newest.
