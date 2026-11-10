@@ -2559,3 +2559,36 @@ fn a_directory_named_like_a_transcript_does_not_hang_listing() {
         .success()
         .stdout(predicate::str::contains(id));
 }
+
+#[test]
+fn a_claude_session_lists_on_the_local_day_it_started() {
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("projects/-work-demo");
+    fs::create_dir_all(&project).unwrap();
+    let id = "abcd0000-1111-2222-3333-555555555555";
+    // 19:10 UTC on Oct 31 is 00:40 on Nov 1 in India. The file itself was
+    // written today, which is neither day.
+    fs::write(
+        project.join(format!("{id}.jsonl")),
+        claude_record(id, "/work/demo", "2026-10-31T19:10:00Z", "late night start"),
+    )
+    .unwrap();
+    let list = |tz: &str, day: &str| {
+        let output = Command::cargo_bin("chat-history")
+            .unwrap()
+            .args(["--from", day, "--to", day, "-v"])
+            .env("CLAUDE_CONFIG_DIR", tmp.path())
+            .env("HOME", tmp.path())
+            .env_remove("CODEX_HOME")
+            .env("TZ", tz)
+            .env("NO_COLOR", "1")
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        String::from_utf8(output.stdout).unwrap().contains(id)
+    };
+    assert!(list("Asia/Kolkata", "2026-11-01"));
+    assert!(!list("Asia/Kolkata", "2026-10-31"));
+    assert!(list("UTC", "2026-10-31"));
+    assert!(!list("UTC", "2026-11-01"));
+}
