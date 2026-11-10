@@ -1870,3 +1870,37 @@ fn read_only_home_cache_falls_back_to_a_private_temp_copy_without_rebuilding() {
     assert!(!stderr.contains("not writable"), "quiet on reuse: {stderr}");
     assert_eq!(second.stdout, warm.stdout);
 }
+
+#[test]
+fn a_transcript_that_cannot_be_read_keeps_its_indexed_messages() {
+    let tmp = TempDir::new().unwrap();
+    let corpus = vec![transcript(
+        &tmp,
+        "source",
+        &["First keptalpha message.", "Second keptbeta message."],
+    )];
+    std::thread::sleep(std::time::Duration::from_millis(2100));
+    let dir = tmp.path().join("index");
+    let mut index = Bm25Backend::open(Some(&dir)).unwrap();
+    assert_eq!(index.sync(&corpus, false).unwrap().updated, 1);
+    assert!(!search(&mut index, &corpus, "keptbeta", 10).is_empty());
+
+    // A path that opens but fails every read: a read failure, not a
+    // transcript that became empty.
+    let file = std::path::Path::new(&corpus[0].file);
+    fs::remove_file(file).unwrap();
+    fs::create_dir(file).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(2100));
+    index.sync(&corpus, false).unwrap();
+    assert!(!search(&mut index, &corpus, "keptalpha", 10).is_empty());
+    assert!(!search(&mut index, &corpus, "keptbeta", 10).is_empty());
+
+    // Readable again: the next sync parses it, though its size and time say
+    // nothing changed since the failed read.
+    fs::remove_dir(file).unwrap();
+    write_messages(file, &["Rewritten keptgamma message."]);
+    std::thread::sleep(std::time::Duration::from_millis(2100));
+    assert_eq!(index.sync(&corpus, false).unwrap().updated, 1);
+    assert!(!search(&mut index, &corpus, "keptgamma", 10).is_empty());
+    assert!(search(&mut index, &corpus, "keptbeta", 10).is_empty());
+}
