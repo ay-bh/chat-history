@@ -1302,7 +1302,7 @@ fn sqlite_wal_changes_refresh_messages_without_main_database_changes() {
 }
 
 #[test]
-fn locked_cache_uses_ephemeral_bm25_and_preserves_json() {
+fn locked_cache_searches_the_index_as_it_stands() {
     let tmp = TempDir::new().unwrap();
     cli_fixture(&tmp);
     command(&tmp)
@@ -1319,17 +1319,16 @@ fn locked_cache_uses_ephemeral_bm25_and_preserves_json() {
         rusqlite::Connection::open(tmp.path().join(".chat-history/cache").join(INDEX_FILENAME))
             .unwrap();
     conn.execute_batch("BEGIN IMMEDIATE").unwrap();
-    // The recent source needs a refresh, so a held write lock must trigger fallback.
+    // The recent source needs a refresh that the held write lock blocks: the
+    // index on disk is searched as it stands, not rebuilt in memory.
     let output = command(&tmp)
         .args(["search", "uniquecli", "--json"])
         .output()
         .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(String::from_utf8_lossy(&output.stderr).contains("in-memory BM25"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(stderr.contains("could not update search cache"), "{stderr}");
+    assert!(!stderr.contains("in-memory BM25"), "{stderr}");
     assert!(
         serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()["count"]
             .as_u64()
