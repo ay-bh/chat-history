@@ -65,6 +65,29 @@ fn inspect_missing_session() {
 }
 
 #[test]
+fn a_claude_session_copied_by_resume_still_resolves_by_id() {
+    let (mut cmd, tmp) = isolated_cmd();
+    let id = "abcd0000-1111-2222-3333-666666666666";
+    let record = serde_json::json!({
+        "type": "user", "sessionId": id, "cwd": "/work/demo",
+        "timestamp": "2026-11-01T10:00:00Z", "uuid": "u1",
+        "message": {"role": "user", "content": "copied session"}
+    })
+    .to_string();
+    // `resume` from another folder copies the transcript under the same id.
+    for dir in ["projects/-work-demo", "projects/-elsewhere"] {
+        let dir = tmp.path().join(dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(format!("{id}.jsonl")), &record).unwrap();
+    }
+    cmd.args(["view", id])
+        .env("NO_COLOR", "1")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("copied session"));
+}
+
+#[test]
 fn view_missing_session() {
     let (mut cmd, _tmp) = isolated_cmd();
     cmd.args(["view", "nonexistent-session-id"])

@@ -2531,6 +2531,12 @@ pub fn lookup_session<'a>(sessions: &'a [Session], sid: &str) -> SessionLookup<'
         }
         return SessionLookup::Found(prefer_session_copy(&matches));
     }
+    // `resume` copies a Claude transcript into the project folder of the
+    // directory it resumes in, under the same id; Claude Code may then go on
+    // writing to either copy. They are one conversation.
+    if one_id && matches.iter().all(|s| s.source == "claude") {
+        return SessionLookup::Found(prefer_session_copy(&matches));
+    }
     SessionLookup::Ambiguous(matches)
 }
 
@@ -2604,9 +2610,14 @@ fn prefer_session_copy<'a>(copies: &[&'a Session]) -> &'a Session {
             }
         }
     }
+    // The file breaks ties, so the pick does not depend on discovery order.
     copies
         .iter()
-        .max_by_key(|s| recency_key(s))
+        .max_by(|a, b| {
+            recency_key(a)
+                .cmp(&recency_key(b))
+                .then_with(|| b.file.cmp(&a.file))
+        })
         .copied()
         .unwrap_or(copies[0])
 }
@@ -3126,16 +3137,32 @@ mod tests {
     }
 
     #[test]
-    fn lookup_session_same_id_claude_stays_ambiguous() {
-        let id = "dddddddd-eeee-ffff-aaaa-111111111111";
+    fn lookup_resolves_claude_copies_of_one_session_but_not_distinct_ids() {
+        let id = "abcd1234-0000-0000-0000-000000000000";
+        let copy = |file: &str, modified: &str| Session {
+            source: "claude".into(),
+            id: id.into(),
+            file: file.into(),
+            project: "/nonexistent/project".into(),
+            modified: modified.into(),
+            ..Session::default()
+        };
         let sessions = vec![
-            make_session(id, "2026-08-26", "claude", "/a", "", "one"),
-            make_session(id, "2026-08-20", "claude", "/b", "", "two"),
+            copy("/a/x.jsonl", "2026-11-01T00:00:00Z"),
+            copy("/b/x.jsonl", "2026-11-02T00:00:00Z"),
         ];
-        match lookup_session(&sessions, id) {
-            SessionLookup::Ambiguous(c) => assert_eq!(c.len(), 2),
-            other => panic!("expected Ambiguous, got {other:?}"),
+        for query in [id, "abcd1234"] {
+            match lookup_session(&sessions, query) {
+                SessionLookup::Found(s) => assert_eq!(s.file, "/b/x.jsonl"),
+                other => panic!("{query}: {other:?}"),
+            }
         }
+        let mut distinct = sessions.clone();
+        distinct[1].id = "abcd1234-1111-0000-0000-000000000000".into();
+        assert!(matches!(
+            lookup_session(&distinct, "abcd1234"),
+            SessionLookup::Ambiguous(_)
+        ));
     }
 
     #[test]
