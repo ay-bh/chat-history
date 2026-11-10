@@ -1904,3 +1904,58 @@ fn a_transcript_that_cannot_be_read_keeps_its_indexed_messages() {
     assert!(!search(&mut index, &corpus, "keptgamma", 10).is_empty());
     assert!(search(&mut index, &corpus, "keptbeta", 10).is_empty());
 }
+
+#[test]
+fn a_locked_cursor_database_keeps_its_indexed_messages() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("state.vscdb");
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE composerHeaders(composerId TEXT PRIMARY KEY, value TEXT);
+        CREATE TABLE cursorDiskKV(key TEXT PRIMARY KEY, value TEXT);",
+    )
+    .unwrap();
+    let id = "locked-session";
+    conn.execute("INSERT INTO composerHeaders VALUES (?1, '{}')", [id])
+        .unwrap();
+    let bubble =
+        |text: &str| json!({"type":1,"text":text,"createdAt":"2026-01-01T00:00:00Z"}).to_string();
+    conn.execute(
+        "INSERT INTO cursorDiskKV VALUES (?1, ?2)",
+        rusqlite::params![
+            format!("bubbleId:{id}:one"),
+            bubble("Original lockedbefore message.")
+        ],
+    )
+    .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(2100));
+    let corpus = vec![Session {
+        source: "cursor-ide".into(),
+        id: id.into(),
+        file: path.to_string_lossy().into(),
+        ..Session::default()
+    }];
+    let mut index = Bm25Backend::open(None).unwrap();
+    index.sync(&corpus, false).unwrap();
+    assert!(!search(&mut index, &corpus, "lockedbefore", 10).is_empty());
+
+    // The conversation changes, then another process locks the database
+    // while the sync reads it: every query fails with SQLITE_BUSY.
+    conn.execute(
+        "INSERT INTO cursorDiskKV VALUES (?1, ?2)",
+        rusqlite::params![
+            format!("bubbleId:{id}:two"),
+            bubble("Later lockedafter message.")
+        ],
+    )
+    .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(2100));
+    conn.execute_batch("BEGIN EXCLUSIVE").unwrap();
+    index.sync(&corpus, false).unwrap();
+    assert!(!search(&mut index, &corpus, "lockedbefore", 10).is_empty());
+
+    conn.execute_batch("COMMIT").unwrap();
+    index.sync(&corpus, false).unwrap();
+    assert!(!search(&mut index, &corpus, "lockedbefore", 10).is_empty());
+    assert!(!search(&mut index, &corpus, "lockedafter", 10).is_empty());
+}

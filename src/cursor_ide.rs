@@ -5,7 +5,7 @@ use crate::parser::{clean_first_prompt, extract_text, is_clear_metadata, is_warm
 use crate::session::{
     Message, Session, cursor_entry_timestamp, iso_date, ms_to_iso, parse_any_timestamp, user_home,
 };
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde_json::Value;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -355,11 +355,14 @@ fn bubble_key_bounds(composer_id: &str) -> (String, String) {
 }
 
 fn kv_blob(conn: &Connection, key: &str) -> Option<String> {
-    let mut stmt = conn
-        .prepare_cached("SELECT value FROM cursorDiskKV WHERE key = ?1")
-        .ok()?;
-    stmt.query_row([key], |row| Ok(blob_text(row.get_ref(0)?)))
-        .ok()
+    try_kv_blob(conn, key).ok().flatten()
+}
+
+/// [`kv_blob`], telling a missing key (`Ok(None)`) from a failed query.
+fn try_kv_blob(conn: &Connection, key: &str) -> rusqlite::Result<Option<String>> {
+    conn.prepare_cached("SELECT value FROM cursorDiskKV WHERE key = ?1")?
+        .query_row([key], |row| Ok(blob_text(row.get_ref(0)?)))
+        .optional()
 }
 
 fn message_from_bubble(session: &Session, entry: &Value) -> Option<Message> {
@@ -416,54 +419,62 @@ fn sort_messages_stable(messages: &mut [Message]) {
     });
 }
 
-fn load_bubbles_range(conn: &Connection, composer_id: &str) -> Vec<Value> {
+fn load_bubbles_range(conn: &Connection, composer_id: &str) -> rusqlite::Result<Vec<Value>> {
     let (lower, upper) = bubble_key_bounds(composer_id);
     let mut stmt =
-        match conn.prepare_cached("SELECT value FROM cursorDiskKV WHERE key >= ?1 AND key < ?2") {
-            Ok(s) => s,
-            Err(_) => return Vec::new(),
-        };
+        conn.prepare_cached("SELECT value FROM cursorDiskKV WHERE key >= ?1 AND key < ?2")?;
     let rows = stmt.query_map(rusqlite::params![lower, upper], |row| {
         Ok(blob_text(row.get_ref(0)?))
-    });
-    let Ok(rows) = rows else {
-        return Vec::new();
-    };
-    rows.flatten()
-        .filter_map(|val| serde_json::from_str::<Value>(&val).ok())
-        .collect()
+    })?;
+    let mut entries = Vec::new();
+    for row in rows {
+        // A bubble that is not JSON is skipped; a failed read is an error.
+        if let Ok(entry) = serde_json::from_str::<Value>(&row?) {
+            entries.push(entry);
+        }
+    }
+    Ok(entries)
 }
 
 fn composer_header_order(conn: &Connection, composer_id: &str) -> Option<Vec<Value>> {
+    try_composer_header_order(conn, composer_id).ok().flatten()
+}
+
+/// [`composer_header_order`], telling a conversation without a header order
+/// (`Ok(None)`) from a failed query.
+fn try_composer_header_order(
+    conn: &Connection,
+    composer_id: &str,
+) -> rusqlite::Result<Option<Vec<Value>>> {
     // Avoid deserializing the large context/tool payload just to read the
     // active conversation order. The bundled SQLite supports JSON extraction.
-    let mut stmt = conn
+    let raw: Option<Option<String>> = conn
         .prepare_cached(
             "SELECT json_extract(value, '$.fullConversationHeadersOnly')
          FROM cursorDiskKV WHERE key = ?1",
-        )
-        .ok()?;
-    let raw: String = stmt
+        )?
         .query_row([format!("composerData:{composer_id}")], |row| row.get(0))
-        .ok()?;
-    let headers: Vec<Value> = serde_json::from_str(&raw).ok()?;
-    if headers.is_empty() {
-        return None;
-    }
-    Some(headers)
+        .optional()?;
+    Ok(raw
+        .flatten()
+        .and_then(|raw| serde_json::from_str::<Vec<Value>>(&raw).ok())
+        .filter(|headers| !headers.is_empty()))
 }
 
 /// Bubbles for a composer and whether they came in the conversation's own
 /// header order (else sorted by time, untimestamped last).
-fn load_bubble_entries(conn: &Connection, composer_id: &str) -> (Vec<Value>, bool) {
-    if let Some(headers) = composer_header_order(conn, composer_id) {
+fn load_bubble_entries(
+    conn: &Connection,
+    composer_id: &str,
+) -> rusqlite::Result<(Vec<Value>, bool)> {
+    if let Some(headers) = try_composer_header_order(conn, composer_id)? {
         let mut entries = Vec::new();
         for h in headers {
             let Some(bid) = h.get("bubbleId").and_then(Value::as_str) else {
                 continue;
             };
             let key = format!("bubbleId:{composer_id}:{bid}");
-            if let Some(raw) = kv_blob(conn, &key)
+            if let Some(raw) = try_kv_blob(conn, &key)?
                 && let Ok(mut entry) = serde_json::from_str::<Value>(&raw)
             {
                 if entry.get("type").is_none()
@@ -476,16 +487,16 @@ fn load_bubble_entries(conn: &Connection, composer_id: &str) -> (Vec<Value>, boo
             }
         }
         if !entries.is_empty() {
-            return (entries, true);
+            return Ok((entries, true));
         }
     }
-    let mut entries = load_bubbles_range(conn, composer_id);
+    let mut entries = load_bubbles_range(conn, composer_id)?;
     // Timestamped first, in order; untimestamped keep their scan order.
     entries.sort_by_cached_key(|entry| {
         let ts = parse_any_timestamp(&cursor_entry_timestamp(entry));
         (ts.is_none(), ts)
     });
-    (entries, false)
+    Ok((entries, false))
 }
 
 fn first_user_text(conn: &Connection, composer_id: &str, headers: Option<&[Value]>) -> String {
@@ -545,7 +556,16 @@ fn first_user_text(conn: &Connection, composer_id: &str, headers: Option<&[Value
 }
 
 fn load_bubbles_as_messages(conn: &Connection, session: &Session) -> Vec<Message> {
-    let (entries, ordered) = load_bubble_entries(conn, &session.id);
+    try_load_bubbles_as_messages(conn, session).unwrap_or_default()
+}
+
+/// [`load_bubbles_as_messages`], or the error of a query that failed (a
+/// locked or damaged database), which must not pass for an empty chat.
+fn try_load_bubbles_as_messages(
+    conn: &Connection,
+    session: &Session,
+) -> rusqlite::Result<Vec<Message>> {
+    let (entries, ordered) = load_bubble_entries(conn, &session.id)?;
     let mut messages: Vec<Message> = entries
         .iter()
         .filter_map(|entry| message_from_bubble(session, entry))
@@ -553,7 +573,7 @@ fn load_bubbles_as_messages(conn: &Connection, session: &Session) -> Vec<Message
     if !ordered {
         sort_messages_stable(&mut messages);
     }
-    messages
+    Ok(messages)
 }
 
 fn bubble_counts(conn: &Connection) -> HashMap<String, u64> {
@@ -851,10 +871,11 @@ pub fn parse_cursor_ide(session: &Session) -> Vec<Message> {
     try_parse_cursor_ide(session).unwrap_or_default()
 }
 
-/// [`parse_cursor_ide`], or `None` when the database could not be opened.
+/// [`parse_cursor_ide`], or `None` when the database could not be opened or
+/// queried.
 pub(crate) fn try_parse_cursor_ide(session: &Session) -> Option<Vec<Message>> {
     let conn = open_ro(Path::new(&session.file))?;
-    Some(load_bubbles_as_messages(&conn, session))
+    try_load_bubbles_as_messages(&conn, session).ok()
 }
 
 #[cfg(test)]
