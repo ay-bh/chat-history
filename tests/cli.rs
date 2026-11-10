@@ -88,6 +88,69 @@ fn a_claude_session_copied_by_resume_still_resolves_by_id() {
 }
 
 #[test]
+fn a_claude_session_copied_by_resume_resolves_to_the_current_workspace_copy() {
+    let tmp = TempDir::new().unwrap();
+    let root = fs::canonicalize(tmp.path()).unwrap();
+    let id = "abcd0000-1111-2222-3333-777777777777";
+    // Both copies keep the folder the session was opened in; only the
+    // project folder they are stored under tells them apart.
+    let record = serde_json::json!({
+        "type": "user", "sessionId": id, "cwd": root.join("a"),
+        "timestamp": "2026-11-01T10:00:00Z", "uuid": "u1",
+        "message": {"role": "user", "content": "copied session"}
+    })
+    .to_string();
+    let slug = |p: &std::path::Path| -> String {
+        p.to_string_lossy()
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect()
+    };
+    let mut copies = Vec::new();
+    for (name, age) in [("a", 3600), ("b", 0)] {
+        let workspace = root.join(name);
+        fs::create_dir_all(&workspace).unwrap();
+        let dir = tmp.path().join("projects").join(slug(&workspace));
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join(format!("{id}.jsonl"));
+        fs::write(&file, &record).unwrap();
+        // `b`'s copy is the newer one.
+        let when = std::time::SystemTime::now() - std::time::Duration::from_secs(age);
+        fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(when)
+            .unwrap();
+        copies.push((workspace, file));
+    }
+    for (workspace, file) in &copies {
+        let out = Command::cargo_bin("chat-history")
+            .unwrap()
+            .args(["find", id])
+            .current_dir(workspace)
+            .env("PWD", workspace)
+            .env("CLAUDE_CONFIG_DIR", tmp.path())
+            .env("HOME", tmp.path())
+            .env_remove("CODEX_HOME")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8(out.stdout).unwrap();
+        assert_eq!(
+            fs::canonicalize(stdout.trim()).unwrap(),
+            fs::canonicalize(file).unwrap(),
+            "find from {}",
+            workspace.display()
+        );
+    }
+}
+
+#[test]
 fn view_missing_session() {
     let (mut cmd, _tmp) = isolated_cmd();
     cmd.args(["view", "nonexistent-session-id"])

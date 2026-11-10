@@ -2533,8 +2533,21 @@ pub fn lookup_session<'a>(sessions: &'a [Session], sid: &str) -> SessionLookup<'
     }
     // `resume` copies a Claude transcript into the project folder of the
     // directory it resumes in, under the same id; Claude Code may then go on
-    // writing to either copy. They are one conversation.
+    // writing to either copy. They are one conversation. Every copy keeps the
+    // folder the session was opened in, so the current workspace's copy is
+    // the one stored under its project folder.
     if one_id && matches.iter().all(|s| s.source == "claude") {
+        if let Ok(cwd) = std::env::current_dir() {
+            let here = claude_project_folders(&cwd);
+            let local: Vec<&Session> = matches
+                .iter()
+                .copied()
+                .filter(|s| claude_project_folder(s).is_some_and(|f| here.contains(&f)))
+                .collect();
+            if local.len() == 1 {
+                return SessionLookup::Found(local[0]);
+            }
+        }
         return SessionLookup::Found(prefer_session_copy(&matches));
     }
     SessionLookup::Ambiguous(matches)
@@ -2580,6 +2593,33 @@ fn project_matches_cwd(cwd: &Path, project: &str) -> bool {
     let project = PathBuf::from(project);
     let project = fs::canonicalize(&project).unwrap_or(project);
     project == cwd || cwd.starts_with(&project) || project.starts_with(&cwd)
+}
+
+/// The folder under `~/.claude/projects` that holds a Claude transcript (a
+/// subagent's too): Claude Code's encoding of the workspace it was written
+/// from.
+fn claude_project_folder(session: &Session) -> Option<String> {
+    let relative = Path::new(&session.file)
+        .strip_prefix(claude_projects_dir())
+        .ok()?;
+    Some(
+        relative
+            .components()
+            .next()?
+            .as_os_str()
+            .to_string_lossy()
+            .into_owned(),
+    )
+}
+
+/// The project folder names Claude Code could have given `cwd`: as spelled
+/// and as the system resolves it.
+fn claude_project_folders(cwd: &Path) -> Vec<String> {
+    let mut folders = vec![encode_path_for_claude(cwd)];
+    if let Ok(real) = fs::canonicalize(cwd) {
+        folders.push(encode_path_for_claude(&real));
+    }
+    folders
 }
 
 /// Prefer the copy whose workspace matches cwd; otherwise the newest.
