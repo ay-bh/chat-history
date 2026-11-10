@@ -848,11 +848,13 @@ fn merge_message_timestamps(messages: &mut [Message], bubbles: &[Message]) {
 }
 
 pub fn parse_cursor_ide(session: &Session) -> Vec<Message> {
-    let db = Path::new(&session.file);
-    let Some(conn) = open_ro(db) else {
-        return Vec::new();
-    };
-    load_bubbles_as_messages(&conn, session)
+    try_parse_cursor_ide(session).unwrap_or_default()
+}
+
+/// [`parse_cursor_ide`], or `None` when the database could not be opened.
+pub(crate) fn try_parse_cursor_ide(session: &Session) -> Option<Vec<Message>> {
+    let conn = open_ro(Path::new(&session.file))?;
+    Some(load_bubbles_as_messages(&conn, session))
 }
 
 #[cfg(test)]

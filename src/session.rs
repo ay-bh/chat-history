@@ -14,6 +14,65 @@ use std::time::{SystemTime, UNIX_EPOCH};
 // Catalog entry kind for cached transcript metadata. Bump when first-prompt or
 // title extraction changes so unchanged files are re-read, not served stale.
 const TRANSCRIPT_KIND: &str = "transcript-v2";
+// Claude entries also carry the transcript's first timestamp.
+const CLAUDE_TRANSCRIPT_KIND: &str = "transcript-v3";
+
+/// The lines of a transcript, like `BufRead::lines`, except that a read
+/// error ends them instead of repeating forever: an unreadable path such as a
+/// directory fails the same way on every read. The error is kept in `error`.
+/// A line that is not UTF-8 is skipped, like any other malformed record.
+pub(crate) struct TranscriptLines<R> {
+    reader: R,
+    buf: Vec<u8>,
+    pub(crate) error: Option<std::io::Error>,
+}
+
+impl<R: BufRead> TranscriptLines<R> {
+    pub(crate) fn new(reader: R) -> Self {
+        Self {
+            reader,
+            buf: Vec::new(),
+            error: None,
+        }
+    }
+}
+
+impl<R: BufRead> Iterator for TranscriptLines<R> {
+    type Item = String;
+
+    fn next(&mut self) -> Option<String> {
+        if self.error.is_some() {
+            return None;
+        }
+        loop {
+            self.buf.clear();
+            match self.reader.read_until(b'\n', &mut self.buf) {
+                Ok(0) => return None,
+                Ok(_) => {
+                    if self.buf.ends_with(b"\n") {
+                        self.buf.pop();
+                        if self.buf.ends_with(b"\r") {
+                            self.buf.pop();
+                        }
+                    }
+                    if let Ok(line) = std::str::from_utf8(&self.buf) {
+                        return Some(line.to_owned());
+                    }
+                }
+                Err(e) => {
+                    self.error = Some(e);
+                    return None;
+                }
+            }
+        }
+    }
+}
+
+fn transcript_lines(path: &Path) -> Option<TranscriptLines<BufReader<fs::File>>> {
+    Some(TranscriptLines::new(BufReader::new(
+        fs::File::open(path).ok()?,
+    )))
+}
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct Session {
@@ -152,19 +211,25 @@ fn codex_sessions_dir() -> PathBuf {
     codex_home().join("sessions")
 }
 
-// Reads cwd and gitBranch from the first records of a Claude transcript.
-fn read_cwd_branch_from_jsonl(path: &Path) -> (Option<String>, Option<String>) {
-    let Ok(file) = fs::File::open(path) else {
-        return (None, None);
+/// What the first records of a Claude transcript say about where and when
+/// it started.
+#[derive(Default)]
+struct ClaudeHead {
+    cwd: Option<String>,
+    branch: Option<String>,
+    /// The first record's timestamp: when the session started.
+    started: Option<String>,
+}
+
+// Reads cwd, gitBranch and the first timestamp from the first records of a
+// Claude transcript. The opening records (mode, permission-mode, ...) carry
+// none of them, so a few more lines are read than records that do.
+fn read_claude_head(path: &Path) -> ClaudeHead {
+    let mut head = ClaudeHead::default();
+    let Some(lines) = transcript_lines(path) else {
+        return head;
     };
-    let reader = BufReader::new(file);
-    let mut cwd = None;
-    let mut branch = None;
-    for line in reader.lines().take(10) {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => continue,
-        };
+    for line in lines.take(20) {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -173,23 +238,29 @@ fn read_cwd_branch_from_jsonl(path: &Path) -> (Option<String>, Option<String>) {
             Ok(v) => v,
             Err(_) => continue,
         };
-        if cwd.is_none()
+        if head.cwd.is_none()
             && let Some(c) = entry.get("cwd").and_then(Value::as_str)
             && !c.is_empty()
         {
-            cwd = Some(c.to_string());
+            head.cwd = Some(c.to_string());
         }
-        if branch.is_none()
+        if head.branch.is_none()
             && let Some(b) = entry.get("gitBranch").and_then(Value::as_str)
             && !b.is_empty()
         {
-            branch = Some(b.to_string());
+            head.branch = Some(b.to_string());
         }
-        if cwd.is_some() && branch.is_some() {
+        if head.started.is_none()
+            && let Some(t) = entry.get("timestamp").and_then(Value::as_str)
+            && parse_any_timestamp(t).is_some()
+        {
+            head.started = Some(t.to_string());
+        }
+        if head.cwd.is_some() && head.branch.is_some() && head.started.is_some() {
             break;
         }
     }
-    (cwd, branch)
+    head
 }
 
 // Current Claude Code appends ai-title records as the session title evolves;
@@ -456,9 +527,21 @@ pub(crate) fn cursor_timestamp(value: &Value) -> String {
 /// The one epoch-milliseconds formatter for Cursor data: preserves
 /// milliseconds when present, keeps whole seconds compact, and treats
 /// non-positive or out-of-range values as unknown.
-/// The `YYYY-MM-DD` day of an ISO timestamp ("" for unknown).
+/// The local `YYYY-MM-DD` day of an ISO timestamp ("" for unknown), the
+/// same calendar that `today` and `--from`/`--to` are read in. A value that
+/// holds only a day is that day.
 pub(crate) fn iso_date(iso: &str) -> String {
-    iso.get(..10).unwrap_or("").to_owned()
+    if let Some(time) = parse_any_timestamp(iso) {
+        return time
+            .with_timezone(&chrono::Local)
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
+    }
+    iso.get(..10)
+        .filter(|d| NaiveDate::parse_from_str(d, "%Y-%m-%d").is_ok())
+        .unwrap_or("")
+        .to_owned()
 }
 
 pub(crate) fn ms_to_iso(ms: i64) -> String {
@@ -488,16 +571,10 @@ fn mtime_date(path: &Path) -> Option<String> {
 }
 
 fn claude_first_prompt(path: &Path) -> String {
-    let file = match fs::File::open(path) {
-        Ok(f) => f,
-        Err(_) => return String::new(),
+    let Some(lines) = transcript_lines(path) else {
+        return String::new();
     };
-    let reader = BufReader::new(file);
-    for line in reader.lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => continue,
-        };
+    for line in lines {
         let trimmed = line.trim().to_string();
         if trimmed.is_empty() {
             continue;
@@ -538,10 +615,7 @@ pub(crate) fn cursor_first_prompt_jsonl(path: &Path) -> String {
 }
 
 fn cursor_first_prompt_jsonl_uncached(path: &Path) -> Option<String> {
-    let file = fs::File::open(path).ok()?;
-    let reader = BufReader::new(file);
-    for line in reader.lines() {
-        let Ok(line) = line else { continue };
+    for line in transcript_lines(path)? {
         let Ok(entry) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
@@ -602,6 +676,16 @@ fn cursor_first_prompt_txt_uncached(path: &Path) -> Option<String> {
     Some(String::new())
 }
 
+/// `created`, `modified` and the listed day of a Claude transcript: it
+/// started at its first record's timestamp and was last written at its file
+/// time. Without a usable first timestamp, the file time stands for both.
+fn claude_times(path: &Path, started: Option<String>) -> (String, String, String) {
+    let modified = mtime_iso(path).unwrap_or_default();
+    let created = started.unwrap_or_else(|| modified.clone());
+    let date = iso_date(&created);
+    (created, modified, date)
+}
+
 pub fn load_claude_sessions() -> Vec<Session> {
     let base = claude_projects_dir();
     if !base.exists() {
@@ -629,11 +713,8 @@ pub fn load_claude_sessions() -> Vec<Session> {
         };
         for entry in index.entries {
             indexed_ids.insert(entry.session_id.clone());
-            let date = entry
-                .created
-                .get(..10)
-                .filter(|d| NaiveDate::parse_from_str(d, "%Y-%m-%d").is_ok())
-                .map(str::to_string)
+            let date = Some(iso_date(&entry.created))
+                .filter(|d| !d.is_empty())
                 .unwrap_or_else(|| mtime_date(Path::new(&entry.full_path)).unwrap_or_default());
             sessions.push(Session {
                 source: "claude".into(),
@@ -677,20 +758,25 @@ pub fn load_claude_sessions() -> Vec<Session> {
                     if indexed_ids.contains(&sid) || sid.starts_with("agent-") {
                         continue;
                     }
-                    let (cwd, branch, summary, first) =
-                        crate::catalog::read("claude", TRANSCRIPT_KIND, &path, false, || {
+                    let (cwd, branch, summary, first, started) = crate::catalog::read(
+                        "claude",
+                        CLAUDE_TRANSCRIPT_KIND,
+                        &path,
+                        false,
+                        || {
                             fs::File::open(&path).ok()?;
-                            let (cwd, branch) = read_cwd_branch_from_jsonl(&path);
+                            let head = read_claude_head(&path);
                             Some((
-                                cwd,
-                                branch,
+                                head.cwd,
+                                head.branch,
                                 claude_ai_title(&path).unwrap_or_default(),
                                 claude_first_prompt(&path),
+                                head.started,
                             ))
-                        })
-                        .unwrap_or_default();
-                    let iso = mtime_iso(&path).unwrap_or_default();
-                    let date = mtime_date(&path).unwrap_or_default();
+                        },
+                    )
+                    .unwrap_or_default();
+                    let (created, modified, date) = claude_times(&path, started);
                     let project = cwd.unwrap_or_else(|| {
                         dir.file_name()
                             .unwrap_or_default()
@@ -702,8 +788,8 @@ pub fn load_claude_sessions() -> Vec<Session> {
                         id: sid,
                         summary,
                         first_prompt: first,
-                        created: iso.clone(),
-                        modified: iso,
+                        created,
+                        modified,
                         date,
                         messages: 0,
                         branch: branch.unwrap_or_default(),
@@ -731,19 +817,25 @@ fn push_claude_subagents(dir: &Path, sessions: &mut Vec<Session>) {
         if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
             continue;
         }
-        let (cwd, branch, summary, first) =
-            crate::catalog::read("claude", TRANSCRIPT_KIND, &path, false, || {
+        let (cwd, branch, summary, first, started) =
+            crate::catalog::read("claude", CLAUDE_TRANSCRIPT_KIND, &path, false, || {
                 fs::File::open(&path).ok()?;
-                let (cwd, branch) = read_cwd_branch_from_jsonl(&path);
+                let head = read_claude_head(&path);
                 let description = fs::read_to_string(path.with_extension("meta.json"))
                     .ok()
                     .and_then(|m| serde_json::from_str::<Value>(&m).ok())
                     .and_then(|m| m.get("description")?.as_str().map(str::to_owned))
                     .unwrap_or_default();
-                Some((cwd, branch, description, claude_first_prompt(&path)))
+                Some((
+                    head.cwd,
+                    head.branch,
+                    description,
+                    claude_first_prompt(&path),
+                    head.started,
+                ))
             })
             .unwrap_or_default();
-        let iso = mtime_iso(&path).unwrap_or_default();
+        let (created, modified, date) = claude_times(&path, started);
         sessions.push(Session {
             source: "claude".into(),
             id: path
@@ -753,9 +845,9 @@ fn push_claude_subagents(dir: &Path, sessions: &mut Vec<Session>) {
                 .to_string(),
             summary,
             first_prompt: first,
-            created: iso.clone(),
-            modified: iso,
-            date: mtime_date(&path).unwrap_or_default(),
+            created,
+            modified,
+            date,
             messages: 0,
             branch: branch.unwrap_or_default(),
             project: cwd.unwrap_or_default(),
@@ -1141,8 +1233,7 @@ fn open_rollout(path: &Path) -> Option<Box<dyn Read>> {
 }
 
 fn read_codex_meta(path: &Path) -> Option<CodexMeta> {
-    let reader = BufReader::new(open_rollout(path)?);
-    let line = reader.lines().next()?.ok()?;
+    let line = TranscriptLines::new(BufReader::new(open_rollout(path)?)).next()?;
     let entry: Value = serde_json::from_str(line.trim()).ok()?;
     let payload = codex_payload(&entry);
     let id = payload.get("id").and_then(Value::as_str)?.to_string();
@@ -1213,12 +1304,7 @@ fn codex_first_prompt(path: &Path) -> String {
     let Some(file) = open_rollout(path) else {
         return String::new();
     };
-    let reader = BufReader::new(file);
-    for line in reader.lines().take(100) {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => continue,
-        };
+    for line in TranscriptLines::new(BufReader::new(file)).take(100) {
         let entry: Value = match serde_json::from_str(line.trim()) {
             Ok(v) => v,
             Err(_) => continue,
@@ -1285,10 +1371,8 @@ pub fn load_codex_sessions() -> Vec<Session> {
             continue;
         }
         let modified = mtime_iso(&path).unwrap_or_default();
-        let date = meta
-            .created
-            .get(..10)
-            .map(str::to_string)
+        let date = Some(iso_date(&meta.created))
+            .filter(|d| !d.is_empty())
             .unwrap_or_else(|| mtime_date(&path).unwrap_or_default());
         // The thread's name, which every page of it shares.
         let summary = titles.get(&meta.id).cloned().unwrap_or_default();
@@ -1699,27 +1783,22 @@ pub fn parse_claude_jsonl(
     filepath: &str,
     extract_meta: bool,
 ) -> (Vec<Message>, Option<SessionMeta>) {
-    let file = match fs::File::open(filepath) {
-        Ok(f) => f,
-        Err(_) => {
-            return (
-                Vec::new(),
-                if extract_meta {
-                    Some(SessionMeta::default())
-                } else {
-                    None
-                },
-            );
-        }
-    };
+    try_parse_claude_jsonl(filepath, extract_meta)
+        .unwrap_or_else(|| (Vec::new(), extract_meta.then(SessionMeta::default)))
+}
+
+/// [`parse_claude_jsonl`], or `None` when the transcript could not be read
+/// to its end.
+fn try_parse_claude_jsonl(
+    filepath: &str,
+    extract_meta: bool,
+) -> Option<(Vec<Message>, Option<SessionMeta>)> {
+    let mut lines = transcript_lines(Path::new(filepath))?;
     let mut parser = ClaudeParser::new(extract_meta);
-    for line in BufReader::new(file).lines() {
-        let Ok(line) = line else {
-            continue;
-        };
+    for line in lines.by_ref() {
         parser.feed(&line);
     }
-    parser.finish()
+    lines.error.is_none().then(|| parser.finish())
 }
 
 /// Where a Claude transcript parse stopped, and what it carried: enough to
@@ -1997,14 +2076,18 @@ fn codex_tool_use(name: &str, call: &str) -> CodexToolUse {
 }
 
 pub fn parse_codex_jsonl(filepath: &str) -> Vec<Message> {
-    // Whole-file read + lossy decode: an unreadable path fails once up front
-    // (io::Lines can yield Err forever), and an invalid UTF-8 line only
-    // corrupts itself instead of truncating the rest of the transcript.
+    try_parse_codex_jsonl(filepath).unwrap_or_default()
+}
+
+/// [`parse_codex_jsonl`], or `None` when the rollout could not be read.
+fn try_parse_codex_jsonl(filepath: &str) -> Option<Vec<Message>> {
+    // Whole-file read + lossy decode: an unreadable path fails once up front,
+    // and an invalid UTF-8 line only corrupts itself instead of truncating the
+    // rest of the transcript.
     let mut bytes = Vec::new();
-    let read = open_rollout(Path::new(filepath)).map(|mut r| r.read_to_end(&mut bytes));
-    if !matches!(read, Some(Ok(_))) {
-        return Vec::new();
-    }
+    open_rollout(Path::new(filepath))?
+        .read_to_end(&mut bytes)
+        .ok()?;
     let entries: Vec<Value> = String::from_utf8_lossy(&bytes)
         .lines()
         .filter_map(|l| serde_json::from_str(l.trim()).ok())
@@ -2145,21 +2228,19 @@ pub fn parse_codex_jsonl(filepath: &str) -> Vec<Message> {
             _ => {}
         }
     }
-    messages
+    Some(messages)
 }
 
 pub fn parse_cursor_jsonl(filepath: &str) -> Vec<Message> {
-    let file = match fs::File::open(filepath) {
-        Ok(f) => f,
-        Err(_) => return Vec::new(),
-    };
-    let reader = BufReader::new(file);
+    try_parse_cursor_jsonl(filepath).unwrap_or_default()
+}
+
+/// [`parse_cursor_jsonl`], or `None` when the transcript could not be read to
+/// its end.
+fn try_parse_cursor_jsonl(filepath: &str) -> Option<Vec<Message>> {
+    let mut lines = transcript_lines(Path::new(filepath))?;
     let mut messages = Vec::new();
-    for line in reader.lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => continue,
-        };
+    for line in lines.by_ref() {
         let trimmed = line.trim().to_string();
         if trimmed.is_empty() {
             continue;
@@ -2209,14 +2290,17 @@ pub fn parse_cursor_jsonl(filepath: &str) -> Vec<Message> {
             });
         }
     }
-    messages
+    lines.error.is_none().then_some(messages)
 }
 
 pub fn parse_cursor_txt(filepath: &str) -> Vec<Message> {
-    let content = match fs::read_to_string(filepath) {
-        Ok(c) => c,
-        Err(_) => return Vec::new(),
-    };
+    try_parse_cursor_txt(filepath).unwrap_or_default()
+}
+
+/// [`parse_cursor_txt`], or `None` when the transcript could not be read.
+fn try_parse_cursor_txt(filepath: &str) -> Option<Vec<Message>> {
+    // Lossy: a stray invalid byte must not make the whole transcript unreadable.
+    let content = String::from_utf8_lossy(&fs::read(filepath).ok()?).into_owned();
     let mut messages = Vec::new();
     let mut current_role: Option<String> = None;
     let mut current_lines = Vec::new();
@@ -2289,7 +2373,7 @@ pub fn parse_cursor_txt(filepath: &str) -> Vec<Message> {
             });
         }
     }
-    messages
+    Some(messages)
 }
 
 pub fn parse_session(session: &Session, extract_meta: bool) -> (Vec<Message>, Option<SessionMeta>) {
@@ -2314,81 +2398,49 @@ fn parse_session_inner(
     if session.source == "claude" {
         return parse_claude_jsonl(&session.file, extract_meta);
     }
-    if session.source == "codex" {
-        let messages = parse_codex_jsonl(&session.file);
-        if extract_meta {
-            return (messages, Some(SessionMeta::default()));
+    let messages = read_session_messages(session, recover_timestamps).unwrap_or_default();
+    let meta = extract_meta.then(|| {
+        if session.source == "codex" {
+            return SessionMeta::default();
         }
-        return (messages, None);
-    }
-    if session.source == "cursor-ide" {
-        let messages = crate::cursor_ide::parse_cursor_ide(session);
-        if extract_meta {
-            return (
-                messages,
-                Some(SessionMeta {
-                    summary: if session.summary.is_empty() {
-                        None
-                    } else {
-                        Some(session.summary.clone())
-                    },
-                    custom_title: None,
-                    model: None,
-                    total_tokens: 0,
-                }),
-            );
+        SessionMeta {
+            summary: (!session.summary.is_empty()).then(|| session.summary.clone()),
+            custom_title: None,
+            model: if session.source == "cursor" {
+                crate::cursor_hooks::registered_model(session)
+            } else {
+                None
+            },
+            total_tokens: 0,
         }
-        return (messages, None);
-    }
-    if session.source == "cursor" {
-        let mut messages = if session.is_cursor_store_only() {
-            Vec::new()
-        } else if session.file.ends_with(".txt") {
-            parse_cursor_txt(&session.file)
-        } else {
-            parse_cursor_jsonl(&session.file)
-        };
-        if recover_timestamps {
-            crate::cursor_ide::enrich_transcript_timestamps(session, &mut messages);
+    });
+    (messages, meta)
+}
+
+/// A session's messages, as [`parse_session`] (or, with `recover_timestamps`,
+/// [`parse_session_recovering_timestamps`]) returns them, or `None` when its
+/// transcript or database could not be read. Unlike those, this tells a read
+/// failure apart from a transcript that holds no messages.
+pub fn read_session_messages(session: &Session, recover_timestamps: bool) -> Option<Vec<Message>> {
+    match session.source.as_str() {
+        "claude" => try_parse_claude_jsonl(&session.file, false).map(|(m, _)| m),
+        "codex" => try_parse_codex_jsonl(&session.file),
+        "cursor-ide" => crate::cursor_ide::try_parse_cursor_ide(session),
+        "cursor" => {
+            let mut messages = if session.is_cursor_store_only() {
+                Vec::new()
+            } else if session.file.ends_with(".txt") {
+                try_parse_cursor_txt(&session.file)?
+            } else {
+                try_parse_cursor_jsonl(&session.file)?
+            };
+            if recover_timestamps {
+                crate::cursor_ide::enrich_transcript_timestamps(session, &mut messages);
+            }
+            Some(messages)
         }
-        if extract_meta {
-            return (
-                messages,
-                Some(SessionMeta {
-                    summary: if session.summary.is_empty() {
-                        None
-                    } else {
-                        Some(session.summary.clone())
-                    },
-                    custom_title: None,
-                    model: crate::cursor_hooks::registered_model(session),
-                    total_tokens: 0,
-                }),
-            );
-        }
-        return (messages, None);
-    }
-    let messages = if session.file.ends_with(".jsonl") {
-        parse_cursor_jsonl(&session.file)
-    } else {
-        parse_cursor_txt(&session.file)
-    };
-    if extract_meta {
-        (
-            messages,
-            Some(SessionMeta {
-                summary: if session.summary.is_empty() {
-                    None
-                } else {
-                    Some(session.summary.clone())
-                },
-                custom_title: None,
-                model: None,
-                total_tokens: 0,
-            }),
-        )
-    } else {
-        (messages, None)
+        _ if session.file.ends_with(".jsonl") => try_parse_cursor_jsonl(&session.file),
+        _ => try_parse_cursor_txt(&session.file),
     }
 }
 
@@ -2531,6 +2583,12 @@ pub fn lookup_session<'a>(sessions: &'a [Session], sid: &str) -> SessionLookup<'
         }
         return SessionLookup::Found(prefer_session_copy(&matches));
     }
+    // `resume` copies a Claude transcript into the project folder of the
+    // directory it resumes in, under the same id; Claude Code may then go on
+    // writing to either copy. They are one conversation.
+    if one_id && matches.iter().all(|s| s.source == "claude") {
+        return SessionLookup::Found(prefer_session_copy(&matches));
+    }
     SessionLookup::Ambiguous(matches)
 }
 
@@ -2576,6 +2634,36 @@ fn project_matches_cwd(cwd: &Path, project: &str) -> bool {
     project == cwd || cwd.starts_with(&project) || project.starts_with(&cwd)
 }
 
+/// Whether a session ran in `cwd` or a folder inside it, by path components.
+/// A Cursor workspace whose folder name could not be decoded back into a path
+/// keeps Cursor's slug of it, so that is compared with the slug of `cwd`.
+pub fn in_workspace(cwd: &Path) -> impl Fn(&Session) -> bool + use<> {
+    // The working directory as the shell spelled it ($PWD, through any
+    // symlink) and as the system resolves it: an agent records either.
+    let mut roots = vec![cwd.to_path_buf()];
+    let real = fs::canonicalize(cwd).ok();
+    if let Some(pwd) = std::env::var_os("PWD").map(PathBuf::from)
+        && real.is_some()
+        && fs::canonicalize(&pwd).ok() == real
+    {
+        roots.push(pwd);
+    }
+    roots.extend(real);
+    roots.dedup();
+    let slugs: Vec<String> = roots
+        .iter()
+        .map(|root| cursor_project_slug(&root.to_string_lossy()))
+        .collect();
+    move |s: &Session| {
+        let project = Path::new(&s.project);
+        if project.is_absolute() {
+            roots.iter().any(|root| project.starts_with(root))
+        } else {
+            !s.project.is_empty() && slugs.contains(&s.project)
+        }
+    }
+}
+
 /// Prefer the copy whose workspace matches cwd; otherwise the newest.
 fn prefer_session_copy<'a>(copies: &[&'a Session]) -> &'a Session {
     if copies.len() == 1 {
@@ -2604,9 +2692,14 @@ fn prefer_session_copy<'a>(copies: &[&'a Session]) -> &'a Session {
             }
         }
     }
+    // The file breaks ties, so the pick does not depend on discovery order.
     copies
         .iter()
-        .max_by_key(|s| recency_key(s))
+        .max_by(|a, b| {
+            recency_key(a)
+                .cmp(&recency_key(b))
+                .then_with(|| b.file.cmp(&a.file))
+        })
         .copied()
         .unwrap_or(copies[0])
 }
@@ -3122,19 +3215,6 @@ mod tests {
         match lookup_session(&sessions, "bbbbbbbb") {
             SessionLookup::Found(s) => assert_eq!(s.project, "/home/alice/src/myapp"),
             other => panic!("expected Found, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn lookup_session_same_id_claude_stays_ambiguous() {
-        let id = "dddddddd-eeee-ffff-aaaa-111111111111";
-        let sessions = vec![
-            make_session(id, "2026-08-26", "claude", "/a", "", "one"),
-            make_session(id, "2026-08-20", "claude", "/b", "", "two"),
-        ];
-        match lookup_session(&sessions, id) {
-            SessionLookup::Ambiguous(c) => assert_eq!(c.len(), 2),
-            other => panic!("expected Ambiguous, got {other:?}"),
         }
     }
 
@@ -3886,25 +3966,113 @@ mod tests {
     }
 
     #[test]
-    fn read_cwd_branch_from_jsonl_extracts_cwd_and_branch() {
+    fn read_claude_head_extracts_cwd_branch_and_start() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        let data = r#"{"type":"user","cwd":"/Users/test/project","gitBranch":"feature-x","message":{"content":"hello"}}"#;
+        let data = [
+            r#"{"type":"mode","mode":"normal","sessionId":"s"}"#,
+            r#"{"type":"permission-mode","permissionMode":"auto","sessionId":"s"}"#,
+            r#"{"type":"user","cwd":"/Users/test/project","gitBranch":"feature-x","timestamp":"2026-11-01T19:10:00.000Z","message":{"content":"hello"}}"#,
+            r#"{"type":"assistant","timestamp":"2026-11-02T08:00:00.000Z","message":{"content":"hi"}}"#,
+        ]
+        .join("\n");
         std::fs::write(tmp.path(), data).unwrap();
-        assert_eq!(
-            read_cwd_branch_from_jsonl(tmp.path()),
-            (
-                Some("/Users/test/project".to_string()),
-                Some("feature-x".to_string())
-            )
-        );
+        let head = read_claude_head(tmp.path());
+        assert_eq!(head.cwd.as_deref(), Some("/Users/test/project"));
+        assert_eq!(head.branch.as_deref(), Some("feature-x"));
+        assert_eq!(head.started.as_deref(), Some("2026-11-01T19:10:00.000Z"));
     }
 
     #[test]
-    fn read_cwd_branch_from_jsonl_no_fields() {
+    fn read_claude_head_no_fields() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let data = r#"{"type":"user","message":{"content":"hello"}}"#;
         std::fs::write(tmp.path(), data).unwrap();
-        assert_eq!(read_cwd_branch_from_jsonl(tmp.path()), (None, None));
+        let head = read_claude_head(tmp.path());
+        assert_eq!((head.cwd, head.branch, head.started), (None, None, None));
+    }
+
+    #[test]
+    fn transcript_lines_skip_undecodable_lines_and_stop_on_read_errors() {
+        let mut bytes = b"one\r\n".to_vec();
+        bytes.extend_from_slice(b"\xff\xfe\n");
+        bytes.extend_from_slice(b"two");
+        let mut lines = TranscriptLines::new(std::io::Cursor::new(bytes));
+        assert_eq!(lines.by_ref().collect::<Vec<_>>(), ["one", "two"]);
+        assert!(lines.error.is_none());
+
+        // A directory opens, then fails every read: `lines()` would spin.
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut lines = transcript_lines(dir.path()).unwrap();
+        assert_eq!(lines.by_ref().count(), 0);
+        assert!(lines.error.is_some());
+        assert_eq!(claude_first_prompt(dir.path()), "");
+        assert!(try_parse_claude_jsonl(&dir.path().to_string_lossy(), false).is_none());
+        assert!(try_parse_cursor_jsonl(&dir.path().to_string_lossy()).is_none());
+    }
+
+    #[test]
+    fn iso_date_is_the_local_day() {
+        let utc = "2026-10-31T19:10:00Z";
+        let local = parse_any_timestamp(utc)
+            .unwrap()
+            .with_timezone(&chrono::Local)
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
+        assert_eq!(iso_date(utc), local);
+        assert_eq!(iso_date("2026-09-02"), "2026-09-02");
+        assert_eq!(iso_date(""), "");
+        assert_eq!(iso_date("garbage"), "");
+    }
+
+    #[test]
+    fn lookup_resolves_claude_copies_of_one_session_but_not_distinct_ids() {
+        let id = "abcd1234-0000-0000-0000-000000000000";
+        let copy = |file: &str, modified: &str| Session {
+            source: "claude".into(),
+            id: id.into(),
+            file: file.into(),
+            project: "/nonexistent/project".into(),
+            modified: modified.into(),
+            ..Session::default()
+        };
+        let sessions = vec![
+            copy("/a/x.jsonl", "2026-11-01T00:00:00Z"),
+            copy("/b/x.jsonl", "2026-11-02T00:00:00Z"),
+        ];
+        for query in [id, "abcd1234"] {
+            match lookup_session(&sessions, query) {
+                SessionLookup::Found(s) => assert_eq!(s.file, "/b/x.jsonl"),
+                other => panic!("{query}: {other:?}"),
+            }
+        }
+        let mut distinct = sessions.clone();
+        distinct[1].id = "abcd1234-1111-0000-0000-000000000000".into();
+        assert!(matches!(
+            lookup_session(&distinct, "abcd1234"),
+            SessionLookup::Ambiguous(_)
+        ));
+    }
+
+    #[test]
+    fn in_workspace_compares_path_components() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cwd = tmp.path().join("data");
+        fs::create_dir_all(&cwd).unwrap();
+        let at = |project: String| Session {
+            project,
+            ..Session::default()
+        };
+        let matches = in_workspace(&cwd);
+        let real = fs::canonicalize(&cwd).unwrap();
+        assert!(matches(&at(cwd.to_string_lossy().into())));
+        assert!(matches(&at(real.to_string_lossy().into())));
+        assert!(matches(&at(cwd.join("sub").to_string_lossy().into())));
+        assert!(!matches(&at(format!("{}-management", cwd.display()))));
+        assert!(!matches(&at(tmp.path().to_string_lossy().into())));
+        assert!(!matches(&at("data".into())));
+        assert!(!matches(&at(String::new())));
+        assert!(matches(&at(cursor_project_slug(&cwd.to_string_lossy()))));
     }
 
     #[test]

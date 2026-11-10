@@ -9,7 +9,7 @@ use crate::search::{
 };
 use crate::session::{
     ClaudeTail, Message, Session, parse_any_timestamp, parse_claude_jsonl_from,
-    parse_session_recovering_timestamps,
+    read_session_messages,
 };
 use chrono::{DateTime, Utc};
 use rayon::prelude::*;
@@ -344,6 +344,22 @@ fn memory_search(
     backend.search(request)
 }
 
+/// Search an index that could not be brought up to date, if it holds any
+/// sessions at all; an empty one would only hide every result.
+fn stale_search(
+    backend: &mut Bm25Backend,
+    request: &SearchRequest<'_>,
+) -> Option<Vec<SearchResult>> {
+    let indexed: i64 = backend
+        .conn
+        .query_row("SELECT count(*) FROM sessions", [], |r| r.get(0))
+        .ok()?;
+    if indexed == 0 {
+        return None;
+    }
+    backend.search(request).ok()
+}
+
 /// CLI orchestration. Cache failures preserve BM25 semantics using an ephemeral
 /// index; malformed user queries remain errors rather than triggering a rebuild.
 pub fn search_corpus(
@@ -405,6 +421,13 @@ pub fn search_corpus(
                     progress.warn(&format!("Warning: search cache reset failed ({e})."));
                 }
                 continue;
+            }
+            // Another process holding the write lock (a VACUUM, a long sync)
+            // or a full disk: the index on disk is still readable, and far
+            // cheaper to search as it stands than rebuilding it in memory.
+            if !rebuild && let Some(results) = stale_search(&mut backend, request) {
+                progress.warn(&format!("Warning: could not update search cache ({error}); results may miss sessions changed since the last update."));
+                return Ok(results);
             }
             progress.warn(&format!("Warning: could not save search cache ({error}); searching with an in-memory BM25 index."));
             return memory_search(corpus, request, rebuild, &mut progress);
@@ -978,30 +1001,42 @@ impl Bm25Backend {
                                     messages,
                                     tail: Some(tail),
                                 },
-                                None => Parsed::Whole {
-                                    messages: Vec::new(),
-                                    tail: None,
-                                },
+                                None => Parsed::Unreadable,
                             },
                         }
                     } else {
-                        Parsed::Whole {
-                            messages: parse_session_recovering_timestamps(session, false).0,
-                            tail: None,
+                        match read_session_messages(session, true) {
+                            Some(messages) => Parsed::Whole {
+                                messages,
+                                tail: None,
+                            },
+                            None => Parsed::Unreadable,
                         }
                     };
+                    let unreadable = matches!(parsed, Parsed::Unreadable);
                     let mut after = fingerprint(session, before.as_ref(), &shapes, true);
                     if let Some(after) = after.as_mut() {
                         after.tail = parsed.tail().cloned();
                     }
-                    (i, extract_parsed(session, before, parsed, after))
+                    (
+                        i,
+                        unreadable,
+                        extract_parsed(session, before, parsed, after),
+                    )
                 })
                 .collect();
             let mut writes = Vec::new();
-            for (i, (stamp, extracted, from)) in prepared {
+            for (i, unreadable, (stamp, extracted, from)) in prepared {
                 let key = &plan[i].0;
                 let current = current_fingerprint(&self.conn, key)?;
-                if from.is_none()
+                if unreadable && current.is_some() {
+                    // A transcript that could not be read keeps the rows and
+                    // the stamp it has; the stamp no longer matches the file,
+                    // so the next sync reads it again.
+                    stats.unchanged += 1;
+                    refreshed += 1;
+                    progress(refreshed, refreshing);
+                } else if from.is_none()
                     && !rebuild
                     && current.as_deref() == Some(stamp.as_str())
                     && matches!(stored_rows(&self.conn, key, &extracted)?, Stored::Identical)
@@ -1010,7 +1045,7 @@ impl Bm25Backend {
                     refreshed += 1;
                     progress(refreshed, refreshing);
                 } else {
-                    writes.push((i, stamp, extracted, from, current));
+                    writes.push((i, unreadable, stamp, extracted, from, current));
                 }
             }
             if writes.is_empty() {
@@ -1018,10 +1053,13 @@ impl Bm25Backend {
                 continue;
             }
             let tx = begin_immediate(&self.conn)?;
-            for (i, stamp, extracted, from, seen) in writes {
+            for (i, unreadable, stamp, extracted, from, seen) in writes {
                 let key = &plan[i].0;
                 let current = current_fingerprint(&tx, key)?;
-                if current != seen
+                if unreadable && current.is_some() {
+                    // Published by another process since it was checked.
+                    stats.unchanged += 1;
+                } else if current != seen
                     && current
                         .as_deref()
                         .and_then(|c| serde_json::from_str::<Fingerprint>(c).ok())
@@ -1312,6 +1350,10 @@ enum Parsed {
         from: usize,
         tail: ClaudeTail,
     },
+    /// The transcript or database could not be read. Rows already stored
+    /// for it are kept; a session not yet stored gets its title and prompt
+    /// rows, under a stamp that is retried.
+    Unreadable,
 }
 
 impl Parsed {
@@ -1319,6 +1361,7 @@ impl Parsed {
         match self {
             Parsed::Whole { tail, .. } => tail.as_ref(),
             Parsed::Tail { tail, .. } => Some(tail),
+            Parsed::Unreadable => None,
         }
     }
 }
@@ -1335,6 +1378,10 @@ fn extract_parsed(
     match parsed {
         Parsed::Whole { messages, .. } => {
             let (stamp, extracted) = extract_session(session, before, messages, after);
+            (stamp, extracted, None)
+        }
+        Parsed::Unreadable => {
+            let (stamp, extracted) = extract_session(session, before, Vec::new(), None);
             (stamp, extracted, None)
         }
         Parsed::Tail { messages, from, .. } => {
@@ -1421,9 +1468,9 @@ fn append_tail(
     Ok(true)
 }
 
-/// Parsers report a failed read as an empty message list. An empty parse of a
-/// plain transcript is kept only when the file reads cleanly from start to end;
-/// SQLite-backed sources cannot be checked this way and are retried.
+/// An empty parse of a plain transcript is kept only when the file reads
+/// cleanly from start to end; SQLite-backed sources cannot be checked this way
+/// and are retried.
 fn empty_parse_is_durable(session: &Session) -> bool {
     let sqlite = session.file.ends_with(".db") || session.file.ends_with(".vscdb");
     !sqlite

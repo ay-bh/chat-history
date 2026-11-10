@@ -517,25 +517,26 @@ fn main() {
     let from_d = parse_date_arg(&cli.from_date);
     let to_d = parse_date_arg(&cli.to_date);
 
-    let project_filter = if cli.local && cli.project.is_none() {
-        std::env::current_dir()
-            .ok()
-            .and_then(|cwd| cwd.file_name().map(|n| n.to_string_lossy().to_string()))
-    } else {
-        cli.project.clone()
-    };
-
     // The filter flags are global, so honor them everywhere they can apply:
     // search scoping, `--last` selection, and the default listing.
-    let filtered = filter_sessions(
+    let mut filtered = filter_sessions(
         &sessions,
         from_d,
         to_d,
         cli.keyword.as_deref(),
         source_filter,
-        project_filter.as_deref(),
+        cli.project.as_deref(),
         cli.branch.as_deref(),
     );
+    // -L is the current folder and the folders inside it, compared as paths:
+    // a folder named `data` must not take in `data-management`. `-p` wins.
+    if cli.local
+        && cli.project.is_none()
+        && let Ok(cwd) = std::env::current_dir()
+    {
+        let in_workspace = session::in_workspace(&cwd);
+        filtered.retain(|s| in_workspace(s));
+    }
 
     match cli.command {
         Some(Commands::Search {

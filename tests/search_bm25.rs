@@ -1302,7 +1302,7 @@ fn sqlite_wal_changes_refresh_messages_without_main_database_changes() {
 }
 
 #[test]
-fn locked_cache_uses_ephemeral_bm25_and_preserves_json() {
+fn locked_cache_searches_the_index_as_it_stands() {
     let tmp = TempDir::new().unwrap();
     cli_fixture(&tmp);
     command(&tmp)
@@ -1319,17 +1319,16 @@ fn locked_cache_uses_ephemeral_bm25_and_preserves_json() {
         rusqlite::Connection::open(tmp.path().join(".chat-history/cache").join(INDEX_FILENAME))
             .unwrap();
     conn.execute_batch("BEGIN IMMEDIATE").unwrap();
-    // The recent source needs a refresh, so a held write lock must trigger fallback.
+    // The recent source needs a refresh that the held write lock blocks: the
+    // index on disk is searched as it stands, not rebuilt in memory.
     let output = command(&tmp)
         .args(["search", "uniquecli", "--json"])
         .output()
         .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(String::from_utf8_lossy(&output.stderr).contains("in-memory BM25"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(stderr.contains("could not update search cache"), "{stderr}");
+    assert!(!stderr.contains("in-memory BM25"), "{stderr}");
     assert!(
         serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()["count"]
             .as_u64()
@@ -1869,4 +1868,38 @@ fn read_only_home_cache_falls_back_to_a_private_temp_copy_without_rebuilding() {
     assert!(second.status.success(), "{stderr}");
     assert!(!stderr.contains("not writable"), "quiet on reuse: {stderr}");
     assert_eq!(second.stdout, warm.stdout);
+}
+
+#[test]
+fn a_transcript_that_cannot_be_read_keeps_its_indexed_messages() {
+    let tmp = TempDir::new().unwrap();
+    let corpus = vec![transcript(
+        &tmp,
+        "source",
+        &["First keptalpha message.", "Second keptbeta message."],
+    )];
+    std::thread::sleep(std::time::Duration::from_millis(2100));
+    let dir = tmp.path().join("index");
+    let mut index = Bm25Backend::open(Some(&dir)).unwrap();
+    assert_eq!(index.sync(&corpus, false).unwrap().updated, 1);
+    assert!(!search(&mut index, &corpus, "keptbeta", 10).is_empty());
+
+    // A path that opens but fails every read: a read failure, not a
+    // transcript that became empty.
+    let file = std::path::Path::new(&corpus[0].file);
+    fs::remove_file(file).unwrap();
+    fs::create_dir(file).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(2100));
+    index.sync(&corpus, false).unwrap();
+    assert!(!search(&mut index, &corpus, "keptalpha", 10).is_empty());
+    assert!(!search(&mut index, &corpus, "keptbeta", 10).is_empty());
+
+    // Readable again: the next sync parses it, though its size and time say
+    // nothing changed since the failed read.
+    fs::remove_dir(file).unwrap();
+    write_messages(file, &["Rewritten keptgamma message."]);
+    std::thread::sleep(std::time::Duration::from_millis(2100));
+    assert_eq!(index.sync(&corpus, false).unwrap().updated, 1);
+    assert!(!search(&mut index, &corpus, "keptgamma", 10).is_empty());
+    assert!(search(&mut index, &corpus, "keptbeta", 10).is_empty());
 }

@@ -2051,61 +2051,57 @@ fn timeframe_excludes_empty_timestamp_messages() {
 #[test]
 fn local_flag_works_with_search() {
     let tmp = TempDir::new().unwrap();
+    // Real paths: -L compares the recorded workspace with the current folder.
+    let root = fs::canonicalize(tmp.path()).unwrap();
+    let alpha_dir = root.join("alpha");
+    fs::create_dir_all(alpha_dir.join("src")).unwrap();
 
-    // Create two projects with different names
-    let proj_a_dir = tmp.path().join("projects").join("-Users-test-alpha");
-    fs::create_dir_all(&proj_a_dir).unwrap();
-    let session_a = "aaaa1111-2222-3333-4444-555555555555";
-    let jsonl_a = proj_a_dir.join(format!("{session_a}.jsonl"));
-    let msg_a = serde_json::json!({"type":"user","cwd":"/Users/test/alpha","message":{"role":"user","content":"deploy the authentication service to production"},"timestamp":"2025-01-15T10:00:00Z","uuid":"u1"});
-    fs::write(&jsonl_a, serde_json::to_string(&msg_a).unwrap()).unwrap();
-    let index_a = serde_json::json!({
-        "entries": [{
-            "sessionId": session_a,
-            "summary": "deploy auth to prod",
-            "firstPrompt": "deploy the authentication service",
-            "created": "2025-01-15T10:00:00Z",
-            "modified": "2025-01-15T10:00:00Z",
-            "messageCount": 1,
-            "gitBranch": "main",
-            "projectPath": "/Users/test/alpha",
-            "fullPath": jsonl_a.to_string_lossy(),
-            "isSidechain": false
-        }]
-    });
-    fs::write(
-        proj_a_dir.join("sessions-index.json"),
-        serde_json::to_string(&index_a).unwrap(),
-    )
-    .unwrap();
+    // `alpha-old` shares a prefix with `alpha` and must stay out of -L.
+    let projects = [
+        (
+            "aaaa1111-2222-3333-4444-555555555555",
+            alpha_dir.clone(),
+            "deploy the authentication service to production",
+        ),
+        (
+            "cccc1111-2222-3333-4444-555555555555",
+            alpha_dir.join("src"),
+            "deploy the billing worker from a subfolder",
+        ),
+        (
+            "bbbb1111-2222-3333-4444-555555555555",
+            root.join("alpha-old"),
+            "deploy the notification service to staging",
+        ),
+    ];
+    for (i, (id, project, text)) in projects.iter().enumerate() {
+        let dir = tmp.path().join("projects").join(format!("p{i}"));
+        fs::create_dir_all(&dir).unwrap();
+        let jsonl = dir.join(format!("{id}.jsonl"));
+        let msg = serde_json::json!({"type":"user","cwd":project,"message":{"role":"user","content":text},"timestamp":"2025-01-15T10:00:00Z","uuid":format!("u{i}")});
+        fs::write(&jsonl, serde_json::to_string(&msg).unwrap()).unwrap();
+        let index = serde_json::json!({
+            "entries": [{
+                "sessionId": id,
+                "summary": text,
+                "firstPrompt": text,
+                "created": "2025-01-15T10:00:00Z",
+                "modified": "2025-01-15T10:00:00Z",
+                "messageCount": 1,
+                "gitBranch": "main",
+                "projectPath": project,
+                "fullPath": jsonl.to_string_lossy(),
+                "isSidechain": false
+            }]
+        });
+        fs::write(
+            dir.join("sessions-index.json"),
+            serde_json::to_string(&index).unwrap(),
+        )
+        .unwrap();
+    }
 
-    let proj_b_dir = tmp.path().join("projects").join("-Users-test-beta");
-    fs::create_dir_all(&proj_b_dir).unwrap();
-    let session_b = "bbbb1111-2222-3333-4444-555555555555";
-    let jsonl_b = proj_b_dir.join(format!("{session_b}.jsonl"));
-    let msg_b = serde_json::json!({"type":"user","cwd":"/Users/test/beta","message":{"role":"user","content":"deploy the notification service to staging"},"timestamp":"2025-01-15T10:00:00Z","uuid":"u2"});
-    fs::write(&jsonl_b, serde_json::to_string(&msg_b).unwrap()).unwrap();
-    let index_b = serde_json::json!({
-        "entries": [{
-            "sessionId": session_b,
-            "summary": "deploy notifications",
-            "firstPrompt": "deploy the notification service",
-            "created": "2025-01-15T10:00:00Z",
-            "modified": "2025-01-15T10:00:00Z",
-            "messageCount": 1,
-            "gitBranch": "main",
-            "projectPath": "/Users/test/beta",
-            "fullPath": jsonl_b.to_string_lossy(),
-            "isSidechain": false
-        }]
-    });
-    fs::write(
-        proj_b_dir.join("sessions-index.json"),
-        serde_json::to_string(&index_b).unwrap(),
-    )
-    .unwrap();
-
-    // Without -L: both projects appear
+    // Without -L: every project appears
     let output = Command::cargo_bin("chat-history")
         .unwrap()
         .env("CLAUDE_CONFIG_DIR", tmp.path())
@@ -2116,33 +2112,34 @@ fn local_flag_works_with_search() {
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(
-        stdout.contains("2 sessions"),
-        "without -L both sessions should appear: {stdout}"
+        stdout.contains("3 sessions"),
+        "without -L every session should appear: {stdout}"
     );
 
-    // With -L from a directory named "alpha": only alpha project matches
-    let alpha_dir = tmp.path().join("alpha");
-    fs::create_dir_all(&alpha_dir).unwrap();
-    let output = Command::cargo_bin("chat-history")
-        .unwrap()
-        .args(["-L", "search", "deploy"])
-        .current_dir(&alpha_dir)
-        .env("CLAUDE_CONFIG_DIR", tmp.path())
-        .env("HOME", tmp.path())
-        .env("NO_COLOR", "1")
-        .output()
-        .unwrap();
-    let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(output.status.success(), "command failed. stderr: {stderr}");
-    let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(
-        stdout.contains("authentication"),
-        "search -L from alpha dir should find alpha session: {stdout}"
-    );
-    assert!(
-        !stdout.contains("notification"),
-        "search -L from alpha dir should not find beta session: {stdout}"
-    );
+    // With -L from alpha: alpha and its subfolder, not alpha-old
+    for args in [&["-L", "search", "deploy"][..], &["-L"][..]] {
+        let output = Command::cargo_bin("chat-history")
+            .unwrap()
+            .args(args)
+            .current_dir(&alpha_dir)
+            .env("PWD", &alpha_dir)
+            .env("CLAUDE_CONFIG_DIR", tmp.path())
+            .env("HOME", tmp.path())
+            .env("NO_COLOR", "1")
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(output.status.success(), "command failed. stderr: {stderr}");
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            stdout.contains("authentication") && stdout.contains("billing"),
+            "{args:?} from alpha should find alpha and alpha/src: {stdout}"
+        );
+        assert!(
+            !stdout.contains("notification"),
+            "{args:?} from alpha should not find alpha-old: {stdout}"
+        );
+    }
 }
 
 #[test]
@@ -2528,4 +2525,85 @@ fn cursor_transcript_with_cli_store_resumes_in_its_workspace() {
             "SHIM cwd {}",
             ws.canonicalize().unwrap().display()
         )));
+}
+
+fn claude_record(id: &str, cwd: &str, timestamp: &str, text: &str) -> String {
+    serde_json::json!({
+        "type": "user", "sessionId": id, "cwd": cwd, "timestamp": timestamp,
+        "uuid": format!("u-{timestamp}"),
+        "message": {"role": "user", "content": text}
+    })
+    .to_string()
+        + "\n"
+}
+
+#[test]
+fn a_directory_named_like_a_transcript_does_not_hang_listing() {
+    let (mut cmd, tmp) = isolated_cmd();
+    let project = tmp.path().join("projects/-work-demo");
+    let id = "abcd0000-1111-2222-3333-444444444444";
+    fs::create_dir_all(project.join(id).join("subagents/agent-x.jsonl")).unwrap();
+    fs::create_dir_all(project.join("ffff0000-1111-2222-3333-444444444444.jsonl")).unwrap();
+    fs::write(
+        project.join(format!("{id}.jsonl")),
+        claude_record(id, "/work/demo", "2026-11-01T10:00:00Z", "list my sessions"),
+    )
+    .unwrap();
+    cmd.args(["--sidechains", "-v"])
+        .env("NO_COLOR", "1")
+        .timeout(std::time::Duration::from_secs(20))
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(id));
+}
+
+#[test]
+fn a_claude_session_lists_on_the_local_day_it_started() {
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("projects/-work-demo");
+    fs::create_dir_all(&project).unwrap();
+    let id = "abcd0000-1111-2222-3333-555555555555";
+    // 19:10 UTC on Oct 31 is 00:40 on Nov 1 in India. The file itself was
+    // written today, which is neither day.
+    fs::write(
+        project.join(format!("{id}.jsonl")),
+        claude_record(id, "/work/demo", "2026-10-31T19:10:00Z", "late night start"),
+    )
+    .unwrap();
+    let list = |tz: &str, day: &str| {
+        let output = Command::cargo_bin("chat-history")
+            .unwrap()
+            .args(["--from", day, "--to", day, "-v"])
+            .env("CLAUDE_CONFIG_DIR", tmp.path())
+            .env("HOME", tmp.path())
+            .env_remove("CODEX_HOME")
+            .env("TZ", tz)
+            .env("NO_COLOR", "1")
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        String::from_utf8(output.stdout).unwrap().contains(id)
+    };
+    assert!(list("Asia/Kolkata", "2026-11-01"));
+    assert!(!list("Asia/Kolkata", "2026-10-31"));
+    assert!(list("UTC", "2026-10-31"));
+    assert!(!list("UTC", "2026-11-01"));
+}
+
+#[test]
+fn a_claude_session_copied_by_resume_still_resolves_by_id() {
+    let (mut cmd, tmp) = isolated_cmd();
+    let id = "abcd0000-1111-2222-3333-666666666666";
+    let record = claude_record(id, "/work/demo", "2026-11-01T10:00:00Z", "copied session");
+    // `resume` from another folder copies the transcript under the same id.
+    for dir in ["projects/-work-demo", "projects/-elsewhere"] {
+        let dir = tmp.path().join(dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(format!("{id}.jsonl")), &record).unwrap();
+    }
+    cmd.args(["view", id])
+        .env("NO_COLOR", "1")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("copied session"));
 }
