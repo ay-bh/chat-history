@@ -2529,3 +2529,33 @@ fn cursor_transcript_with_cli_store_resumes_in_its_workspace() {
             ws.canonicalize().unwrap().display()
         )));
 }
+
+fn claude_record(id: &str, cwd: &str, timestamp: &str, text: &str) -> String {
+    serde_json::json!({
+        "type": "user", "sessionId": id, "cwd": cwd, "timestamp": timestamp,
+        "uuid": format!("u-{timestamp}"),
+        "message": {"role": "user", "content": text}
+    })
+    .to_string()
+        + "\n"
+}
+
+#[test]
+fn a_directory_named_like_a_transcript_does_not_hang_listing() {
+    let (mut cmd, tmp) = isolated_cmd();
+    let project = tmp.path().join("projects/-work-demo");
+    let id = "abcd0000-1111-2222-3333-444444444444";
+    fs::create_dir_all(project.join(id).join("subagents/agent-x.jsonl")).unwrap();
+    fs::create_dir_all(project.join("ffff0000-1111-2222-3333-444444444444.jsonl")).unwrap();
+    fs::write(
+        project.join(format!("{id}.jsonl")),
+        claude_record(id, "/work/demo", "2026-11-01T10:00:00Z", "list my sessions"),
+    )
+    .unwrap();
+    cmd.args(["--sidechains", "-v"])
+        .env("NO_COLOR", "1")
+        .timeout(std::time::Duration::from_secs(20))
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(id));
+}

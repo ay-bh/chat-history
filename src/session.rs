@@ -15,6 +15,63 @@ use std::time::{SystemTime, UNIX_EPOCH};
 // title extraction changes so unchanged files are re-read, not served stale.
 const TRANSCRIPT_KIND: &str = "transcript-v2";
 
+/// The lines of a transcript, like `BufRead::lines`, except that a read
+/// error ends them instead of repeating forever: an unreadable path such as a
+/// directory fails the same way on every read. The error is kept in `error`.
+/// A line that is not UTF-8 is skipped, like any other malformed record.
+pub(crate) struct TranscriptLines<R> {
+    reader: R,
+    buf: Vec<u8>,
+    pub(crate) error: Option<std::io::Error>,
+}
+
+impl<R: BufRead> TranscriptLines<R> {
+    pub(crate) fn new(reader: R) -> Self {
+        Self {
+            reader,
+            buf: Vec::new(),
+            error: None,
+        }
+    }
+}
+
+impl<R: BufRead> Iterator for TranscriptLines<R> {
+    type Item = String;
+
+    fn next(&mut self) -> Option<String> {
+        if self.error.is_some() {
+            return None;
+        }
+        loop {
+            self.buf.clear();
+            match self.reader.read_until(b'\n', &mut self.buf) {
+                Ok(0) => return None,
+                Ok(_) => {
+                    if self.buf.ends_with(b"\n") {
+                        self.buf.pop();
+                        if self.buf.ends_with(b"\r") {
+                            self.buf.pop();
+                        }
+                    }
+                    if let Ok(line) = std::str::from_utf8(&self.buf) {
+                        return Some(line.to_owned());
+                    }
+                }
+                Err(e) => {
+                    self.error = Some(e);
+                    return None;
+                }
+            }
+        }
+    }
+}
+
+fn transcript_lines(path: &Path) -> Option<TranscriptLines<BufReader<fs::File>>> {
+    Some(TranscriptLines::new(BufReader::new(
+        fs::File::open(path).ok()?,
+    )))
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct Session {
     pub source: String,
@@ -154,17 +211,12 @@ fn codex_sessions_dir() -> PathBuf {
 
 // Reads cwd and gitBranch from the first records of a Claude transcript.
 fn read_cwd_branch_from_jsonl(path: &Path) -> (Option<String>, Option<String>) {
-    let Ok(file) = fs::File::open(path) else {
+    let Some(lines) = transcript_lines(path) else {
         return (None, None);
     };
-    let reader = BufReader::new(file);
     let mut cwd = None;
     let mut branch = None;
-    for line in reader.lines().take(10) {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => continue,
-        };
+    for line in lines.take(10) {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -488,16 +540,10 @@ fn mtime_date(path: &Path) -> Option<String> {
 }
 
 fn claude_first_prompt(path: &Path) -> String {
-    let file = match fs::File::open(path) {
-        Ok(f) => f,
-        Err(_) => return String::new(),
+    let Some(lines) = transcript_lines(path) else {
+        return String::new();
     };
-    let reader = BufReader::new(file);
-    for line in reader.lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => continue,
-        };
+    for line in lines {
         let trimmed = line.trim().to_string();
         if trimmed.is_empty() {
             continue;
@@ -538,10 +584,7 @@ pub(crate) fn cursor_first_prompt_jsonl(path: &Path) -> String {
 }
 
 fn cursor_first_prompt_jsonl_uncached(path: &Path) -> Option<String> {
-    let file = fs::File::open(path).ok()?;
-    let reader = BufReader::new(file);
-    for line in reader.lines() {
-        let Ok(line) = line else { continue };
+    for line in transcript_lines(path)? {
         let Ok(entry) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
@@ -1141,8 +1184,7 @@ fn open_rollout(path: &Path) -> Option<Box<dyn Read>> {
 }
 
 fn read_codex_meta(path: &Path) -> Option<CodexMeta> {
-    let reader = BufReader::new(open_rollout(path)?);
-    let line = reader.lines().next()?.ok()?;
+    let line = TranscriptLines::new(BufReader::new(open_rollout(path)?)).next()?;
     let entry: Value = serde_json::from_str(line.trim()).ok()?;
     let payload = codex_payload(&entry);
     let id = payload.get("id").and_then(Value::as_str)?.to_string();
@@ -1213,12 +1255,7 @@ fn codex_first_prompt(path: &Path) -> String {
     let Some(file) = open_rollout(path) else {
         return String::new();
     };
-    let reader = BufReader::new(file);
-    for line in reader.lines().take(100) {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => continue,
-        };
+    for line in TranscriptLines::new(BufReader::new(file)).take(100) {
         let entry: Value = match serde_json::from_str(line.trim()) {
             Ok(v) => v,
             Err(_) => continue,
@@ -1699,24 +1736,11 @@ pub fn parse_claude_jsonl(
     filepath: &str,
     extract_meta: bool,
 ) -> (Vec<Message>, Option<SessionMeta>) {
-    let file = match fs::File::open(filepath) {
-        Ok(f) => f,
-        Err(_) => {
-            return (
-                Vec::new(),
-                if extract_meta {
-                    Some(SessionMeta::default())
-                } else {
-                    None
-                },
-            );
-        }
+    let Some(lines) = transcript_lines(Path::new(filepath)) else {
+        return (Vec::new(), extract_meta.then(SessionMeta::default));
     };
     let mut parser = ClaudeParser::new(extract_meta);
-    for line in BufReader::new(file).lines() {
-        let Ok(line) = line else {
-            continue;
-        };
+    for line in lines {
         parser.feed(&line);
     }
     parser.finish()
@@ -1997,8 +2021,8 @@ fn codex_tool_use(name: &str, call: &str) -> CodexToolUse {
 }
 
 pub fn parse_codex_jsonl(filepath: &str) -> Vec<Message> {
-    // Whole-file read + lossy decode: an unreadable path fails once up front
-    // (io::Lines can yield Err forever), and an invalid UTF-8 line only
+    // Whole-file read + lossy decode: an unreadable path fails once up front,
+    // and an invalid UTF-8 line only
     // corrupts itself instead of truncating the rest of the transcript.
     let mut bytes = Vec::new();
     let read = open_rollout(Path::new(filepath)).map(|mut r| r.read_to_end(&mut bytes));
@@ -2149,17 +2173,11 @@ pub fn parse_codex_jsonl(filepath: &str) -> Vec<Message> {
 }
 
 pub fn parse_cursor_jsonl(filepath: &str) -> Vec<Message> {
-    let file = match fs::File::open(filepath) {
-        Ok(f) => f,
-        Err(_) => return Vec::new(),
+    let Some(lines) = transcript_lines(Path::new(filepath)) else {
+        return Vec::new();
     };
-    let reader = BufReader::new(file);
     let mut messages = Vec::new();
-    for line in reader.lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => continue,
-        };
+    for line in lines {
         let trimmed = line.trim().to_string();
         if trimmed.is_empty() {
             continue;
@@ -3905,6 +3923,23 @@ mod tests {
         let data = r#"{"type":"user","message":{"content":"hello"}}"#;
         std::fs::write(tmp.path(), data).unwrap();
         assert_eq!(read_cwd_branch_from_jsonl(tmp.path()), (None, None));
+    }
+
+    #[test]
+    fn transcript_lines_skip_undecodable_lines_and_stop_on_read_errors() {
+        let mut bytes = b"one\r\n".to_vec();
+        bytes.extend_from_slice(b"\xff\xfe\n");
+        bytes.extend_from_slice(b"two");
+        let mut lines = TranscriptLines::new(std::io::Cursor::new(bytes));
+        assert_eq!(lines.by_ref().collect::<Vec<_>>(), ["one", "two"]);
+        assert!(lines.error.is_none());
+
+        // A directory opens, then fails every read: `lines()` would spin.
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut lines = transcript_lines(dir.path()).unwrap();
+        assert_eq!(lines.by_ref().count(), 0);
+        assert!(lines.error.is_some());
+        assert_eq!(claude_first_prompt(dir.path()), "");
     }
 
     #[test]
