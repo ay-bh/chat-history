@@ -2576,6 +2576,36 @@ fn project_matches_cwd(cwd: &Path, project: &str) -> bool {
     project == cwd || cwd.starts_with(&project) || project.starts_with(&cwd)
 }
 
+/// Whether a session ran in `cwd` or a folder inside it, by path components.
+/// A Cursor workspace whose folder name could not be decoded back into a path
+/// keeps Cursor's slug of it, so that is compared with the slug of `cwd`.
+pub fn in_workspace(cwd: &Path) -> impl Fn(&Session) -> bool + use<> {
+    // The working directory as the shell spelled it ($PWD, through any
+    // symlink) and as the system resolves it: an agent records either.
+    let mut roots = vec![cwd.to_path_buf()];
+    let real = fs::canonicalize(cwd).ok();
+    if let Some(pwd) = std::env::var_os("PWD").map(PathBuf::from)
+        && real.is_some()
+        && fs::canonicalize(&pwd).ok() == real
+    {
+        roots.push(pwd);
+    }
+    roots.extend(real);
+    roots.dedup();
+    let slugs: Vec<String> = roots
+        .iter()
+        .map(|root| cursor_project_slug(&root.to_string_lossy()))
+        .collect();
+    move |s: &Session| {
+        let project = Path::new(&s.project);
+        if project.is_absolute() {
+            roots.iter().any(|root| project.starts_with(root))
+        } else {
+            !s.project.is_empty() && slugs.contains(&s.project)
+        }
+    }
+}
+
 /// Prefer the copy whose workspace matches cwd; otherwise the newest.
 fn prefer_session_copy<'a>(copies: &[&'a Session]) -> &'a Session {
     if copies.len() == 1 {
@@ -2774,6 +2804,27 @@ mod tests {
         assert_eq!(shell_quote("it's"), "'it'\\''s'");
         assert_eq!(shell_quote("$HOME"), "'$HOME'");
         assert_eq!(shell_quote(""), "''");
+    }
+
+    #[test]
+    fn in_workspace_compares_path_components() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cwd = tmp.path().join("data");
+        fs::create_dir_all(&cwd).unwrap();
+        let at = |project: String| Session {
+            project,
+            ..Session::default()
+        };
+        let matches = in_workspace(&cwd);
+        let real = fs::canonicalize(&cwd).unwrap();
+        assert!(matches(&at(cwd.to_string_lossy().into())));
+        assert!(matches(&at(real.to_string_lossy().into())));
+        assert!(matches(&at(cwd.join("sub").to_string_lossy().into())));
+        assert!(!matches(&at(format!("{}-management", cwd.display()))));
+        assert!(!matches(&at(tmp.path().to_string_lossy().into())));
+        assert!(!matches(&at("data".into())));
+        assert!(!matches(&at(String::new())));
+        assert!(matches(&at(cursor_project_slug(&cwd.to_string_lossy()))));
     }
 
     #[test]
