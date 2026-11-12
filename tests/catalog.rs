@@ -320,3 +320,53 @@ fn concurrent_processes_share_the_cache_without_changing_output() {
         "ok"
     );
 }
+
+#[test]
+fn a_cached_ide_listing_follows_the_local_day_of_each_run() {
+    let tmp = TempDir::new().unwrap();
+    let db = tmp.path().join("cursor-user/globalStorage/state.vscdb");
+    fs::create_dir_all(db.parent().unwrap()).unwrap();
+    let conn = Connection::open(&db).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE composerHeaders(composerId TEXT PRIMARY KEY, value TEXT);
+        CREATE TABLE cursorDiskKV(key TEXT PRIMARY KEY, value TEXT);",
+    )
+    .unwrap();
+    // 19:10 UTC on Oct 31 is 00:40 on Nov 1 in India.
+    let at = 1793473800000i64;
+    conn.execute(
+        "INSERT INTO composerHeaders VALUES (?1, ?2)",
+        params![
+            ID,
+            json!({"name":"Late IDE chat", "createdAt":at, "lastUpdatedAt":at}).to_string()
+        ],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO cursorDiskKV VALUES (?1, ?2)",
+        params![
+            format!("bubbleId:{ID}:one"),
+            json!({"type":1, "text":"IDE user message"}).to_string()
+        ],
+    )
+    .unwrap();
+    drop(conn);
+    std::thread::sleep(std::time::Duration::from_millis(2100));
+    let listed = |tz: &str, day: &str| {
+        let mut cmd = command(&tmp);
+        let out = cmd
+            .args(["--source", "cursor-ide", "--from", day, "--to", day])
+            .env("TZ", tz)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        String::from_utf8(out.stdout)
+            .unwrap()
+            .contains("Late IDE chat")
+    };
+    // Warm the catalog in one zone, then list in another.
+    assert!(listed("UTC", "2026-10-31"));
+    assert!(listed("UTC", "2026-10-31"));
+    assert!(!listed("Asia/Kolkata", "2026-10-31"));
+    assert!(listed("Asia/Kolkata", "2026-11-01"));
+}

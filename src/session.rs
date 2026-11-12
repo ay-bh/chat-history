@@ -14,6 +14,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 // Catalog entry kind for cached transcript metadata. Bump when first-prompt or
 // title extraction changes so unchanged files are re-read, not served stale.
 const TRANSCRIPT_KIND: &str = "transcript-v2";
+// Claude entries also carry the transcript's first timestamp.
+const CLAUDE_TRANSCRIPT_KIND: &str = "transcript-v3";
 
 /// The lines of a transcript, like `BufRead::lines`, except that a read
 /// error ends them instead of repeating forever: an unreadable path such as a
@@ -209,14 +211,25 @@ fn codex_sessions_dir() -> PathBuf {
     codex_home().join("sessions")
 }
 
-// Reads cwd and gitBranch from the first records of a Claude transcript.
-fn read_cwd_branch_from_jsonl(path: &Path) -> (Option<String>, Option<String>) {
+/// What the first records of a Claude transcript say about where and when
+/// it started.
+#[derive(Default)]
+struct ClaudeHead {
+    cwd: Option<String>,
+    branch: Option<String>,
+    /// The first record's timestamp: when the session started.
+    started: Option<String>,
+}
+
+// Reads cwd, gitBranch and the first timestamp from the first records of a
+// Claude transcript. The opening records (mode, permission-mode, ...) carry
+// none of them, so a few more lines are read than records that do.
+fn read_claude_head(path: &Path) -> ClaudeHead {
+    let mut head = ClaudeHead::default();
     let Some(lines) = transcript_lines(path) else {
-        return (None, None);
+        return head;
     };
-    let mut cwd = None;
-    let mut branch = None;
-    for line in lines.take(10) {
+    for line in lines.take(20) {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -225,23 +238,29 @@ fn read_cwd_branch_from_jsonl(path: &Path) -> (Option<String>, Option<String>) {
             Ok(v) => v,
             Err(_) => continue,
         };
-        if cwd.is_none()
+        if head.cwd.is_none()
             && let Some(c) = entry.get("cwd").and_then(Value::as_str)
             && !c.is_empty()
         {
-            cwd = Some(c.to_string());
+            head.cwd = Some(c.to_string());
         }
-        if branch.is_none()
+        if head.branch.is_none()
             && let Some(b) = entry.get("gitBranch").and_then(Value::as_str)
             && !b.is_empty()
         {
-            branch = Some(b.to_string());
+            head.branch = Some(b.to_string());
         }
-        if cwd.is_some() && branch.is_some() {
+        if head.started.is_none()
+            && let Some(t) = entry.get("timestamp").and_then(Value::as_str)
+            && parse_any_timestamp(t).is_some()
+        {
+            head.started = Some(t.to_string());
+        }
+        if head.cwd.is_some() && head.branch.is_some() && head.started.is_some() {
             break;
         }
     }
-    (cwd, branch)
+    head
 }
 
 // Current Claude Code appends ai-title records as the session title evolves;
@@ -508,9 +527,21 @@ pub(crate) fn cursor_timestamp(value: &Value) -> String {
 /// The one epoch-milliseconds formatter for Cursor data: preserves
 /// milliseconds when present, keeps whole seconds compact, and treats
 /// non-positive or out-of-range values as unknown.
-/// The `YYYY-MM-DD` day of an ISO timestamp ("" for unknown).
+/// The local `YYYY-MM-DD` day of an ISO timestamp ("" for unknown), the
+/// same calendar that `today` and `--from`/`--to` are read in. A value that
+/// holds only a day is that day.
 pub(crate) fn iso_date(iso: &str) -> String {
-    iso.get(..10).unwrap_or("").to_owned()
+    if let Some(time) = parse_any_timestamp(iso) {
+        return time
+            .with_timezone(&chrono::Local)
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
+    }
+    iso.get(..10)
+        .filter(|d| NaiveDate::parse_from_str(d, "%Y-%m-%d").is_ok())
+        .unwrap_or("")
+        .to_owned()
 }
 
 pub(crate) fn ms_to_iso(ms: i64) -> String {
@@ -645,6 +676,16 @@ fn cursor_first_prompt_txt_uncached(path: &Path) -> Option<String> {
     Some(String::new())
 }
 
+/// `created`, `modified` and the listed day of a Claude transcript: it
+/// started at its first record's timestamp and was last written at its file
+/// time. Without a usable first timestamp, the file time stands for both.
+fn claude_times(path: &Path, started: Option<String>) -> (String, String, String) {
+    let modified = mtime_iso(path).unwrap_or_default();
+    let created = started.unwrap_or_else(|| modified.clone());
+    let date = iso_date(&created);
+    (created, modified, date)
+}
+
 pub fn load_claude_sessions() -> Vec<Session> {
     let base = claude_projects_dir();
     if !base.exists() {
@@ -672,11 +713,8 @@ pub fn load_claude_sessions() -> Vec<Session> {
         };
         for entry in index.entries {
             indexed_ids.insert(entry.session_id.clone());
-            let date = entry
-                .created
-                .get(..10)
-                .filter(|d| NaiveDate::parse_from_str(d, "%Y-%m-%d").is_ok())
-                .map(str::to_string)
+            let date = Some(iso_date(&entry.created))
+                .filter(|d| !d.is_empty())
                 .unwrap_or_else(|| mtime_date(Path::new(&entry.full_path)).unwrap_or_default());
             sessions.push(Session {
                 source: "claude".into(),
@@ -720,20 +758,25 @@ pub fn load_claude_sessions() -> Vec<Session> {
                     if indexed_ids.contains(&sid) || sid.starts_with("agent-") {
                         continue;
                     }
-                    let (cwd, branch, summary, first) =
-                        crate::catalog::read("claude", TRANSCRIPT_KIND, &path, false, || {
+                    let (cwd, branch, summary, first, started) = crate::catalog::read(
+                        "claude",
+                        CLAUDE_TRANSCRIPT_KIND,
+                        &path,
+                        false,
+                        || {
                             fs::File::open(&path).ok()?;
-                            let (cwd, branch) = read_cwd_branch_from_jsonl(&path);
+                            let head = read_claude_head(&path);
                             Some((
-                                cwd,
-                                branch,
+                                head.cwd,
+                                head.branch,
                                 claude_ai_title(&path).unwrap_or_default(),
                                 claude_first_prompt(&path),
+                                head.started,
                             ))
-                        })
-                        .unwrap_or_default();
-                    let iso = mtime_iso(&path).unwrap_or_default();
-                    let date = mtime_date(&path).unwrap_or_default();
+                        },
+                    )
+                    .unwrap_or_default();
+                    let (created, modified, date) = claude_times(&path, started);
                     let project = cwd.unwrap_or_else(|| {
                         dir.file_name()
                             .unwrap_or_default()
@@ -745,8 +788,8 @@ pub fn load_claude_sessions() -> Vec<Session> {
                         id: sid,
                         summary,
                         first_prompt: first,
-                        created: iso.clone(),
-                        modified: iso,
+                        created,
+                        modified,
                         date,
                         messages: 0,
                         branch: branch.unwrap_or_default(),
@@ -774,19 +817,25 @@ fn push_claude_subagents(dir: &Path, sessions: &mut Vec<Session>) {
         if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
             continue;
         }
-        let (cwd, branch, summary, first) =
-            crate::catalog::read("claude", TRANSCRIPT_KIND, &path, false, || {
+        let (cwd, branch, summary, first, started) =
+            crate::catalog::read("claude", CLAUDE_TRANSCRIPT_KIND, &path, false, || {
                 fs::File::open(&path).ok()?;
-                let (cwd, branch) = read_cwd_branch_from_jsonl(&path);
+                let head = read_claude_head(&path);
                 let description = fs::read_to_string(path.with_extension("meta.json"))
                     .ok()
                     .and_then(|m| serde_json::from_str::<Value>(&m).ok())
                     .and_then(|m| m.get("description")?.as_str().map(str::to_owned))
                     .unwrap_or_default();
-                Some((cwd, branch, description, claude_first_prompt(&path)))
+                Some((
+                    head.cwd,
+                    head.branch,
+                    description,
+                    claude_first_prompt(&path),
+                    head.started,
+                ))
             })
             .unwrap_or_default();
-        let iso = mtime_iso(&path).unwrap_or_default();
+        let (created, modified, date) = claude_times(&path, started);
         sessions.push(Session {
             source: "claude".into(),
             id: path
@@ -796,9 +845,9 @@ fn push_claude_subagents(dir: &Path, sessions: &mut Vec<Session>) {
                 .to_string(),
             summary,
             first_prompt: first,
-            created: iso.clone(),
-            modified: iso,
-            date: mtime_date(&path).unwrap_or_default(),
+            created,
+            modified,
+            date,
             messages: 0,
             branch: branch.unwrap_or_default(),
             project: cwd.unwrap_or_default(),
@@ -1322,10 +1371,8 @@ pub fn load_codex_sessions() -> Vec<Session> {
             continue;
         }
         let modified = mtime_iso(&path).unwrap_or_default();
-        let date = meta
-            .created
-            .get(..10)
-            .map(str::to_string)
+        let date = Some(iso_date(&meta.created))
+            .filter(|d| !d.is_empty())
             .unwrap_or_else(|| mtime_date(&path).unwrap_or_default());
         // The thread's name, which every page of it shares.
         let summary = titles.get(&meta.id).cloned().unwrap_or_default();
@@ -3891,25 +3938,29 @@ mod tests {
     }
 
     #[test]
-    fn read_cwd_branch_from_jsonl_extracts_cwd_and_branch() {
+    fn read_claude_head_extracts_cwd_branch_and_start() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        let data = r#"{"type":"user","cwd":"/Users/test/project","gitBranch":"feature-x","message":{"content":"hello"}}"#;
+        let data = [
+            r#"{"type":"mode","mode":"normal","sessionId":"s"}"#,
+            r#"{"type":"permission-mode","permissionMode":"auto","sessionId":"s"}"#,
+            r#"{"type":"user","cwd":"/Users/test/project","gitBranch":"feature-x","timestamp":"2026-11-01T19:10:00.000Z","message":{"content":"hello"}}"#,
+            r#"{"type":"assistant","timestamp":"2026-11-02T08:00:00.000Z","message":{"content":"hi"}}"#,
+        ]
+        .join("\n");
         std::fs::write(tmp.path(), data).unwrap();
-        assert_eq!(
-            read_cwd_branch_from_jsonl(tmp.path()),
-            (
-                Some("/Users/test/project".to_string()),
-                Some("feature-x".to_string())
-            )
-        );
+        let head = read_claude_head(tmp.path());
+        assert_eq!(head.cwd.as_deref(), Some("/Users/test/project"));
+        assert_eq!(head.branch.as_deref(), Some("feature-x"));
+        assert_eq!(head.started.as_deref(), Some("2026-11-01T19:10:00.000Z"));
     }
 
     #[test]
-    fn read_cwd_branch_from_jsonl_no_fields() {
+    fn read_claude_head_no_fields() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let data = r#"{"type":"user","message":{"content":"hello"}}"#;
         std::fs::write(tmp.path(), data).unwrap();
-        assert_eq!(read_cwd_branch_from_jsonl(tmp.path()), (None, None));
+        let head = read_claude_head(tmp.path());
+        assert_eq!((head.cwd, head.branch, head.started), (None, None, None));
     }
 
     #[test]
@@ -3929,6 +3980,21 @@ mod tests {
         assert_eq!(claude_first_prompt(dir.path()), "");
         assert!(try_parse_claude_jsonl(&dir.path().to_string_lossy(), false).is_none());
         assert!(try_parse_cursor_jsonl(&dir.path().to_string_lossy()).is_none());
+    }
+
+    #[test]
+    fn iso_date_is_the_local_day() {
+        let utc = "2026-10-31T19:10:00Z";
+        let local = parse_any_timestamp(utc)
+            .unwrap()
+            .with_timezone(&chrono::Local)
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
+        assert_eq!(iso_date(utc), local);
+        assert_eq!(iso_date("2026-09-02"), "2026-09-02");
+        assert_eq!(iso_date(""), "");
+        assert_eq!(iso_date("garbage"), "");
     }
 
     #[test]
