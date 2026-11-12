@@ -344,6 +344,22 @@ fn memory_search(
     backend.search(request)
 }
 
+/// Search an index that could not be brought up to date, if it holds any
+/// sessions at all; an empty one would only hide every result.
+fn stale_search(
+    backend: &mut Bm25Backend,
+    request: &SearchRequest<'_>,
+) -> Option<Vec<SearchResult>> {
+    let indexed: i64 = backend
+        .conn
+        .query_row("SELECT count(*) FROM sessions", [], |r| r.get(0))
+        .ok()?;
+    if indexed == 0 {
+        return None;
+    }
+    backend.search(request).ok()
+}
+
 /// CLI orchestration. Cache failures preserve BM25 semantics using an ephemeral
 /// index; malformed user queries remain errors rather than triggering a rebuild.
 pub fn search_corpus(
@@ -405,6 +421,13 @@ pub fn search_corpus(
                     progress.warn(&format!("Warning: search cache reset failed ({e})."));
                 }
                 continue;
+            }
+            // Another process holding the write lock (a VACUUM, a long sync)
+            // or a full disk: the index on disk is still readable, and far
+            // cheaper to search as it stands than rebuilding it in memory.
+            if !rebuild && let Some(results) = stale_search(&mut backend, request) {
+                progress.warn(&format!("Warning: could not update search cache ({error}); results may miss sessions changed since the last update."));
+                return Ok(results);
             }
             progress.warn(&format!("Warning: could not save search cache ({error}); searching with an in-memory BM25 index."));
             return memory_search(corpus, request, rebuild, &mut progress);
