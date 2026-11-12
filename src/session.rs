@@ -326,6 +326,33 @@ pub fn encode_path_for_claude(path: &Path) -> String {
         .collect()
 }
 
+/// The folder under `~/.claude/projects` that holds a Claude transcript (a
+/// subagent's too): Claude Code's encoding of the workspace it was written
+/// from.
+fn claude_project_folder(session: &Session) -> Option<String> {
+    let relative = Path::new(&session.file)
+        .strip_prefix(claude_projects_dir())
+        .ok()?;
+    Some(
+        relative
+            .components()
+            .next()?
+            .as_os_str()
+            .to_string_lossy()
+            .into_owned(),
+    )
+}
+
+/// The project folder names Claude Code could have given `cwd`: as spelled
+/// and as the system resolves it.
+fn claude_project_folders(cwd: &Path) -> Vec<String> {
+    let mut folders = vec![encode_path_for_claude(cwd)];
+    if let Ok(real) = fs::canonicalize(cwd) {
+        folders.push(encode_path_for_claude(&real));
+    }
+    folders
+}
+
 fn normalize_for_project_match(s: &str) -> String {
     s.chars()
         .map(|c| {
@@ -2583,6 +2610,25 @@ pub fn lookup_session<'a>(sessions: &'a [Session], sid: &str) -> SessionLookup<'
         }
         return SessionLookup::Found(prefer_session_copy(&matches));
     }
+    // `resume` copies a Claude transcript into the project folder of the
+    // directory it resumes in, under the same id; Claude Code may then go on
+    // writing to either copy. They are one conversation. Every copy keeps the
+    // folder the session was opened in, so the current workspace's copy is
+    // the one stored under its project folder.
+    if one_id && matches.iter().all(|s| s.source == "claude") {
+        if let Ok(cwd) = std::env::current_dir() {
+            let here = claude_project_folders(&cwd);
+            let local: Vec<&Session> = matches
+                .iter()
+                .copied()
+                .filter(|s| claude_project_folder(s).is_some_and(|f| here.contains(&f)))
+                .collect();
+            if local.len() == 1 {
+                return SessionLookup::Found(local[0]);
+            }
+        }
+        return SessionLookup::Found(prefer_session_copy(&matches));
+    }
     SessionLookup::Ambiguous(matches)
 }
 
@@ -2686,9 +2732,14 @@ fn prefer_session_copy<'a>(copies: &[&'a Session]) -> &'a Session {
             }
         }
     }
+    // The file breaks ties, so the pick does not depend on discovery order.
     copies
         .iter()
-        .max_by_key(|s| recency_key(s))
+        .max_by(|a, b| {
+            recency_key(a)
+                .cmp(&recency_key(b))
+                .then_with(|| b.file.cmp(&a.file))
+        })
         .copied()
         .unwrap_or(copies[0])
 }
@@ -3229,16 +3280,32 @@ mod tests {
     }
 
     #[test]
-    fn lookup_session_same_id_claude_stays_ambiguous() {
-        let id = "dddddddd-eeee-ffff-aaaa-111111111111";
+    fn lookup_resolves_claude_copies_of_one_session_but_not_distinct_ids() {
+        let id = "abcd1234-0000-0000-0000-000000000000";
+        let copy = |file: &str, modified: &str| Session {
+            source: "claude".into(),
+            id: id.into(),
+            file: file.into(),
+            project: "/nonexistent/project".into(),
+            modified: modified.into(),
+            ..Session::default()
+        };
         let sessions = vec![
-            make_session(id, "2026-08-26", "claude", "/a", "", "one"),
-            make_session(id, "2026-08-20", "claude", "/b", "", "two"),
+            copy("/a/x.jsonl", "2026-11-01T00:00:00Z"),
+            copy("/b/x.jsonl", "2026-11-02T00:00:00Z"),
         ];
-        match lookup_session(&sessions, id) {
-            SessionLookup::Ambiguous(c) => assert_eq!(c.len(), 2),
-            other => panic!("expected Ambiguous, got {other:?}"),
+        for query in [id, "abcd1234"] {
+            match lookup_session(&sessions, query) {
+                SessionLookup::Found(s) => assert_eq!(s.file, "/b/x.jsonl"),
+                other => panic!("{query}: {other:?}"),
+            }
         }
+        let mut distinct = sessions.clone();
+        distinct[1].id = "abcd1234-1111-0000-0000-000000000000".into();
+        assert!(matches!(
+            lookup_session(&distinct, "abcd1234"),
+            SessionLookup::Ambiguous(_)
+        ));
     }
 
     #[test]
