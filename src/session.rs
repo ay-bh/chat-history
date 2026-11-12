@@ -1736,14 +1736,22 @@ pub fn parse_claude_jsonl(
     filepath: &str,
     extract_meta: bool,
 ) -> (Vec<Message>, Option<SessionMeta>) {
-    let Some(lines) = transcript_lines(Path::new(filepath)) else {
-        return (Vec::new(), extract_meta.then(SessionMeta::default));
-    };
+    try_parse_claude_jsonl(filepath, extract_meta)
+        .unwrap_or_else(|| (Vec::new(), extract_meta.then(SessionMeta::default)))
+}
+
+/// [`parse_claude_jsonl`], or `None` when the transcript could not be read
+/// to its end.
+fn try_parse_claude_jsonl(
+    filepath: &str,
+    extract_meta: bool,
+) -> Option<(Vec<Message>, Option<SessionMeta>)> {
+    let mut lines = transcript_lines(Path::new(filepath))?;
     let mut parser = ClaudeParser::new(extract_meta);
-    for line in lines {
+    for line in lines.by_ref() {
         parser.feed(&line);
     }
-    parser.finish()
+    lines.error.is_none().then(|| parser.finish())
 }
 
 /// Where a Claude transcript parse stopped, and what it carried: enough to
@@ -2021,14 +2029,18 @@ fn codex_tool_use(name: &str, call: &str) -> CodexToolUse {
 }
 
 pub fn parse_codex_jsonl(filepath: &str) -> Vec<Message> {
+    try_parse_codex_jsonl(filepath).unwrap_or_default()
+}
+
+/// [`parse_codex_jsonl`], or `None` when the rollout could not be read.
+fn try_parse_codex_jsonl(filepath: &str) -> Option<Vec<Message>> {
     // Whole-file read + lossy decode: an unreadable path fails once up front,
-    // and an invalid UTF-8 line only
-    // corrupts itself instead of truncating the rest of the transcript.
+    // and an invalid UTF-8 line only corrupts itself instead of truncating the
+    // rest of the transcript.
     let mut bytes = Vec::new();
-    let read = open_rollout(Path::new(filepath)).map(|mut r| r.read_to_end(&mut bytes));
-    if !matches!(read, Some(Ok(_))) {
-        return Vec::new();
-    }
+    open_rollout(Path::new(filepath))?
+        .read_to_end(&mut bytes)
+        .ok()?;
     let entries: Vec<Value> = String::from_utf8_lossy(&bytes)
         .lines()
         .filter_map(|l| serde_json::from_str(l.trim()).ok())
@@ -2169,15 +2181,19 @@ pub fn parse_codex_jsonl(filepath: &str) -> Vec<Message> {
             _ => {}
         }
     }
-    messages
+    Some(messages)
 }
 
 pub fn parse_cursor_jsonl(filepath: &str) -> Vec<Message> {
-    let Some(lines) = transcript_lines(Path::new(filepath)) else {
-        return Vec::new();
-    };
+    try_parse_cursor_jsonl(filepath).unwrap_or_default()
+}
+
+/// [`parse_cursor_jsonl`], or `None` when the transcript could not be read to
+/// its end.
+fn try_parse_cursor_jsonl(filepath: &str) -> Option<Vec<Message>> {
+    let mut lines = transcript_lines(Path::new(filepath))?;
     let mut messages = Vec::new();
-    for line in lines {
+    for line in lines.by_ref() {
         let trimmed = line.trim().to_string();
         if trimmed.is_empty() {
             continue;
@@ -2227,14 +2243,17 @@ pub fn parse_cursor_jsonl(filepath: &str) -> Vec<Message> {
             });
         }
     }
-    messages
+    lines.error.is_none().then_some(messages)
 }
 
 pub fn parse_cursor_txt(filepath: &str) -> Vec<Message> {
-    let content = match fs::read_to_string(filepath) {
-        Ok(c) => c,
-        Err(_) => return Vec::new(),
-    };
+    try_parse_cursor_txt(filepath).unwrap_or_default()
+}
+
+/// [`parse_cursor_txt`], or `None` when the transcript could not be read.
+fn try_parse_cursor_txt(filepath: &str) -> Option<Vec<Message>> {
+    // Lossy: a stray invalid byte must not make the whole transcript unreadable.
+    let content = String::from_utf8_lossy(&fs::read(filepath).ok()?).into_owned();
     let mut messages = Vec::new();
     let mut current_role: Option<String> = None;
     let mut current_lines = Vec::new();
@@ -2307,7 +2326,7 @@ pub fn parse_cursor_txt(filepath: &str) -> Vec<Message> {
             });
         }
     }
-    messages
+    Some(messages)
 }
 
 pub fn parse_session(session: &Session, extract_meta: bool) -> (Vec<Message>, Option<SessionMeta>) {
@@ -2332,81 +2351,49 @@ fn parse_session_inner(
     if session.source == "claude" {
         return parse_claude_jsonl(&session.file, extract_meta);
     }
-    if session.source == "codex" {
-        let messages = parse_codex_jsonl(&session.file);
-        if extract_meta {
-            return (messages, Some(SessionMeta::default()));
+    let messages = read_session_messages(session, recover_timestamps).unwrap_or_default();
+    let meta = extract_meta.then(|| {
+        if session.source == "codex" {
+            return SessionMeta::default();
         }
-        return (messages, None);
-    }
-    if session.source == "cursor-ide" {
-        let messages = crate::cursor_ide::parse_cursor_ide(session);
-        if extract_meta {
-            return (
-                messages,
-                Some(SessionMeta {
-                    summary: if session.summary.is_empty() {
-                        None
-                    } else {
-                        Some(session.summary.clone())
-                    },
-                    custom_title: None,
-                    model: None,
-                    total_tokens: 0,
-                }),
-            );
+        SessionMeta {
+            summary: (!session.summary.is_empty()).then(|| session.summary.clone()),
+            custom_title: None,
+            model: if session.source == "cursor" {
+                crate::cursor_hooks::registered_model(session)
+            } else {
+                None
+            },
+            total_tokens: 0,
         }
-        return (messages, None);
-    }
-    if session.source == "cursor" {
-        let mut messages = if session.is_cursor_store_only() {
-            Vec::new()
-        } else if session.file.ends_with(".txt") {
-            parse_cursor_txt(&session.file)
-        } else {
-            parse_cursor_jsonl(&session.file)
-        };
-        if recover_timestamps {
-            crate::cursor_ide::enrich_transcript_timestamps(session, &mut messages);
+    });
+    (messages, meta)
+}
+
+/// A session's messages, as [`parse_session`] (or, with `recover_timestamps`,
+/// [`parse_session_recovering_timestamps`]) returns them, or `None` when its
+/// transcript or database could not be read. Unlike those, this tells a read
+/// failure apart from a transcript that holds no messages.
+pub fn read_session_messages(session: &Session, recover_timestamps: bool) -> Option<Vec<Message>> {
+    match session.source.as_str() {
+        "claude" => try_parse_claude_jsonl(&session.file, false).map(|(m, _)| m),
+        "codex" => try_parse_codex_jsonl(&session.file),
+        "cursor-ide" => crate::cursor_ide::try_parse_cursor_ide(session),
+        "cursor" => {
+            let mut messages = if session.is_cursor_store_only() {
+                Vec::new()
+            } else if session.file.ends_with(".txt") {
+                try_parse_cursor_txt(&session.file)?
+            } else {
+                try_parse_cursor_jsonl(&session.file)?
+            };
+            if recover_timestamps {
+                crate::cursor_ide::enrich_transcript_timestamps(session, &mut messages);
+            }
+            Some(messages)
         }
-        if extract_meta {
-            return (
-                messages,
-                Some(SessionMeta {
-                    summary: if session.summary.is_empty() {
-                        None
-                    } else {
-                        Some(session.summary.clone())
-                    },
-                    custom_title: None,
-                    model: crate::cursor_hooks::registered_model(session),
-                    total_tokens: 0,
-                }),
-            );
-        }
-        return (messages, None);
-    }
-    let messages = if session.file.ends_with(".jsonl") {
-        parse_cursor_jsonl(&session.file)
-    } else {
-        parse_cursor_txt(&session.file)
-    };
-    if extract_meta {
-        (
-            messages,
-            Some(SessionMeta {
-                summary: if session.summary.is_empty() {
-                    None
-                } else {
-                    Some(session.summary.clone())
-                },
-                custom_title: None,
-                model: None,
-                total_tokens: 0,
-            }),
-        )
-    } else {
-        (messages, None)
+        _ if session.file.ends_with(".jsonl") => try_parse_cursor_jsonl(&session.file),
+        _ => try_parse_cursor_txt(&session.file),
     }
 }
 
@@ -3940,6 +3927,8 @@ mod tests {
         assert_eq!(lines.by_ref().count(), 0);
         assert!(lines.error.is_some());
         assert_eq!(claude_first_prompt(dir.path()), "");
+        assert!(try_parse_claude_jsonl(&dir.path().to_string_lossy(), false).is_none());
+        assert!(try_parse_cursor_jsonl(&dir.path().to_string_lossy()).is_none());
     }
 
     #[test]
